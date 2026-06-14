@@ -234,6 +234,21 @@ fn models(args: &ModelsArgs) -> Result<(), String> {
                 return Ok(());
             }
 
+            let existing_status = default_model_status(&args.models_dir);
+            if existing_status.is_complete() {
+                println!(
+                    "default GGUF models already exist in {}; no download needed",
+                    args.models_dir.display()
+                );
+                print_model_status_from(&existing_status);
+                return Ok(());
+            }
+
+            println!(
+                "{} default GGUF model(s) missing; downloading to {}",
+                existing_status.missing_files().len(),
+                args.models_dir.display()
+            );
             let status =
                 ensure_models_with_cli_progress(&args.models_dir).map_err(|err| err.to_string())?;
             print_model_status_from(&status);

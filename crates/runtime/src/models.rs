@@ -324,4 +324,26 @@ mod tests {
             assert_eq!(file.url, resolve_url_for_file(file.file_name));
         }
     }
+
+    #[test]
+    fn complete_model_dir_skips_download_progress() {
+        let unique_dir =
+            std::env::temp_dir().join(format!("qwen-tts-complete-models-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&unique_dir);
+        fs::create_dir_all(&unique_dir).unwrap();
+        for file in DEFAULT_MODEL_FILES {
+            fs::write(file.path_in(&unique_dir), b"already-here").unwrap();
+        }
+
+        let mut progress_count = 0_usize;
+        let status = ensure_default_models_with_progress(&unique_dir, |_| {
+            progress_count += 1;
+        })
+        .unwrap();
+
+        assert!(status.is_complete());
+        assert_eq!(progress_count, 0);
+
+        let _ = fs::remove_dir_all(&unique_dir);
+    }
 }

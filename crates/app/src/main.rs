@@ -324,10 +324,19 @@ impl QwenTtsApp {
 
     fn start_download(&mut self) {
         let models_dir = PathBuf::from(self.models_dir.clone());
+        let status = default_model_status(&models_dir);
+        if status.is_complete() {
+            self.set_status("預設 GGUF 模型已存在，不需要下載");
+            return;
+        }
+
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.busy = true;
-        self.set_status("正在下載預設 GGUF 模型...");
+        self.status = format!(
+            "缺少 {} 個預設 GGUF 模型，準備下載...",
+            status.missing_files().len()
+        );
 
         thread::spawn(move || {
             let progress_sender = sender.clone();
@@ -391,12 +400,15 @@ fn run_synthesis(
         .path
         .parent()
         .map_or_else(|| PathBuf::from(DEFAULT_MODELS_DIR), PathBuf::from);
-    ensure_default_models_with_progress(models_dir, |progress| {
-        let _ = sender.send(WorkerMessage::DownloadProgress(format_download_progress(
-            &progress,
-        )));
-    })
-    .map_err(|err| err.to_string())?;
+    let status = default_model_status(&models_dir);
+    if !status.is_complete() {
+        ensure_default_models_with_progress(models_dir, |progress| {
+            let _ = sender.send(WorkerMessage::DownloadProgress(format_download_progress(
+                &progress,
+            )));
+        })
+        .map_err(|err| err.to_string())?;
+    }
 
     let mut scheduler = Scheduler::new();
     scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, request.device));
