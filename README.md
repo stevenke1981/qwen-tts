@@ -44,6 +44,21 @@ The talker model converts text into acoustic codes; the codec/tokenizer model de
 cargo build --workspace
 ```
 
+## Windows release binary
+
+The checked-in Windows build artifact is available at:
+
+```text
+dist/qwen-tts.exe
+```
+
+Verify it with:
+
+```powershell
+Get-FileHash dist/qwen-tts.exe -Algorithm SHA256
+Get-Content dist/SHA256SUMS.txt
+```
+
 ## Build qwentts.cpp runtime
 
 ```bash

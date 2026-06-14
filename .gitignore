@@ -1,5 +1,6 @@
 /target
 /.opencode/
+/${PROJECT_ROOT}/
 /models/*.gguf
 /output*.wav
 *.log

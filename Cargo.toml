@@ -17,7 +17,7 @@ edition = "2021"
 rust-version = "1.75"
 license = "MIT"
 authors = ["Steven <stevenke1981@gmail.com>"]
-repository = "https://example.local/qwen-tts"
+repository = "https://github.com/stevenke1981/qwen-tts"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
