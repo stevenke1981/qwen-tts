@@ -12,6 +12,7 @@ members = [
     "crates/app",
     "crates/codec",
     "crates/qwentts-sys",
+    "crates/backends/pure-rust",
 ]
 resolver = "2"
 

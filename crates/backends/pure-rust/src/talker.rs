@@ -13,9 +13,9 @@ use candle_nn::RmsNorm;
 use crate::config::ModelConfig;
 use crate::code_predictor::CodePredictor;
 
-const FN_TOKEN_EMBD: &str = "token_embd.weight";
-const FN_OUTPUT: &str = "output.weight";
-const FN_OUTPUT_NORM: &str = "output_norm.weight";
+const FN_TOKEN_EMBD: &str = "talker.text_embd.weight";
+const FN_OUTPUT: &str = "talker.output.weight";
+const FN_OUTPUT_NORM: &str = "talker.output_norm.weight";
 const FN_ATTN_NORM: &str = "attn_norm.weight";
 const FN_ATTN_Q: &str = "attn_q.weight";
 const FN_ATTN_K: &str = "attn_k.weight";
@@ -25,6 +25,9 @@ const FN_FFN_NORM: &str = "ffn_norm.weight";
 const FN_FFN_GATE: &str = "ffn_gate.weight";
 const FN_FFN_UP: &str = "ffn_up.weight";
 const FN_FFN_DOWN: &str = "ffn_down.weight";
+
+/// Prefix for talker transformer layer tensors.
+const BLK_PREFIX: &str = "talker.blk";
 
 /// Qwen2 talker transformer.
 pub struct Talker {
@@ -106,7 +109,7 @@ impl Talker {
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
-            let blk = |n: &str| format!("blk.{i}.{n}");
+            let blk = |n: &str| format!("{BLK_PREFIX}.{i}.{n}");
             layers.push(DecoderLayer {
                 attn_norm: RmsNorm::new(load(&blk(FN_ATTN_NORM))?, cfg.norm_eps),
                 attn_q: load(&blk(FN_ATTN_Q))?,

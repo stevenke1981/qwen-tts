@@ -12,11 +12,17 @@
 //!   code_pred.mtp_proj.weight / .bias         (optional → talker→pred hidden)
 //!   code_pred.codec_embd.{g}.weight            (g = 0..num_acoustic-1)
 //!   code_pred.lm_head.{g}.weight
-//!   code_pred.layers.{i}.input_layernorm.weight
-//!   code_pred.layers.{i}.post_attention_layernorm.weight
-//!   code_pred.layers.{i}.attn.{q,k,v,o}_proj.weight
-//!   code_pred.layers.{i}.attn.{q,k}_norm.weight
-//!   code_pred.layers.{i}.mlp.{gate,up,down}_proj.weight
+//!   code_pred.blk.{i}.attn_norm.weight
+//!   code_pred.blk.{i}.ffn_norm.weight
+//!   code_pred.blk.{i}.attn_q.weight
+//!   code_pred.blk.{i}.attn_k.weight
+//!   code_pred.blk.{i}.attn_v.weight
+//!   code_pred.blk.{i}.attn_output.weight
+//!   code_pred.blk.{i}.attn_q_norm.weight       (QK-norm)
+//!   code_pred.blk.{i}.attn_k_norm.weight       (QK-norm)
+//!   code_pred.blk.{i}.ffn_gate.weight           (SwiGLU)
+//!   code_pred.blk.{i}.ffn_up.weight
+//!   code_pred.blk.{i}.ffn_down.weight
 
 use std::fs::File;
 
