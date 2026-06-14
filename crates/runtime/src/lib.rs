@@ -21,6 +21,11 @@ pub use backend_setup::{
 pub use config::{ConfigError, ConfigResult, RuntimeConfig};
 pub use device::DeviceKind;
 pub use external_qwentts::ExternalQwenTtsBackend;
+
+#[cfg(feature = "ffi")]
+pub mod ffi_backend;
+#[cfg(feature = "ffi")]
+pub use ffi_backend::FfiBackend;
 pub use logging::{init_logging, init_logging_with, LoggingError, LoggingOptions, LoggingResult};
 pub use models::{
     default_model_set, default_model_status, ensure_default_models,

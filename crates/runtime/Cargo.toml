@@ -14,5 +14,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ureq = "3.2.1"
 
+# FFI in-process backend
+qwen-tts-sys = { path = "../qwentts-sys", optional = true }
+
+[features]
+default = []
+ffi = ["qwen-tts-sys"]
+
 [lints]
 workspace = true
