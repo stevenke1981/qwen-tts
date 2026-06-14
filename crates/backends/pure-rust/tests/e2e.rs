@@ -230,7 +230,7 @@ fn test_code_predictor_loads() {
     let predictor = CodePredictor::from_gguf(&content, &mut file, &device)
         .expect("code predictor should load from talker GGUF");
     assert_eq!(predictor.num_acoustic(), 15, "expect 15 acoustic codebooks");
-    assert_eq!(predictor.hidden_size(), 2048, "expect 2048 hidden dim");
+    assert_eq!(predictor.hidden_size(), 1024, "expect 1024 code predictor hidden dim");
 }
 
 /// Full pipeline end-to-end: load all models, synthesize a short text,
