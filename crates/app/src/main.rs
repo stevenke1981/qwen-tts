@@ -5,6 +5,7 @@ use qwen_tts_runtime::{
     SynthesisRequest, DEFAULT_CODEC_FILE, DEFAULT_MODELS_DIR, DEFAULT_TALKER_FILE,
 };
 use std::{
+    fs,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
@@ -17,10 +18,46 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Qwen TTS",
+        "Qwen TTS 語音合成",
         options,
-        Box::new(|_cc| Box::new(QwenTtsApp::default())),
+        Box::new(|cc| {
+            configure_fonts(&cc.egui_ctx);
+            Box::new(QwenTtsApp::default())
+        }),
     )
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    if let Some((name, data)) = load_cjk_font() {
+        fonts.font_data.insert(name.clone(), data);
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.clone());
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(target_os = "windows")]
+fn load_cjk_font() -> Option<(String, egui::FontData)> {
+    let candidates = [
+        ("Microsoft-JhengHei", "C:\\Windows\\Fonts\\msjh.ttc"),
+        ("Microsoft-JhengHei-Bold", "C:\\Windows\\Fonts\\msjhbd.ttc"),
+        ("MingLiU", "C:\\Windows\\Fonts\\mingliu.ttc"),
+    ];
+
+    candidates.iter().find_map(|(name, path)| {
+        fs::read(path)
+            .ok()
+            .map(|bytes| ((*name).to_owned(), egui::FontData::from_owned(bytes)))
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn load_cjk_font() -> Option<(String, egui::FontData)> {
+    None
 }
 
 #[derive(Debug)]
@@ -52,7 +89,7 @@ impl Default for QwenTtsApp {
             models_dir: DEFAULT_MODELS_DIR.to_owned(),
             output_path: "output.wav".to_owned(),
             device: DeviceKind::Auto,
-            status: "Ready".to_owned(),
+            status: "就緒".to_owned(),
             busy: false,
             receiver: None,
         }
@@ -65,7 +102,7 @@ impl eframe::App for QwenTtsApp {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Qwen TTS");
+                ui.heading("Qwen TTS 語音合成");
                 ui.separator();
                 ui.label(&self.status);
             });
@@ -123,15 +160,15 @@ impl QwenTtsApp {
     }
 
     fn model_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Models");
+        ui.heading("模型");
         ui.horizontal(|ui| {
-            ui.label("Folder");
+            ui.label("資料夾");
             ui.text_edit_singleline(&mut self.models_dir);
             if ui.button("Refresh").clicked() {
                 self.refresh_model_status();
             }
             if ui
-                .add_enabled(!self.busy, egui::Button::new("Download GGUF"))
+                .add_enabled(!self.busy, egui::Button::new("下載 GGUF"))
                 .clicked()
             {
                 self.start_download();
@@ -143,16 +180,16 @@ impl QwenTtsApp {
             .num_columns(4)
             .spacing([16.0, 6.0])
             .show(ui, |ui| {
-                ui.strong("Role");
-                ui.strong("File");
-                ui.strong("Status");
-                ui.strong("Size");
+                ui.strong("角色");
+                ui.strong("檔案");
+                ui.strong("狀態");
+                ui.strong("大小");
                 ui.end_row();
 
                 for file in status.files {
                     ui.label(file.file.role);
                     ui.monospace(file.path.display().to_string());
-                    ui.label(if file.exists { "Present" } else { "Missing" });
+                    ui.label(if file.exists { "已存在" } else { "缺少" });
                     ui.label(file.size_bytes.map_or_else(|| "-".to_owned(), format_bytes));
                     ui.end_row();
                 }
@@ -160,8 +197,8 @@ impl QwenTtsApp {
     }
 
     fn synthesis_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Synthesis");
-        ui.label("Text");
+        ui.heading("語音合成");
+        ui.label("文字");
         ui.add(
             egui::TextEdit::multiline(&mut self.text)
                 .desired_rows(7)
@@ -172,25 +209,25 @@ impl QwenTtsApp {
             .num_columns(2)
             .spacing([18.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Language");
+                ui.label("語言");
                 ui.text_edit_singleline(&mut self.language);
                 ui.end_row();
 
-                ui.label("Speaker");
+                ui.label("說話者");
                 ui.text_edit_singleline(&mut self.speaker);
                 ui.end_row();
 
-                ui.label("qwen-tts binary");
+                ui.label("qwen-tts 執行檔");
                 ui.text_edit_singleline(&mut self.qwen_tts_bin);
                 ui.end_row();
 
-                ui.label("Output WAV");
+                ui.label("輸出 WAV");
                 ui.text_edit_singleline(&mut self.output_path);
                 ui.end_row();
             });
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Device");
+            ui.label("裝置");
             for device in [
                 DeviceKind::Auto,
                 DeviceKind::Cpu,
@@ -208,12 +245,12 @@ impl QwenTtsApp {
     fn run_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.busy, egui::Button::new("Synthesize"))
+                .add_enabled(!self.busy, egui::Button::new("開始合成"))
                 .clicked()
             {
                 self.start_synthesis();
             }
-            if ui.button("Reset defaults").clicked() {
+            if ui.button("重設預設值").clicked() {
                 *self = Self::default();
             }
         });
@@ -222,12 +259,9 @@ impl QwenTtsApp {
     fn refresh_model_status(&mut self) {
         let status = default_model_status(&self.models_dir);
         self.status = if status.is_complete() {
-            "Default GGUF models are present".to_owned()
+            "預設 GGUF 模型已存在".to_owned()
         } else {
-            format!(
-                "{} default GGUF model(s) missing",
-                status.missing_files().len()
-            )
+            format!("缺少 {} 個預設 GGUF 模型", status.missing_files().len())
         };
     }
 
@@ -236,13 +270,13 @@ impl QwenTtsApp {
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.busy = true;
-        self.set_status("Downloading default GGUF models...");
+        self.set_status("正在下載預設 GGUF 模型...");
 
         thread::spawn(move || {
             let result = ensure_default_models(&models_dir)
                 .map(|status| {
                     format!(
-                        "Downloaded/verified {} model files in {}",
+                        "已下載/確認 {} 個模型檔案：{}",
                         status.files.len(),
                         status.models_dir.display()
                     )
@@ -255,7 +289,7 @@ impl QwenTtsApp {
     fn start_synthesis(&mut self) {
         let text = self.text.trim().to_owned();
         if text.is_empty() {
-            self.set_status("Text cannot be empty");
+            self.set_status("文字不能空白");
             return;
         }
 
@@ -275,7 +309,7 @@ impl QwenTtsApp {
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.busy = true;
-        self.set_status("Synthesizing...");
+        self.set_status("正在合成...");
 
         thread::spawn(move || {
             let result = run_synthesis(qwen_tts_bin, &request);
@@ -300,7 +334,7 @@ fn run_synthesis(qwen_tts_bin: PathBuf, request: &SynthesisRequest) -> Result<St
         .map_err(|err| err.to_string())?;
 
     Ok(format!(
-        "Generated {} ({} Hz, {} channel(s))",
+        "已產生 {}（{} Hz，{} 聲道）",
         response.wav_path.display(),
         response.sample_rate_hz,
         response.channels
