@@ -163,7 +163,7 @@ impl CodePredictor {
         if let Some(ref w) = self.mtp_proj_w {
             h = w.matmul(&h.t()?)?.t()?;
             if let Some(ref b) = self.mtp_proj_b {
-                h = (h + b)?;
+                h = h.broadcast_add(b)?;
             }
         }
 
@@ -212,7 +212,7 @@ impl CodePredictor {
         if let Some(ref w) = self.mtp_proj_w {
             h = w.matmul(&h.t()?)?.t()?;
             if let Some(ref b) = self.mtp_proj_b {
-                h = (h + b)?;
+                h = h.broadcast_add(b)?;
             }
         }
 

@@ -29,6 +29,12 @@ const FN_FFN_DOWN: &str = "ffn_down.weight";
 const FN_CODEC_EMBD: &str = "talker.codec_embd.weight";
 const FN_CODEC_HEAD: &str = "talker.codec_head.weight";
 
+/// Text projection MLP tensor names.
+const FN_TEXT_PROJ_FC1_W: &str = "talker.text_proj.fc1.weight";
+const FN_TEXT_PROJ_FC1_B: &str = "talker.text_proj.fc1.bias";
+const FN_TEXT_PROJ_FC2_W: &str = "talker.text_proj.fc2.weight";
+const FN_TEXT_PROJ_FC2_B: &str = "talker.text_proj.fc2.bias";
+
 /// Prefix for talker transformer layer tensors.
 const BLK_PREFIX: &str = "talker.blk";
 
@@ -42,6 +48,11 @@ pub struct Talker {
     codec_embd: Option<Tensor>,
     /// LM head for codebook 0 prediction.
     codec_head: Option<Tensor>,
+    /// Text projection MLP: fc1 → silu → fc2
+    text_proj_fc1_w: Tensor,
+    text_proj_fc1_b: Tensor,
+    text_proj_fc2_w: Tensor,
+    text_proj_fc2_b: Tensor,
     layers: Vec<DecoderLayer>,
     device: Device,
 }
@@ -52,6 +63,9 @@ struct DecoderLayer {
     attn_k: Tensor,
     attn_v: Tensor,
     attn_o: Tensor,
+    /// Per-head QK-norm (applied after reshaping to multi-head, before RoPE).
+    attn_q_norm: RmsNorm,
+    attn_k_norm: RmsNorm,
     ffn_norm: RmsNorm,
     ffn_gate: Tensor,
     ffn_up: Tensor,
@@ -126,15 +140,42 @@ impl Talker {
             None
         };
 
+        // Text projection MLP (required for correct text embedding)
+        let text_proj_fc1_w = load(FN_TEXT_PROJ_FC1_W)?;
+        let text_proj_fc1_b = load(FN_TEXT_PROJ_FC1_B)?;
+        let text_proj_fc2_w = load(FN_TEXT_PROJ_FC2_W)?;
+        let text_proj_fc2_b = load(FN_TEXT_PROJ_FC2_B)?;
+
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let blk = |n: &str| format!("{BLK_PREFIX}.{i}.{n}");
+            let q_norm_w = load(&format!("{BLK_PREFIX}.{i}.attn_q_norm.weight"));
+            let k_norm_w = load(&format!("{BLK_PREFIX}.{i}.attn_k_norm.weight"));
+            // If QK-norm weights exist, use them; otherwise use identity-norm
+            // (standard RmsNorm with weight=ones is fine since the default
+            // gain of 1.0 matches the identity after norm).
+            let attn_q_norm = match q_norm_w {
+                Ok(w) => RmsNorm::new(w, cfg.norm_eps),
+                Err(_) => {
+                    let ones = Tensor::ones(cfg.head_dim(), candle_core::DType::F32, device)?;
+                    RmsNorm::new(ones, cfg.norm_eps)
+                }
+            };
+            let attn_k_norm = match k_norm_w {
+                Ok(w) => RmsNorm::new(w, cfg.norm_eps),
+                Err(_) => {
+                    let ones = Tensor::ones(cfg.head_dim(), candle_core::DType::F32, device)?;
+                    RmsNorm::new(ones, cfg.norm_eps)
+                }
+            };
             layers.push(DecoderLayer {
                 attn_norm: RmsNorm::new(load(&blk(FN_ATTN_NORM))?, cfg.norm_eps),
                 attn_q: load(&blk(FN_ATTN_Q))?,
                 attn_k: load(&blk(FN_ATTN_K))?,
                 attn_v: load(&blk(FN_ATTN_V))?,
                 attn_o: load(&blk(FN_ATTN_O))?,
+                attn_q_norm,
+                attn_k_norm,
                 ffn_norm: RmsNorm::new(load(&blk(FN_FFN_NORM))?, cfg.norm_eps),
                 ffn_gate: load(&blk(FN_FFN_GATE))?,
                 ffn_up: load(&blk(FN_FFN_UP))?,
@@ -149,6 +190,10 @@ impl Talker {
             output_norm,
             codec_embd,
             codec_head,
+            text_proj_fc1_w,
+            text_proj_fc1_b,
+            text_proj_fc2_w,
+            text_proj_fc2_b,
             layers,
             device: device.clone(),
         })
@@ -162,50 +207,51 @@ impl Talker {
         let cfg = &self.config;
         let batch = input_ids.dims()[0];
         let seq_len = input_ids.dims()[1];
+        let d_model = cfg.d_model;
+        let vocab_size = cfg.vocab_size;
 
         // --- Embedding lookup (manual) ---
-        // token_embd shape: [d_model, vocab_size] or [vocab_size, d_model]
-        // We gather embeddings by index.
         let emb_w = &self.token_embd;
-        let vocab_size = cfg.vocab_size;
-        let d_model = cfg.d_model;
-
-        // Determine layout: [d_model, vocab_size] (transposed) or [vocab_size, d_model]
         let emb_weights = if emb_w.dims()[0] == d_model && emb_w.dims()[1] == vocab_size {
-            // Transposed: [d_model, vocab_size] — need to take() first
             emb_w.t()?
         } else {
             emb_w.clone()
         };
-        // Now emb_weights: [vocab_size, d_model], use gather
-        let mut hidden = emb_weights.gather(input_ids, 0)?;
-        // hidden: [batch, seq_len, d_model]
-        // Make contiguous for matmul
+        // index_select requires 1D indices
+        let ids_flat = input_ids.flatten_all()?;
+        let hidden_flat = emb_weights.index_select(&ids_flat, 0)?;
+        let mut hidden = hidden_flat.reshape((batch, seq_len, d_model))?;
         hidden = hidden.contiguous()?;
 
         // --- RoPE precompute ---
         let (cos, sin) = precompute_cos_sin(cfg, seq_len, dev)?;
 
         // --- Decoder layers ---
+        let n_heads = cfg.n_heads;
+        let n_kv = cfg.n_kv_heads;
+        let hd = cfg.head_dim();
+        let head_dim_sum = n_heads * hd;
+        
         for layer in &self.layers {
-            // Pre-attention norm
             let residual = hidden.clone();
             hidden = layer.attn_norm.forward(&hidden)?;
 
-            // Self-attention with GQA
-            let n_heads = cfg.n_heads;
-            let n_kv = cfg.n_kv_heads;
-            let hd = cfg.head_dim();
+            // Flatten batch*seq_len for 2D matmul (candle requires matching ranks)
+            let h_2d = hidden.reshape((batch * seq_len, d_model))?;
 
-            // QKV projections: [batch, seq_len, d_model] → [batch, seq_len, dim]
-            let q = layer.attn_q.matmul(&hidden)?;
-            let k = layer.attn_k.matmul(&hidden)?;
-            let v = layer.attn_v.matmul(&hidden)?;
+            // QKV projections: h_2d [B*T, d_model] @ W^T
+            let q = h_2d.matmul(&layer.attn_q.t()?)?; // [B*T, head_dim_sum]
+            let k = h_2d.matmul(&layer.attn_k.t()?)?; // [B*T, n_kv*hd]
+            let v = h_2d.matmul(&layer.attn_v.t()?)?; // [B*T, n_kv*hd]
 
-            // Reshape to multi-head: [batch, seq_len, n_heads, hd] → [batch, n_heads, seq_len, hd]
+            // Reshape to multi-head: [B*T, dim] → [B, T, n_heads, hd] → [B, n_heads, T, hd]
             let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
             let k = k.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
             let v = v.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
+
+            // Per-head QK-norm (after reshape, before RoPE)
+            let q = apply_per_head_norm(&q, &layer.attn_q_norm)?;
+            let k = apply_per_head_norm(&k, &layer.attn_k_norm)?;
 
             let q = apply_rope(&q, &cos, &sin)?;
             let k = apply_rope(&k, &cos, &sin)?;
@@ -224,28 +270,28 @@ impl Talker {
             let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
             let attn_out = attn.matmul(&v)?;
 
-            // Reshape back
-            let attn_out = attn_out.permute((0, 2, 1, 3))?.reshape((batch, seq_len, d_model))?;
-            let attn_out = layer.attn_o.matmul(&attn_out)?;
-
-            hidden = (residual + attn_out)?;
+            // Output projection: flatten to 2D, apply, reshape back
+            let attn_flat = attn_out
+                .permute((0, 2, 1, 3))?
+                .reshape((batch * seq_len, head_dim_sum))?;
+            let attn_proj = attn_flat.matmul(&layer.attn_o.t()?)?; // [B*T, d_model]
+            hidden = (residual + attn_proj.reshape((batch, seq_len, d_model))?)?;
 
             // SwiGLU FFN
             let residual = hidden.clone();
             hidden = layer.ffn_norm.forward(&hidden)?;
-            let gate = candle_nn::ops::silu(&layer.ffn_gate.matmul(&hidden)?)?;
-            let up = layer.ffn_up.matmul(&hidden)?;
-            hidden = layer.ffn_down.matmul(&(gate * up)?)?;
-            hidden = (hidden + residual)?;
+            let h_2d = hidden.reshape((batch * seq_len, d_model))?;
+            let gate = candle_nn::ops::silu(&h_2d.matmul(&layer.ffn_gate.t()?)?)?;
+            let up = h_2d.matmul(&layer.ffn_up.t()?)?;
+            let hid_2d = (gate * up)?;
+            let hid_out = hid_2d.matmul(&layer.ffn_down.t()?)?; // [B*T, d_model]
+            hidden = (residual + hid_out.reshape((batch, seq_len, d_model))?)?;
         }
 
         // Final norm + output projection
         hidden = self.output_norm.forward(&hidden)?;
         let out_w = self.output.as_ref().unwrap_or(&self.token_embd);
-        // out_w shape: typically [d_model, vocab_size] (transposed)
-        // hidden: [batch, seq_len, d_model]
-        // We want: logits = hidden @ out_w^T → [batch, seq_len, vocab_size]
-        let logits = hidden.matmul(&out_w.t()?)?;
+        let logits = linear_fwd(out_w, &hidden)?;
 
         // Take last position
         let last = logits.i((.., seq_len.saturating_sub(1), ..))?;
@@ -260,47 +306,61 @@ impl Talker {
         let cfg = &self.config;
         let batch = input_ids.dims()[0];
         let seq_len = input_ids.dims()[1];
-
-        // --- Embedding lookup ---
-        let emb_w = &self.token_embd;
         let d_model = cfg.d_model;
         let vocab_size = cfg.vocab_size;
 
+        // --- Embedding lookup ---
+        let emb_w = &self.token_embd;
         let emb_weights = if emb_w.dims()[0] == d_model && emb_w.dims()[1] == vocab_size {
             emb_w.t()?
         } else {
             emb_w.clone()
         };
-        let mut hidden = emb_weights.gather(input_ids, 0)?;
+        // Flatten input_ids to 1D first (index_select requires 1D indices)
+        let ids_flat = input_ids.flatten_all()?;
+        let hidden_flat_res = emb_weights.index_select(&ids_flat, 0)?;
+        let mut hidden = hidden_flat_res.reshape((batch, seq_len, d_model))?;
         hidden = hidden.contiguous()?;
 
         // --- RoPE precompute ---
         let (cos, sin) = precompute_cos_sin(cfg, seq_len, dev)?;
 
         // --- Decoder layers ---
+        let n_heads = cfg.n_heads;
+        let n_kv = cfg.n_kv_heads;
+        let hd = cfg.head_dim();
+        let head_dim_sum = n_heads * hd;
+        
         for layer in &self.layers {
             let residual = hidden.clone();
             hidden = layer.attn_norm.forward(&hidden)?;
 
-            let n_heads = cfg.n_heads;
-            let n_kv = cfg.n_kv_heads;
-            let hd = cfg.head_dim();
+            // Flatten batch*seq_len for 2D matmul (candle requires matching ranks)
+            let h_2d = hidden.reshape((batch * seq_len, d_model))?;
 
-            let q = layer.attn_q.matmul(&hidden)?;
-            let k = layer.attn_k.matmul(&hidden)?;
-            let v = layer.attn_v.matmul(&hidden)?;
+            // QKV projections: h_2d [B*T, d_model] @ W^T
+            let q = h_2d.matmul(&layer.attn_q.t()?)?; // [B*T, head_dim_sum]
+            let k = h_2d.matmul(&layer.attn_k.t()?)?; // [B*T, n_kv*hd]
+            let v = h_2d.matmul(&layer.attn_v.t()?)?; // [B*T, n_kv*hd]
 
+            // Reshape to multi-head: [B*T, dim] → [B, T, n_heads, hd] → [B, n_heads, T, hd]
             let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
             let k = k.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
             let v = v.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
 
+            // Per-head QK-norm (after reshape, before RoPE)
+            let q = apply_per_head_norm(&q, &layer.attn_q_norm)?;
+            let k = apply_per_head_norm(&k, &layer.attn_k_norm)?;
+
             let q = apply_rope(&q, &cos, &sin)?;
             let k = apply_rope(&k, &cos, &sin)?;
 
+            // GQA: repeat K,V heads
             let n_repeat = n_heads / n_kv;
             let k = if n_repeat > 1 { repeat_kv(&k, n_repeat)? } else { k };
             let v = if n_repeat > 1 { repeat_kv(&v, n_repeat)? } else { v };
 
+            // Scaled dot-product attention
             let scale = (hd as f64).sqrt().recip();
             let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
             let attn = (attn * scale)?;
@@ -309,16 +369,22 @@ impl Talker {
             let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
             let attn_out = attn.matmul(&v)?;
 
-            let attn_out = attn_out.permute((0, 2, 1, 3))?.reshape((batch, seq_len, d_model))?;
-            let attn_out = layer.attn_o.matmul(&attn_out)?;
-            hidden = (residual + attn_out)?;
+            // Output projection: flatten to 2D, apply, reshape back
+            let attn_flat = attn_out
+                .permute((0, 2, 1, 3))?
+                .reshape((batch * seq_len, head_dim_sum))?;
+            let attn_proj = attn_flat.matmul(&layer.attn_o.t()?)?; // [B*T, d_model]
+            hidden = (residual + attn_proj.reshape((batch, seq_len, d_model))?)?;
 
+            // SwiGLU FFN
             let residual = hidden.clone();
             hidden = layer.ffn_norm.forward(&hidden)?;
-            let gate = candle_nn::ops::silu(&layer.ffn_gate.matmul(&hidden)?)?;
-            let up = layer.ffn_up.matmul(&hidden)?;
-            hidden = layer.ffn_down.matmul(&(gate * up)?)?;
-            hidden = (hidden + residual)?;
+            let h_2d = hidden.reshape((batch * seq_len, d_model))?;
+            let gate = candle_nn::ops::silu(&h_2d.matmul(&layer.ffn_gate.t()?)?)?;
+            let up = h_2d.matmul(&layer.ffn_up.t()?)?;
+            let hid_2d = (gate * up)?;
+            let hid_out = hid_2d.matmul(&layer.ffn_down.t()?)?; // [B*T, d_model]
+            hidden = (residual + hid_out.reshape((batch, seq_len, d_model))?)?;
         }
 
         // Final norm
@@ -326,7 +392,9 @@ impl Talker {
 
         // LM head (output projection) — reuse token_embd if no separate output weight
         let out_w = self.output.as_ref().unwrap_or(&self.token_embd);
-        let logits = hidden_normed.matmul(&out_w.t()?)?;
+        // out_w: [vocab_size, d_model], hidden_normed: [B, T, d_model]
+        // Use linear_fwd which handles flatten→matmul→reshape
+        let logits = linear_fwd(out_w, &hidden_normed)?;
 
         // Return both logits and the normed hidden state
         let last_logits = logits.i((.., seq_len.saturating_sub(1), ..))?;
@@ -349,29 +417,41 @@ impl Talker {
         let (cos, sin) = precompute_cos_sin(cfg, seq_len, dev)?;
 
         // --- Decoder layers ---
+        let n_heads = cfg.n_heads;
+        let n_kv = cfg.n_kv_heads;
+        let hd = cfg.head_dim();
+        let head_dim_sum = n_heads * hd;
+        
         for layer in &self.layers {
             let residual = hidden.clone();
             hidden = layer.attn_norm.forward(&hidden)?;
 
-            let n_heads = cfg.n_heads;
-            let n_kv = cfg.n_kv_heads;
-            let hd = cfg.head_dim();
+            // Flatten batch*seq_len for 2D matmul (candle requires matching ranks)
+            let h_2d = hidden.reshape((batch * seq_len, d_model))?;
 
-            let q = layer.attn_q.matmul(&hidden)?;
-            let k = layer.attn_k.matmul(&hidden)?;
-            let v = layer.attn_v.matmul(&hidden)?;
+            // QKV projections: h_2d [B*T, d_model] @ W^T
+            let q = h_2d.matmul(&layer.attn_q.t()?)?; // [B*T, head_dim_sum]
+            let k = h_2d.matmul(&layer.attn_k.t()?)?; // [B*T, n_kv*hd]
+            let v = h_2d.matmul(&layer.attn_v.t()?)?; // [B*T, n_kv*hd]
 
+            // Reshape to multi-head: [B*T, dim] → [B, T, n_heads, hd] → [B, n_heads, T, hd]
             let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
             let k = k.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
             let v = v.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
 
+            // Per-head QK-norm (after reshape, before RoPE)
+            let q = apply_per_head_norm(&q, &layer.attn_q_norm)?;
+            let k = apply_per_head_norm(&k, &layer.attn_k_norm)?;
+
             let q = apply_rope(&q, &cos, &sin)?;
             let k = apply_rope(&k, &cos, &sin)?;
 
+            // GQA: repeat K,V heads
             let n_repeat = n_heads / n_kv;
             let k = if n_repeat > 1 { repeat_kv(&k, n_repeat)? } else { k };
             let v = if n_repeat > 1 { repeat_kv(&v, n_repeat)? } else { v };
 
+            // Scaled dot-product attention
             let scale = (hd as f64).sqrt().recip();
             let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
             let attn = (attn * scale)?;
@@ -380,16 +460,22 @@ impl Talker {
             let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
             let attn_out = attn.matmul(&v)?;
 
-            let attn_out = attn_out.permute((0, 2, 1, 3))?.reshape((batch, seq_len, d_model))?;
-            let attn_out = layer.attn_o.matmul(&attn_out)?;
-            hidden = (residual + attn_out)?;
+            // Output projection: flatten to 2D, apply, reshape back
+            let attn_flat = attn_out
+                .permute((0, 2, 1, 3))?
+                .reshape((batch * seq_len, head_dim_sum))?;
+            let attn_proj = attn_flat.matmul(&layer.attn_o.t()?)?; // [B*T, d_model]
+            hidden = (residual + attn_proj.reshape((batch, seq_len, d_model))?)?;
 
+            // SwiGLU FFN
             let residual = hidden.clone();
             hidden = layer.ffn_norm.forward(&hidden)?;
-            let gate = candle_nn::ops::silu(&layer.ffn_gate.matmul(&hidden)?)?;
-            let up = layer.ffn_up.matmul(&hidden)?;
-            hidden = layer.ffn_down.matmul(&(gate * up)?)?;
-            hidden = (hidden + residual)?;
+            let h_2d = hidden.reshape((batch * seq_len, d_model))?;
+            let gate = candle_nn::ops::silu(&h_2d.matmul(&layer.ffn_gate.t()?)?)?;
+            let up = h_2d.matmul(&layer.ffn_up.t()?)?;
+            let hid_2d = (gate * up)?;
+            let hid_out = hid_2d.matmul(&layer.ffn_down.t()?)?; // [B*T, d_model]
+            hidden = (residual + hid_out.reshape((batch, seq_len, d_model))?)?;
         }
 
         // Final norm
@@ -404,10 +490,10 @@ impl Talker {
     pub fn predict_codebook0(&self, hidden: &Tensor) -> anyhow::Result<Tensor> {
         let head = self.codec_head.as_ref()
             .ok_or_else(|| anyhow::anyhow!("codec_head not loaded (no codec_head.weight in GGUF)"))?;
-        // codec_head shape: [d_model, vocab_size_cb0]
+        // codec_head shape: [vocab_size_cb0, d_model] = [3072, 2048]
         // hidden shape: [batch, 1, d_model]
-        // logits = hidden @ head^T → [batch, 1, vocab_size_cb0]
-        let logits = hidden.matmul(&head.t()?)?;
+        // logits = hidden @ head^T = linear_fwd(head, hidden)
+        let logits = linear_fwd(head, hidden)?;
         Ok(logits)
     }
 
@@ -425,29 +511,74 @@ impl Talker {
         };
         let ids = Tensor::from_slice(&[token_id], (1, 1), &self.device)?;
         // emb_w: [vocab_size, d_model]
-        let result = emb_w.gather(&ids, 0)?;
-        // result: [1, 1, d_model]
+        // index_select requires 1D indices
+        let ids_flat = ids.flatten_all()?;
+        let result_flat = emb_w.index_select(&ids_flat, 0)?;
+        // Reshape back to [1, 1, d_model]
+        let result = result_flat.reshape((1, 1, d_model))?;
         Ok(result.contiguous()?)
     }
 
+    /// Apply the text projection MLP: fc1 → silu → fc2 + bias.
+    ///
+    /// `x`: `[batch, seq_len, d_model]` — text embeddings.
+    /// Returns: `[batch, seq_len, d_model]` — projected embeddings.
+    pub fn apply_text_proj(&self, x: &Tensor) -> anyhow::Result<Tensor> {
+        let fc1 = linear_fwd(&self.text_proj_fc1_w, x)?.broadcast_add(&self.text_proj_fc1_b)?;
+        let act = candle_nn::ops::silu(&fc1)?;
+        let fc2 = linear_fwd(&self.text_proj_fc2_w, &act)?.broadcast_add(&self.text_proj_fc2_b)?;
+        Ok(fc2)
+    }
+
     /// Embed text token IDs into `[batch, seq_len, d_model]` using the
-    /// text embedding table (`text_embd.weight`).
+    /// text embedding table (`text_embd.weight`) followed by text_proj MLP.
     pub fn embed_text(&self, input_ids: &Tensor) -> anyhow::Result<Tensor> {
         let cfg = &self.config;
         let emb_w = &self.token_embd;
         let d_model = cfg.d_model;
         let vocab_size = cfg.vocab_size;
+        let batch = input_ids.dims()[0];
+        let seq_len = input_ids.dims()[1];
         let emb_weights = if emb_w.dims()[0] == d_model && emb_w.dims()[1] == vocab_size {
             emb_w.t()?
         } else {
             emb_w.clone()
         };
-        let hidden = emb_weights.gather(input_ids, 0)?;
-        Ok(hidden.contiguous()?)
+        // index_select requires 1D indices
+        let ids_flat = input_ids.flatten_all()?;
+        let hidden_flat = emb_weights.index_select(&ids_flat, 0)?;
+        let hidden = hidden_flat.reshape((batch, seq_len, d_model))?;
+        let hidden = hidden.contiguous()?;
+        // Apply text projection MLP
+        self.apply_text_proj(&hidden)
     }
 
     pub fn device(&self) -> &Device { &self.device }
     pub fn config(&self) -> &ModelConfig { &self.config }
+}
+
+// -----------------------------------------------------------------------
+// Linear projection helper
+// -----------------------------------------------------------------------
+
+/// Apply a linear projection `weight @ x` with correct rank handling.
+///
+/// `weight`: `[out_features, in_features]` (GGUF convention).
+/// `x`: any-rank tensor with last dim = `in_features`.
+///
+/// Flattens all batch dims to 2D, applies `x @ W^T`, reshapes back.
+fn linear_fwd(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
+    let x_dims = x.dims();
+    let rank = x_dims.len();
+    let bsz: usize = x_dims[..rank - 1].iter().product();
+    let in_features = x_dims[rank - 1];
+    let out_features = weight.dims()[0];
+    let x_2d = x.reshape((bsz, in_features))?;
+    let w_t = weight.t()?; // [in_features, out_features]
+    let y_2d = x_2d.matmul(&w_t)?;
+    let mut out_dims = x_dims.to_vec();
+    out_dims[rank - 1] = out_features;
+    y_2d.reshape(out_dims)
 }
 
 // -----------------------------------------------------------------------
@@ -512,6 +643,23 @@ fn build_causal_mask(n: usize, dev: &Device) -> Result<Tensor> {
         }
     }
     Tensor::from_slice(&data, (n, n), dev)
+}
+
+/// Apply a per-head RMS norm to a multi-head attention tensor.
+///
+/// `x`: `[batch, n_heads, seq_len, head_dim]`
+/// `norm`: RmsNorm with weight `[head_dim]`
+///
+/// Returns: `[batch, n_heads, seq_len, head_dim]`
+fn apply_per_head_norm(x: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
+    let shape = x.dims();
+    let n_heads = shape[1];
+    let seq_len = shape[2];
+    let head_dim = shape[3];
+    // Flatten batch*n_heads*seq_len into one dim, apply norm over head_dim
+    let x_flat = x.reshape((shape[0] * n_heads * seq_len, head_dim))?;
+    let x_normed = norm.forward(&x_flat)?;
+    x_normed.reshape(shape)
 }
 
 #[cfg(test)]

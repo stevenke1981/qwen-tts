@@ -166,7 +166,7 @@ impl Pipeline {
 // Helpers
 // -----------------------------------------------------------------------
 
-/// Sample from a `[batch, 1, vocab]` logits tensor.
+/// Sample from a `[batch, 1, vocab]` or `[batch, vocab]` logits tensor.
 fn sample_logits_tensor(
     logits: &Tensor,
     temperature: f32,
@@ -174,10 +174,8 @@ fn sample_logits_tensor(
     top_p: Option<f32>,
     rng: &mut impl rand::Rng,
 ) -> anyhow::Result<u32> {
-    let vocab_size = logits.dims()[2];
-    let logits_1d: Vec<f32> = logits.squeeze(0)?.squeeze(0)?.to_vec1()?;
-    // Ensure correct length
-    assert_eq!(logits_1d.len(), vocab_size);
+    // Flatten to 1D regardless of input rank
+    let logits_1d: Vec<f32> = logits.flatten_all()?.to_vec1()?;
     let (token, _prob) = sampling::sample_token(&logits_1d, temperature, top_k, top_p, rng);
     Ok(token)
 }
