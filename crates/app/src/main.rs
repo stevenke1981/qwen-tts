@@ -1,4 +1,5 @@
 use eframe::egui;
+use qwen_tts_backend_cpu::CpuBackend;
 use qwen_tts_core::TtsModelSet;
 use qwen_tts_runtime::{
     backend_status, default_backend_executable, default_model_status, default_voice_output_path,
@@ -70,6 +71,21 @@ enum WorkerMessage {
     SynthesisFinished(Result<String, String>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendMode {
+    NativeCpu,
+    Qwentts,
+}
+
+impl BackendMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NativeCpu => "Native CPU (Rust)",
+            Self::Qwentts => "qwentts.cpp",
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct QwenTtsApp {
     text: String,
@@ -79,6 +95,7 @@ struct QwenTtsApp {
     models_dir: String,
     output_path: String,
     device: DeviceKind,
+    backend_mode: BackendMode,
     status: String,
     busy: bool,
     prompted_for_missing_models: bool,
@@ -101,6 +118,7 @@ impl Default for QwenTtsApp {
             models_dir: project_models_dir().display().to_string(),
             output_path: default_voice_output_path().display().to_string(),
             device: DeviceKind::Auto,
+            backend_mode: BackendMode::NativeCpu,
             status: "就緒".to_owned(),
             busy: false,
             prompted_for_missing_models: false,
@@ -218,6 +236,10 @@ impl QwenTtsApp {
         }
 
         self.prompted_for_missing_backend = true;
+        if self.backend_mode == BackendMode::NativeCpu {
+            return;
+        }
+
         let status = current_backend_status(Some(&self.qwen_tts_bin));
         if !status.is_available() {
             self.show_backend_prompt = true;
@@ -255,6 +277,19 @@ impl QwenTtsApp {
 
     fn backend_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Backend");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("模式");
+            for mode in [BackendMode::NativeCpu, BackendMode::Qwentts] {
+                ui.radio_value(&mut self.backend_mode, mode, mode.label());
+            }
+        });
+
+        if self.backend_mode == BackendMode::NativeCpu {
+            ui.label("狀態：原生 Rust CPU backend 可用（逐步改寫中）");
+            ui.label("目前會驗證 GGUF 模型並由 Rust 產生 WAV；完整 Qwen 推論仍在後續階段。");
+            return;
+        }
+
         let status = current_backend_status(Some(&self.qwen_tts_bin));
         egui::Grid::new("backend_status_grid")
             .num_columns(2)
@@ -520,19 +555,21 @@ impl QwenTtsApp {
             ),
         };
         let qwen_tts_bin = PathBuf::from(self.qwen_tts_bin.clone());
+        let backend_mode = self.backend_mode;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.busy = true;
         self.set_status("正在合成...");
 
         thread::spawn(move || {
-            let result = run_synthesis(qwen_tts_bin, &request, &sender);
+            let result = run_synthesis(backend_mode, qwen_tts_bin, &request, &sender);
             let _ = sender.send(WorkerMessage::SynthesisFinished(result));
         });
     }
 }
 
 fn run_synthesis(
+    backend_mode: BackendMode,
     qwen_tts_bin: PathBuf,
     request: &SynthesisRequest,
     sender: &Sender<WorkerMessage>,
@@ -554,17 +591,28 @@ fn run_synthesis(
     }
 
     let mut scheduler = Scheduler::new();
-    scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, request.device));
+    match backend_mode {
+        BackendMode::NativeCpu => scheduler.register(CpuBackend::new()),
+        BackendMode::Qwentts => {
+            scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, request.device));
+        }
+    }
     let response = scheduler
         .synthesize(request)
         .map_err(|err| err.to_string())?;
+
+    let backend_note = if response.backend_name == "native-cpu-rust" {
+        "，Native CPU Rust 實驗 backend"
+    } else {
+        ""
+    };
 
     Ok(format!(
         "已產生 {}（{} Hz，{} 聲道）",
         response.wav_path.display(),
         response.sample_rate_hz,
-        response.channels
-    ))
+        response.channels,
+    ) + backend_note)
 }
 
 fn current_backend_status(configured: Option<&str>) -> BackendStatus {

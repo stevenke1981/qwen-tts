@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+qwen-tts-core = { path = "../../core" }
 qwen-tts-runtime = { path = "../../runtime" }
 
 [lints]

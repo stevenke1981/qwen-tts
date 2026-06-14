@@ -2,7 +2,10 @@
 
 Rust workspace for building a local speech generation app with Qwen3-TTS GGUF.
 
-The MVP uses Rust as the app/runtime layer and delegates actual Qwen3-TTS inference to `qwentts.cpp`'s `qwen-tts` executable. The project is intentionally split into crates so native CPU/CUDA/Metal/WGPU/ROCm/SYCL backends can be added later without rewriting the CLI or scheduler.
+The app/runtime layer is Rust-first. Native Rust CPU synthesis is available as
+the first rewrite milestone, while the `qwentts.cpp` `qwen-tts` executable is
+still kept as the fallback for full Qwen3-TTS model inference during the
+incremental port.
 
 ## Layout
 
@@ -122,21 +125,25 @@ cargo run -p qwen-tts-cli -- inspect \
 cargo run -p qwen-tts-cli -- synth \
   --text "你好，這是 Rust 本機語音生成測試。" \
   --lang Chinese \
-  --device auto
+  --backend native-cpu
 ```
 
 When `--out` is omitted, the WAV is written to `output/voice-<timestamp>.wav`.
 Pass `--out` only when you want a custom path.
 
+`--backend native-cpu` is the native Rust CPU rewrite path. It currently
+validates the GGUF files and emits a valid WAV from Rust as the first CPU
+milestone; use `--backend qwentts` when you need the full upstream Qwen voice
+quality while the remaining graph/codec layers are being ported.
+
 If your `qwen-tts` binary is elsewhere:
 
 ```bash
-QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --text "測試"
+QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --backend qwentts --text "測試"
 ```
 
 ## Roadmap
 
-1. Keep CLI + qwentts.cpp path as the MVP.
-2. Replace CLI process execution with qwentts.cpp C ABI through Rust FFI.
-3. Add native backend implementations crate by crate.
-4. Add GUI crate later, for example Tauri / egui / Slint.
+1. Port the CPU GGUF loaders, tokenizer, sampler, and codec layers to native Rust.
+2. Replace the experimental CPU waveform path with full Qwen3-TTS inference.
+3. Add native CUDA/Metal/WGPU/ROCm/SYCL implementations crate by crate.

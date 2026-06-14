@@ -1,4 +1,5 @@
 use clap::{error::ErrorKind, Parser, Subcommand, ValueEnum};
+use qwen_tts_backend_cpu::CpuBackend;
 use qwen_tts_core::{graph::TtsGraph, GgufProbe, TtsModelSet};
 use qwen_tts_runtime::{
     backend_status, default_backend_executable, default_model_status, default_voice_output_path,
@@ -104,6 +105,12 @@ impl SetupTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BackendMode {
+    NativeCpu,
+    Qwentts,
+}
+
 #[derive(Debug, Parser)]
 struct SynthArgs {
     #[arg(long)]
@@ -116,6 +123,8 @@ struct SynthArgs {
     speaker: Option<String>,
     #[arg(long, default_value = "auto")]
     device: DeviceKind,
+    #[arg(long, default_value = "native-cpu")]
+    backend: BackendMode,
     #[arg(long = "bin")]
     qwen_tts_bin: Option<PathBuf>,
     #[arg(long)]
@@ -190,7 +199,6 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         }
     }
 
-    let qwen_tts_bin = resolve_backend_executable(&project_root, args.qwen_tts_bin.as_ref())?;
     let talker = path_from_arg_env_or_default(
         args.talker.as_ref(),
         "QWEN_TTS_TALKER",
@@ -200,7 +208,14 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         path_from_arg_env_or_default(args.codec.as_ref(), "QWEN_TTS_CODEC", DEFAULT_CODEC_MODEL);
 
     let mut scheduler = Scheduler::new();
-    scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, args.device));
+    match args.backend {
+        BackendMode::NativeCpu => scheduler.register(CpuBackend::new()),
+        BackendMode::Qwentts => {
+            let qwen_tts_bin =
+                resolve_backend_executable(&project_root, args.qwen_tts_bin.as_ref())?;
+            scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, args.device));
+        }
+    }
 
     let request = SynthesisRequest {
         text: args.text.clone(),
@@ -220,6 +235,9 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         response.sample_rate_hz, response.channels
     );
     println!("backend: {}", response.backend_name);
+    if response.backend_name == "native-cpu-rust" {
+        println!("note: native CPU Rust backend is an experimental rewrite milestone");
+    }
     Ok(())
 }
 
@@ -454,6 +472,7 @@ mod tests {
         assert_eq!(args.lang, "Chinese");
         assert_eq!(args.speaker, None);
         assert_eq!(args.device, DeviceKind::Auto);
+        assert_eq!(args.backend, BackendMode::NativeCpu);
         assert_eq!(args.qwen_tts_bin, None);
         assert_eq!(args.talker, None);
         assert_eq!(args.codec, None);
@@ -472,6 +491,8 @@ mod tests {
             "alice",
             "--device",
             "cuda",
+            "--backend",
+            "qwentts",
             "--out",
             "speech.wav",
             "--bin",
@@ -488,6 +509,7 @@ mod tests {
         assert_eq!(args.lang, "English");
         assert_eq!(args.speaker, Some(String::from("alice")));
         assert_eq!(args.device, DeviceKind::Cuda);
+        assert_eq!(args.backend, BackendMode::Qwentts);
         assert_eq!(args.out, Some(PathBuf::from("speech.wav")));
         assert_eq!(args.qwen_tts_bin, Some(PathBuf::from("qwen-tts-bin")));
         assert_eq!(args.talker, Some(PathBuf::from("talker.gguf")));

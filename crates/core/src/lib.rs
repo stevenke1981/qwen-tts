@@ -9,7 +9,7 @@ pub mod ops;
 pub mod wav;
 
 pub use audio::{AudioBuffer, AudioSpec};
-pub use gguf::{GgufProbe, GgufProbeError};
+pub use gguf::{GgufMetadata, GgufMetadataValue, GgufProbe, GgufProbeError};
 pub use graph::{GraphNode, NodeKind, TtsGraph};
 pub use model::{CodecModel, TalkerModel, TtsModelSet};
 pub use wav::{
