@@ -1,8 +1,10 @@
 use clap::{error::ErrorKind, Parser, Subcommand, ValueEnum};
 use qwen_tts_core::{graph::TtsGraph, GgufProbe, TtsModelSet};
 use qwen_tts_runtime::{
-    default_model_status, ensure_default_models_with_progress, DeviceKind, ExternalQwenTtsBackend,
-    ModelDownloadProgress, Scheduler, SynthesisRequest, DEFAULT_MODELS_DIR, DEFAULT_MODEL_FILES,
+    backend_status, default_backend_executable, default_model_status,
+    ensure_default_models_with_progress, find_qwentts_executable, setup_qwentts_backend,
+    BackendStatus, DeviceKind, ExternalQwenTtsBackend, ModelDownloadProgress, Scheduler,
+    SynthesisRequest, DEFAULT_MODELS_DIR, DEFAULT_MODEL_FILES,
 };
 use std::{
     env,
@@ -11,7 +13,6 @@ use std::{
     process::ExitCode,
 };
 
-const DEFAULT_QWEN_TTS_BIN: &str = "./vendor/qwentts.cpp/build/bin/qwen-tts";
 const DEFAULT_TALKER_MODEL: &str = "./models/qwen-talker-1.7b-base-Q8_0.gguf";
 const DEFAULT_CODEC_MODEL: &str = "./models/qwen-tokenizer-12hz-Q8_0.gguf";
 
@@ -24,11 +25,24 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Backend(BackendArgs),
     Inspect(InspectArgs),
     Graph,
     Models(ModelsArgs),
     SetupScript(SetupScriptArgs),
     Synth(SynthArgs),
+}
+
+#[derive(Debug, Parser)]
+struct BackendArgs {
+    #[command(subcommand)]
+    command: BackendCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BackendCommand {
+    Status,
+    Setup,
 }
 
 #[derive(Debug, Parser)]
@@ -136,6 +150,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
+        Command::Backend(args) => backend(&args),
         Command::Inspect(args) => inspect(&args),
         Command::Synth(args) => synth(&args),
         Command::Models(args) => models(&args),
@@ -162,6 +177,7 @@ fn inspect(args: &InspectArgs) -> Result<(), String> {
 }
 
 fn synth(args: &SynthArgs) -> Result<(), String> {
+    let project_root = project_root_dir();
     let should_download_defaults = args.talker.is_none()
         && args.codec.is_none()
         && env::var_os("QWEN_TTS_TALKER").is_none()
@@ -174,11 +190,7 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         }
     }
 
-    let qwen_tts_bin = path_from_arg_env_or_default(
-        args.qwen_tts_bin.as_ref(),
-        "QWEN_TTS_BIN",
-        DEFAULT_QWEN_TTS_BIN,
-    );
+    let qwen_tts_bin = resolve_backend_executable(&project_root, args.qwen_tts_bin.as_ref())?;
     let talker = path_from_arg_env_or_default(
         args.talker.as_ref(),
         "QWEN_TTS_TALKER",
@@ -209,6 +221,50 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
     );
     println!("backend: {}", response.backend_name);
     Ok(())
+}
+
+fn backend(args: &BackendArgs) -> Result<(), String> {
+    let project_root = project_root_dir();
+    match args.command {
+        BackendCommand::Status => {
+            print_backend_status(&backend_status(&project_root, None));
+            Ok(())
+        }
+        BackendCommand::Setup => {
+            println!(
+                "setting up qwentts.cpp backend under {}",
+                project_root.display()
+            );
+            let status = setup_qwentts_backend(&project_root).map_err(|err| err.to_string())?;
+            print_backend_status(&status);
+            Ok(())
+        }
+    }
+}
+
+fn resolve_backend_executable(
+    project_root: &std::path::Path,
+    explicit: Option<&PathBuf>,
+) -> Result<PathBuf, String> {
+    find_qwentts_executable(project_root, explicit.map(PathBuf::as_path)).ok_or_else(|| {
+        let expected = default_backend_executable(project_root);
+        format!(
+            "qwen-tts backend executable not found. Expected {}. Run `qwen-tts backend setup` or set QWEN_TTS_BIN.",
+            expected.display()
+        )
+    })
+}
+
+fn print_backend_status(status: &BackendStatus) {
+    println!("backend source: {}", status.source_dir.display());
+    println!(
+        "expected executable: {}",
+        status.expected_executable.display()
+    );
+    match &status.resolved_executable {
+        Some(path) => println!("resolved executable: {}", path.display()),
+        None => println!("resolved executable: missing"),
+    }
 }
 
 fn models(args: &ModelsArgs) -> Result<(), String> {
@@ -326,11 +382,18 @@ fn setup_script(args: &SetupScriptArgs) {
     println!("set -euo pipefail");
     println!("# target: {}", args.target.as_str());
     println!("mkdir -p vendor models");
-    println!("if [ ! -d vendor/qwentts.cpp ]; then git clone https://github.com/ServeurpersoCom/qwentts.cpp vendor/qwentts.cpp; fi");
+    println!("if [ ! -d vendor/qwentts.cpp ]; then git clone --recurse-submodules https://github.com/ServeurpersoCom/qwentts.cpp vendor/qwentts.cpp; fi");
+    println!("git -C vendor/qwentts.cpp submodule update --init --recursive");
     println!("huggingface-cli download Serveurperso/Qwen3-TTS-GGUF qwen-talker-1.7b-base-Q8_0.gguf qwen-tokenizer-12hz-Q8_0.gguf --local-dir models");
-    println!("cmake -S vendor/qwentts.cpp -B vendor/qwentts.cpp/build -DCMAKE_BUILD_TYPE=Release");
-    println!("cmake --build vendor/qwentts.cpp/build --config Release -j --target qwen-tts");
+    println!(
+        "cmake -S vendor/qwentts.cpp -B vendor/qwentts.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_BLAS=ON"
+    );
+    println!("cmake --build vendor/qwentts.cpp/build --config Release --target qwen-tts -j");
     println!("echo 'Run cargo run -p qwen-tts-cli -- synth --text ...'");
+}
+
+fn project_root_dir() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn path_from_arg_env_or_default(
@@ -367,6 +430,16 @@ mod tests {
         };
         assert_eq!(args.talker, PathBuf::from("talker.gguf"));
         assert_eq!(args.codec, PathBuf::from("codec.gguf"));
+    }
+
+    #[test]
+    fn parses_backend_status() {
+        let cli = parse(["qwen-tts", "backend", "status"]);
+
+        let Command::Backend(args) = cli.command else {
+            panic!("expected backend command");
+        };
+        assert!(matches!(args.command, BackendCommand::Status));
     }
 
     #[test]

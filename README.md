@@ -94,14 +94,17 @@ qwentts.cpp runtime.
 ## Build qwentts.cpp runtime
 
 ```bash
-cargo run -p qwen-tts-cli -- setup-script --target cpu > setup.sh
-bash setup.sh
+cargo run -p qwen-tts-cli -- backend status
+cargo run -p qwen-tts-cli -- backend setup
 ```
 
-CUDA example:
+The GUI also shows backend status and can run the same setup flow from the
+`建置 backend` button.
+
+Script generator for manual qwentts.cpp builds:
 
 ```bash
-cargo run -p qwen-tts-cli -- setup-script --target cuda > setup.sh
+cargo run -p qwen-tts-cli -- setup-script --target cpu > setup.sh
 bash setup.sh
 ```
 

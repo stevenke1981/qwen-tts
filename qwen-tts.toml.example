@@ -1,5 +1,5 @@
 # Example config for the Rust wrapper.
-qwen_tts_bin = "./vendor/qwentts.cpp/build/bin/qwen-tts"
+qwen_tts_bin = "./vendor/qwentts.cpp/build/Release/qwen-tts.exe"
 talker_model = "./models/qwen-talker-1.7b-base-Q8_0.gguf"
 codec_model = "./models/qwen-tokenizer-12hz-Q8_0.gguf"
 default_lang = "Chinese"

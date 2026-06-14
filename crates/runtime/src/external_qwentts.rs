@@ -2,7 +2,11 @@ use crate::{
     BackendError, BackendResult, DeviceKind, RuntimeBackend, SynthesisRequest, SynthesisResponse,
 };
 use qwen_tts_core::{validate_wav_file, AudioSpec};
-use std::{path::PathBuf, process::Command};
+use std::{
+    io::Write,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 use tracing::{debug, error, info};
 
 #[derive(Debug, Clone)]
@@ -17,18 +21,6 @@ impl ExternalQwenTtsBackend {
         Self {
             qwen_tts_bin: qwen_tts_bin.into(),
             device,
-        }
-    }
-
-    fn device_arg(device: DeviceKind) -> Option<&'static str> {
-        match device {
-            DeviceKind::Auto => None,
-            DeviceKind::Cpu => Some("cpu"),
-            DeviceKind::Cuda => Some("cuda"),
-            DeviceKind::Rocm => Some("rocm"),
-            DeviceKind::Metal => Some("metal"),
-            DeviceKind::Wgpu => Some("vulkan"),
-            DeviceKind::Sycl => Some("sycl"),
         }
     }
 }
@@ -63,19 +55,13 @@ impl RuntimeBackend for ExternalQwenTtsBackend {
             .arg(&request.models.talker.path)
             .arg("--codec")
             .arg(&request.models.codec.path)
-            .arg("--text")
-            .arg(&request.text)
             .arg("--lang")
             .arg(&request.language)
-            .arg("--out")
+            .arg("-o")
             .arg(&request.out_path);
 
         if let Some(speaker) = &request.speaker {
             command.arg("--speaker").arg(speaker);
-        }
-
-        if let Some(device) = Self::device_arg(request.device) {
-            command.arg("--device").arg(device);
         }
 
         debug!(
@@ -89,7 +75,19 @@ impl RuntimeBackend for ExternalQwenTtsBackend {
             "starting qwentts process"
         );
 
-        let output = command.output()?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        {
+            let stdin = child.stdin.as_mut().ok_or_else(|| {
+                BackendError::InvalidRequest("failed to open qwentts stdin".into())
+            })?;
+            stdin.write_all(request.text.as_bytes())?;
+        }
+
+        let output = child.wait_with_output()?;
         if !output.status.success() {
             error!(
                 backend = self.name(),

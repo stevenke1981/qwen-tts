@@ -134,7 +134,7 @@ impl RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            qwen_tts_bin: PathBuf::from("./vendor/qwentts.cpp/build/bin/qwen-tts"),
+            qwen_tts_bin: default_qwentts_bin(),
             talker_model: PathBuf::from("./models/qwen-talker-1.7b-base-Q8_0.gguf"),
             codec_model: PathBuf::from("./models/qwen-tokenizer-12hz-Q8_0.gguf"),
             default_lang: "Chinese".to_owned(),
@@ -142,6 +142,14 @@ impl Default for RuntimeConfig {
             default_threads: None,
             output_dir: PathBuf::from("./out"),
         }
+    }
+}
+
+fn default_qwentts_bin() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("./vendor/qwentts.cpp/build/Release/qwen-tts.exe")
+    } else {
+        PathBuf::from("./vendor/qwentts.cpp/build/qwen-tts")
     }
 }
 

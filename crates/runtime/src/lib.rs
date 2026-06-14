@@ -1,6 +1,7 @@
 //! Runtime trait, scheduler, and external qwentts.cpp adapter.
 
 pub mod backend;
+pub mod backend_setup;
 pub mod config;
 pub mod device;
 pub mod external_qwentts;
@@ -10,6 +11,11 @@ pub mod scheduler;
 
 pub use backend::{
     BackendError, BackendResult, RuntimeBackend, SynthesisRequest, SynthesisResponse,
+};
+pub use backend_setup::{
+    backend_executable_candidates, backend_status, default_backend_executable,
+    default_backend_source_dir, find_qwentts_executable, setup_qwentts_backend, BackendSetupError,
+    BackendSetupResult, BackendStatus, DEFAULT_QWENTTS_REPO,
 };
 pub use config::{ConfigError, ConfigResult, RuntimeConfig};
 pub use device::DeviceKind;

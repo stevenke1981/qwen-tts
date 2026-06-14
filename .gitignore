@@ -3,6 +3,7 @@
 /${PROJECT_ROOT}/
 /models/*.gguf
 /models/*.part
+/vendor/qwentts.cpp/
 /output*.wav
 *.log
 
