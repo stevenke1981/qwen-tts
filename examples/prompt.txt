@@ -1,0 +1,1 @@
+你好，這是 Rust 本機語音生成測試。這個版本使用 workspace 架構，方便日後加入 CUDA、Metal、WGPU 等後端。

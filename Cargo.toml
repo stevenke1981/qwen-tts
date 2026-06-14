@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/runtime",
+    "crates/backends/cpu",
+    "crates/backends/cuda",
+    "crates/backends/rocm",
+    "crates/backends/metal",
+    "crates/backends/wgpu",
+    "crates/backends/sycl",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["Steven <stevenke1981@gmail.com>"]
+repository = "https://example.local/qwen-tts"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

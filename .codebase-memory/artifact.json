@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "commit": "",
+  "indexed_at": "1781419167",
+  "project": "cbrlm+D-qwen_tts",
+  "nodes": 291,
+  "edges": 402,
+  "original_size": 507904,
+  "compressed_size": 83681,
+  "compression_level": 3
+}

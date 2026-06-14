@@ -1,0 +1,5 @@
+/target
+/.opencode/
+/models/*.gguf
+/output*.wav
+*.log
