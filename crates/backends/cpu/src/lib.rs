@@ -114,11 +114,7 @@ impl RuntimeBackend for CpuBackend {
         })?;
 
         let f32_samples = ctx
-            .synthesize(
-                &request.text,
-                &request.language,
-                request.speaker.as_deref(),
-            )
+            .synthesize(request)
             .map_err(|e| BackendError::InvalidRequest(format!("synthesis failed: {e}")))?;
 
         drop(guard); // release the lock before file I/O
