@@ -1,6 +1,8 @@
 use eframe::egui;
 use qwen_tts_backend_cpu::CpuBackend;
 use qwen_tts_core::TtsModelSet;
+#[cfg(feature = "ffi")]
+use qwen_tts_runtime::FfiBackend;
 use qwen_tts_runtime::{
     backend_status, default_backend_executable, default_model_status, default_voice_output_path,
     ensure_default_models_with_progress, find_qwentts_executable, setup_qwentts_backend,
@@ -75,6 +77,8 @@ enum WorkerMessage {
 enum BackendMode {
     NativeCpu,
     Qwentts,
+    #[cfg(feature = "ffi")]
+    Ffi,
 }
 
 impl BackendMode {
@@ -82,6 +86,8 @@ impl BackendMode {
         match self {
             Self::NativeCpu => "Native CPU (Rust)",
             Self::Qwentts => "qwentts.cpp",
+            #[cfg(feature = "ffi")]
+            Self::Ffi => "FFI (in-process)",
         }
     }
 }
@@ -91,11 +97,23 @@ struct QwenTtsApp {
     text: String,
     language: String,
     speaker: String,
+    instruct: String,
+    ref_audio_path: String,
+    ref_text: String,
     qwen_tts_bin: String,
     models_dir: String,
     output_path: String,
     device: DeviceKind,
     backend_mode: BackendMode,
+    seed: String,
+    temperature: String,
+    top_k: String,
+    top_p: String,
+    repetition_penalty: String,
+    max_tokens: String,
+    no_sample: bool,
+    flash_attention: bool,
+    clamp_fp16: bool,
     status: String,
     busy: bool,
     prompted_for_missing_models: bool,
@@ -114,11 +132,23 @@ impl Default for QwenTtsApp {
             text: "你好，這是 Qwen TTS GUI 測試。".to_owned(),
             language: "Chinese".to_owned(),
             speaker: String::new(),
+            instruct: String::new(),
+            ref_audio_path: String::new(),
+            ref_text: String::new(),
             qwen_tts_bin: qwen_tts_bin.display().to_string(),
             models_dir: project_models_dir().display().to_string(),
             output_path: default_voice_output_path().display().to_string(),
             device: DeviceKind::Auto,
             backend_mode: BackendMode::NativeCpu,
+            seed: String::new(),
+            temperature: String::new(),
+            top_k: String::new(),
+            top_p: String::new(),
+            repetition_penalty: String::new(),
+            max_tokens: String::new(),
+            no_sample: false,
+            flash_attention: false,
+            clamp_fp16: false,
             status: "就緒".to_owned(),
             busy: false,
             prompted_for_missing_models: false,
@@ -279,55 +309,68 @@ impl QwenTtsApp {
         ui.heading("Backend");
         ui.horizontal_wrapped(|ui| {
             ui.label("模式");
+            #[cfg(feature = "ffi")]
+            {
+                ui.radio_value(&mut self.backend_mode, BackendMode::Ffi, "FFI (in-process)");
+            }
             for mode in [BackendMode::NativeCpu, BackendMode::Qwentts] {
                 ui.radio_value(&mut self.backend_mode, mode, mode.label());
             }
         });
 
+        let status_str = match self.backend_mode {
+            BackendMode::NativeCpu => "原生 Rust CPU backend — 純 Rust 實作（實驗性質）",
+            #[cfg(feature = "ffi")]
+            BackendMode::Ffi => "FFI in-process backend — 直接呼叫 qwentts.cpp 共享函式庫",
+            BackendMode::Qwentts => "外部 qwen-tts 子行程後端",
+        };
+        ui.label(status_str);
+
         if self.backend_mode == BackendMode::NativeCpu {
-            ui.label("狀態：原生 Rust CPU backend — 透過 FFI 呼叫 qwentts.cpp 進行完整合成");
             return;
         }
 
-        let status = current_backend_status(Some(&self.qwen_tts_bin));
-        egui::Grid::new("backend_status_grid")
-            .num_columns(2)
-            .spacing([18.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("狀態");
-                ui.label(if status.is_available() {
-                    "已就緒"
-                } else {
-                    "缺少 qwen-tts backend"
+        if self.backend_mode == BackendMode::Qwentts {
+            let status = current_backend_status(Some(&self.qwen_tts_bin));
+            egui::Grid::new("backend_status_grid")
+                .num_columns(2)
+                .spacing([18.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("狀態");
+                    ui.label(if status.is_available() {
+                        "已就緒"
+                    } else {
+                        "缺少 qwen-tts backend"
+                    });
+                    ui.end_row();
+
+                    ui.label("執行檔");
+                    ui.monospace(
+                        status
+                            .resolved_executable
+                            .as_ref()
+                            .unwrap_or(&status.expected_executable)
+                            .display()
+                            .to_string(),
+                    );
+                    ui.end_row();
                 });
-                ui.end_row();
 
-                ui.label("執行檔");
-                ui.monospace(
-                    status
-                        .resolved_executable
-                        .as_ref()
-                        .unwrap_or(&status.expected_executable)
-                        .display()
-                        .to_string(),
-                );
-                ui.end_row();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("重新偵測 backend"))
+                    .clicked()
+                {
+                    self.refresh_backend_path();
+                }
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("建置 backend"))
+                    .clicked()
+                {
+                    self.start_backend_setup();
+                }
             });
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("重新偵測 backend"))
-                .clicked()
-            {
-                self.refresh_backend_path();
-            }
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("建置 backend"))
-                .clicked()
-            {
-                self.start_backend_setup();
-            }
-        });
+        }
     }
 
     fn download_prompt_window(&mut self, ctx: &egui::Context) {
@@ -400,13 +443,13 @@ impl QwenTtsApp {
         ui.label("文字");
         ui.add(
             egui::TextEdit::multiline(&mut self.text)
-                .desired_rows(7)
+                .desired_rows(5)
                 .lock_focus(true),
         );
 
         egui::Grid::new("synthesis_form")
             .num_columns(2)
-            .spacing([18.0, 8.0])
+            .spacing([18.0, 6.0])
             .show(ui, |ui| {
                 ui.label("語言");
                 ui.text_edit_singleline(&mut self.language);
@@ -416,9 +459,23 @@ impl QwenTtsApp {
                 ui.text_edit_singleline(&mut self.speaker);
                 ui.end_row();
 
-                ui.label("qwen-tts 執行檔");
-                ui.text_edit_singleline(&mut self.qwen_tts_bin);
+                ui.label("指令 (instruct)");
+                ui.text_edit_singleline(&mut self.instruct);
                 ui.end_row();
+
+                ui.label("參考音檔");
+                ui.text_edit_singleline(&mut self.ref_audio_path);
+                ui.end_row();
+
+                ui.label("參考文字");
+                ui.text_edit_singleline(&mut self.ref_text);
+                ui.end_row();
+
+                if self.backend_mode == BackendMode::Qwentts || self.backend_mode == BackendMode::NativeCpu {
+                    ui.label("qwen-tts 執行檔");
+                    ui.text_edit_singleline(&mut self.qwen_tts_bin);
+                    ui.end_row();
+                }
 
                 ui.label("輸出 WAV");
                 ui.text_edit_singleline(&mut self.output_path);
@@ -438,6 +495,42 @@ impl QwenTtsApp {
             ] {
                 ui.radio_value(&mut self.device, device, device.to_string());
             }
+        });
+
+        ui.add_space(4.0);
+        ui.collapsing("進階參數", |ui| {
+            egui::Grid::new("advanced_params")
+                .num_columns(2)
+                .spacing([18.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("隨機種子 (seed)");
+                    ui.text_edit_singleline(&mut self.seed);
+                    ui.end_row();
+
+                    ui.label("溫度 (temperature)");
+                    ui.text_edit_singleline(&mut self.temperature);
+                    ui.end_row();
+
+                    ui.label("Top-K");
+                    ui.text_edit_singleline(&mut self.top_k);
+                    ui.end_row();
+
+                    ui.label("Top-P");
+                    ui.text_edit_singleline(&mut self.top_p);
+                    ui.end_row();
+
+                    ui.label("重複懲罰 (repetition penalty)");
+                    ui.text_edit_singleline(&mut self.repetition_penalty);
+                    ui.end_row();
+
+                    ui.label("最大 tokens");
+                    ui.text_edit_singleline(&mut self.max_tokens);
+                    ui.end_row();
+                });
+
+            ui.checkbox(&mut self.no_sample, "停用隨機採樣 (do_sample=false)");
+            ui.checkbox(&mut self.flash_attention, "Flash Attention");
+            ui.checkbox(&mut self.clamp_fp16, "Clamp FP16");
         });
     }
 
@@ -546,16 +639,16 @@ impl QwenTtsApp {
             text,
             language: self.language.clone(),
             speaker: non_empty_string(&self.speaker),
-            instruct: None,
-            ref_audio_path: None,
-            ref_text: None,
-            seed: None,
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            repetition_penalty: None,
-            do_sample: None,
+            instruct: non_empty_string(&self.instruct),
+            ref_audio_path: non_empty_string(&self.ref_audio_path).map(PathBuf::from),
+            ref_text: non_empty_string(&self.ref_text),
+            seed: self.seed.trim().parse().ok(),
+            max_new_tokens: self.max_tokens.trim().parse().ok(),
+            temperature: self.temperature.trim().parse().ok(),
+            top_k: self.top_k.trim().parse().ok(),
+            top_p: self.top_p.trim().parse().ok(),
+            repetition_penalty: self.repetition_penalty.trim().parse().ok(),
+            do_sample: (!self.no_sample).then_some(true),
             out_path: PathBuf::from(self.output_path.clone()),
             device: self.device,
             models: TtsModelSet::new(
@@ -565,13 +658,16 @@ impl QwenTtsApp {
         };
         let qwen_tts_bin = PathBuf::from(self.qwen_tts_bin.clone());
         let backend_mode = self.backend_mode;
+        let use_flash_attn = self.flash_attention;
+        let clamp_fp16 = self.clamp_fp16;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.busy = true;
         self.set_status("正在合成...");
 
         thread::spawn(move || {
-            let result = run_synthesis(backend_mode, qwen_tts_bin, &request, &sender);
+            let result =
+                run_synthesis(backend_mode, qwen_tts_bin, &request, use_flash_attn, clamp_fp16, &sender);
             let _ = sender.send(WorkerMessage::SynthesisFinished(result));
         });
     }
@@ -581,6 +677,8 @@ fn run_synthesis(
     backend_mode: BackendMode,
     qwen_tts_bin: PathBuf,
     request: &SynthesisRequest,
+    _use_flash_attn: bool,
+    _clamp_fp16: bool,
     sender: &Sender<WorkerMessage>,
 ) -> Result<String, String> {
     let models_dir = request
@@ -602,6 +700,20 @@ fn run_synthesis(
     let mut scheduler = Scheduler::new();
     match backend_mode {
         BackendMode::NativeCpu => scheduler.register(CpuBackend::new()),
+        #[cfg(feature = "ffi")]
+        BackendMode::Ffi => {
+            let use_flash_attn = _use_flash_attn;
+            let clamp_fp16 = _clamp_fp16;
+            scheduler.register(FfiBackend {
+                use_flash_attn,
+                clamp_fp16,
+                ..FfiBackend::new(
+                    &request.models.talker.path,
+                    &request.models.codec.path,
+                    request.device,
+                )
+            });
+        }
         BackendMode::Qwentts => {
             scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, request.device));
         }
@@ -610,10 +722,10 @@ fn run_synthesis(
         .synthesize(request)
         .map_err(|err| err.to_string())?;
 
-    let backend_note = if response.backend_name == "native-cpu-rust" {
-        "，Native CPU Rust 實驗 backend"
-    } else {
-        ""
+    let backend_note = match response.backend_name.as_str() {
+        "native-cpu-rust" => "，Native CPU Rust 實驗 backend",
+        "qwentts.cpp-ffi" => "，FFI in-process backend",
+        _ => "",
     };
 
     Ok(format!(

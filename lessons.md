@@ -33,3 +33,9 @@
 **Trigger:** CLI `cmd_info()` used `probe.architecture()` and `probe.description()` which don't exist on `GgufProbe` struct.
 **Rule:** Before calling methods on a Rust type from a crate you didn't write today, read the struct definition and `impl` block to verify the method exists. Guess-by-name (e.g., `probe.architecture()`) is not reliable for types with limited public API. Use `grep "pub fn"` on the source file to enumerate available methods.
 **Source:** codec-decoder-rust (CLI tool)
+
+---
+## Lesson #7 - 2026-06-14
+**Trigger:** Adding fields to `SynthesisRequest` broke 6 construction sites (config.rs, scheduler.rs, backend tests, CLI, app, CPU backend).
+**Rule:** Before adding required fields to a widely-used struct, grep for every construction site (`StructName {`) and update all of them in the same commit to avoid intermediate broken states.
+**Source:** ffi-backend-completeness
