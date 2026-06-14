@@ -20,5 +20,8 @@ qwen-tts-backend-metal = { path = "../backends/metal" }
 qwen-tts-backend-wgpu = { path = "../backends/wgpu" }
 qwen-tts-backend-sycl = { path = "../backends/sycl" }
 
+[features]
+ffi = ["qwen-tts-runtime/ffi"]
+
 [lints]
 workspace = true

@@ -1,6 +1,8 @@
 use clap::{error::ErrorKind, Parser, Subcommand, ValueEnum};
 use qwen_tts_backend_cpu::CpuBackend;
 use qwen_tts_core::{graph::TtsGraph, GgufProbe, TtsModelSet};
+#[cfg(feature = "ffi")]
+use qwen_tts_runtime::FfiBackend;
 use qwen_tts_runtime::{
     backend_status, default_backend_executable, default_model_status, default_voice_output_path,
     ensure_default_models_with_progress, find_qwentts_executable, setup_qwentts_backend,
@@ -109,6 +111,8 @@ impl SetupTarget {
 enum BackendMode {
     NativeCpu,
     Qwentts,
+    #[cfg(feature = "ffi")]
+    Ffi,
 }
 
 #[derive(Debug, Parser)]
@@ -214,6 +218,10 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
             let qwen_tts_bin =
                 resolve_backend_executable(&project_root, args.qwen_tts_bin.as_ref())?;
             scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, args.device));
+        }
+        #[cfg(feature = "ffi")]
+        BackendMode::Ffi => {
+            scheduler.register(FfiBackend::new(talker.clone(), codec.clone(), args.device));
         }
     }
 
@@ -533,6 +541,17 @@ mod tests {
             panic!("expected setup-script command");
         };
         assert_eq!(args.target, SetupTarget::Cpu);
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn parses_synth_backend_ffi() {
+        let cli = parse(["qwen-tts", "synth", "--text", "hi", "--backend", "ffi"]);
+
+        let Command::Synth(args) = cli.command else {
+            panic!("expected synth command");
+        };
+        assert_eq!(args.backend, BackendMode::Ffi);
     }
 
     #[test]
