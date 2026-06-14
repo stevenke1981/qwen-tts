@@ -4,7 +4,54 @@ Source documents: `PLAN.md`, `SPEC.md`.
 
 ## Active Phase
 
-Phase 2 - Robust runtime.
+Phase 4 - egui desktop app and model setup.
+
+## Task D - GGUF Model Download
+
+Owner: runtime/CLI worker.
+
+Scope:
+
+- `crates/runtime/src/models.rs`
+- `crates/runtime/src/lib.rs`
+- `crates/cli/src/main.rs`
+- `README.md`
+
+Goals:
+
+- Centralize the default qwentts.cpp GGUF catalog.
+- Download the default talker and codec into `./models`.
+- Add CLI status/dry-run/download commands.
+- Auto-download missing default models before `synth`.
+
+Acceptance:
+
+- `cargo run -p qwen-tts-cli -- models download --dry-run`
+- `cargo run -p qwen-tts-cli -- models status`
+- `cargo test --workspace`
+
+## Task E - egui GUI
+
+Owner: GUI worker.
+
+Scope:
+
+- `Cargo.toml`
+- `crates/app/Cargo.toml`
+- `crates/app/src/main.rs`
+- `README.md`
+
+Goals:
+
+- Add a native egui app.
+- Show model status and trigger background GGUF downloads.
+- Provide text, language, speaker, device, runtime binary, and output WAV controls.
+- Run synthesis on a worker thread so the UI remains responsive.
+
+Acceptance:
+
+- `cargo test --workspace`
+- `cargo build --release -p qwen-tts-app`
 
 ## Task A - CLI Parser
 

@@ -7,10 +7,12 @@ Build a Rust local text-to-speech app using Qwen3-TTS GGUF models.
 The architecture must support:
 
 - GGUF model inspection.
+- Default GGUF model download into `./models`.
 - Text-to-WAV generation through qwentts.cpp.
 - A clean Rust runtime abstraction.
+- A native egui GUI for setup and synthesis.
 - Future native CPU/CUDA/ROCm/Metal/WGPU/SYCL backend implementations.
-- Future GUI and streaming playback.
+- Future streaming playback.
 
 ## Non-goals for MVP
 
@@ -39,6 +41,16 @@ Owns:
 - `Scheduler`.
 - `SynthesisRequest` / `SynthesisResponse`.
 - `ExternalQwenTtsBackend`, which calls the qwentts.cpp CLI.
+- Default GGUF model catalog/status/download helpers.
+
+### `crates/app`
+
+Native egui desktop app:
+
+- Model folder status.
+- Default GGUF download button.
+- Text, language, speaker, device, runtime binary, and output path controls.
+- Background download and synthesis workers.
 
 ### `crates/backends/cpu`
 
@@ -89,6 +101,8 @@ Binary entrypoint:
 
 - `inspect`
 - `graph`
+- `models status`
+- `models download`
 - `setup-script`
 - `synth`
 

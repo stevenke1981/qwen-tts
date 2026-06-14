@@ -29,7 +29,21 @@ qwen_tts/
 
 ## Model files
 
-Place these files under `./models`:
+The app can download the default qwentts.cpp GGUF files from
+`Serveurperso/Qwen3-TTS-GGUF` into `./models`:
+
+```bash
+cargo run -p qwen-tts-cli -- models download
+```
+
+Dry-run and status checks:
+
+```bash
+cargo run -p qwen-tts-cli -- models download --dry-run
+cargo run -p qwen-tts-cli -- models status
+```
+
+The default files are:
 
 ```text
 qwen-talker-1.7b-base-Q8_0.gguf
@@ -37,6 +51,7 @@ qwen-tokenizer-12hz-Q8_0.gguf
 ```
 
 The talker model converts text into acoustic codes; the codec/tokenizer model decodes those codes into 24 kHz mono WAV.
+When `synth` uses the default model paths and either file is missing, it downloads the default GGUF files before synthesis.
 
 ## Build Rust workspace
 
@@ -46,18 +61,28 @@ cargo build --workspace
 
 ## Windows release binary
 
-The checked-in Windows build artifact is available at:
+The checked-in Windows build artifacts are available at:
 
 ```text
 dist/qwen-tts.exe
+dist/qwen-tts-gui.exe
 ```
 
 Verify it with:
 
 ```powershell
 Get-FileHash dist/qwen-tts.exe -Algorithm SHA256
+Get-FileHash dist/qwen-tts-gui.exe -Algorithm SHA256
 Get-Content dist/SHA256SUMS.txt
 ```
+
+## Run the egui desktop app
+
+```bash
+cargo run -p qwen-tts-app
+```
+
+The GUI can check/download the default GGUF files, edit synthesis settings, and run text-to-WAV generation through the external qwentts.cpp runtime.
 
 ## Build qwentts.cpp runtime
 

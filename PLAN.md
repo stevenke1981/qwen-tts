@@ -21,6 +21,7 @@
 - [x] Add structured logs.
 - [x] Add wav metadata validation after generation.
 - [x] Add batch synthesis.
+- [x] Add default GGUF model status and download workflow.
 
 ## Phase 3 — qwentts.cpp FFI
 
@@ -31,10 +32,10 @@
 
 ## Phase 4 — GUI
 
-- [ ] Add GUI crate: `crates/app`.
-- [ ] Choose Tauri, egui, or Slint.
-- [ ] Add model path settings.
-- [ ] Add text box, language selector, voice selector, output path selector.
+- [x] Add GUI crate: `crates/app`.
+- [x] Choose Tauri, egui, or Slint.
+- [x] Add model path settings.
+- [x] Add text box, language selector, voice selector, output path selector.
 - [ ] Add playback.
 
 ## Phase 5 — Native backend experiments

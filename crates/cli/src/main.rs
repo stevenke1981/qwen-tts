@@ -1,6 +1,9 @@
 use clap::{error::ErrorKind, Parser, Subcommand, ValueEnum};
 use qwen_tts_core::{graph::TtsGraph, GgufProbe, TtsModelSet};
-use qwen_tts_runtime::{DeviceKind, ExternalQwenTtsBackend, Scheduler, SynthesisRequest};
+use qwen_tts_runtime::{
+    default_model_status, ensure_default_models, DeviceKind, ExternalQwenTtsBackend, Scheduler,
+    SynthesisRequest, DEFAULT_MODELS_DIR, DEFAULT_MODEL_FILES,
+};
 use std::{env, path::PathBuf, process::ExitCode};
 
 const DEFAULT_QWEN_TTS_BIN: &str = "./vendor/qwentts.cpp/build/bin/qwen-tts";
@@ -18,6 +21,7 @@ struct Cli {
 enum Command {
     Inspect(InspectArgs),
     Graph,
+    Models(ModelsArgs),
     SetupScript(SetupScriptArgs),
     Synth(SynthArgs),
 }
@@ -34,6 +38,32 @@ struct InspectArgs {
 struct SetupScriptArgs {
     #[arg(long, default_value = "cpu")]
     target: SetupTarget,
+}
+
+#[derive(Debug, Parser)]
+struct ModelsArgs {
+    #[command(subcommand)]
+    command: ModelsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    Status(ModelPathArgs),
+    Download(ModelDownloadArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ModelPathArgs {
+    #[arg(long, default_value = DEFAULT_MODELS_DIR)]
+    models_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct ModelDownloadArgs {
+    #[arg(long, default_value = DEFAULT_MODELS_DIR)]
+    models_dir: PathBuf,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -103,6 +133,7 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Inspect(args) => inspect(&args),
         Command::Synth(args) => synth(&args),
+        Command::Models(args) => models(&args),
         Command::Graph => {
             graph();
             Ok(())
@@ -126,6 +157,18 @@ fn inspect(args: &InspectArgs) -> Result<(), String> {
 }
 
 fn synth(args: &SynthArgs) -> Result<(), String> {
+    let should_download_defaults = args.talker.is_none()
+        && args.codec.is_none()
+        && env::var_os("QWEN_TTS_TALKER").is_none()
+        && env::var_os("QWEN_TTS_CODEC").is_none();
+    if should_download_defaults {
+        let status = default_model_status(DEFAULT_MODELS_DIR);
+        if !status.is_complete() {
+            println!("default GGUF models missing; downloading to {DEFAULT_MODELS_DIR} ...");
+            ensure_default_models(DEFAULT_MODELS_DIR).map_err(|err| err.to_string())?;
+        }
+    }
+
     let qwen_tts_bin = path_from_arg_env_or_default(
         args.qwen_tts_bin.as_ref(),
         "QWEN_TTS_BIN",
@@ -163,6 +206,58 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn models(args: &ModelsArgs) -> Result<(), String> {
+    match &args.command {
+        ModelsCommand::Status(args) => {
+            print_model_status(&args.models_dir);
+            Ok(())
+        }
+        ModelsCommand::Download(args) => {
+            if args.dry_run {
+                println!(
+                    "would download default GGUF models to {}",
+                    args.models_dir.display()
+                );
+                for file in DEFAULT_MODEL_FILES {
+                    println!(
+                        "{}: {} -> {}",
+                        file.role,
+                        file.url,
+                        file.path_in(&args.models_dir).display()
+                    );
+                }
+                return Ok(());
+            }
+
+            let status = ensure_default_models(&args.models_dir).map_err(|err| err.to_string())?;
+            print_model_status_from(&status);
+            Ok(())
+        }
+    }
+}
+
+fn print_model_status(models_dir: &PathBuf) {
+    let status = default_model_status(models_dir);
+    print_model_status_from(&status);
+}
+
+fn print_model_status_from(status: &qwen_tts_runtime::DefaultModelStatus) {
+    println!("models dir: {}", status.models_dir.display());
+    for file in &status.files {
+        let state = if file.exists { "present" } else { "missing" };
+        let size = file
+            .size_bytes
+            .map_or_else(|| "-".to_owned(), |value| format!("{value} bytes"));
+        println!(
+            "{}: {} ({}) [{}]",
+            file.file.role,
+            file.path.display(),
+            size,
+            state
+        );
+    }
+}
+
 fn graph() {
     let graph = TtsGraph::qwen_tts_default();
     for (index, node) in graph.nodes.iter().enumerate() {
@@ -176,9 +271,10 @@ fn setup_script(args: &SetupScriptArgs) {
     println!("# target: {}", args.target.as_str());
     println!("mkdir -p vendor models");
     println!("if [ ! -d vendor/qwentts.cpp ]; then git clone https://github.com/ServeurpersoCom/qwentts.cpp vendor/qwentts.cpp; fi");
+    println!("huggingface-cli download Serveurperso/Qwen3-TTS-GGUF qwen-talker-1.7b-base-Q8_0.gguf qwen-tokenizer-12hz-Q8_0.gguf --local-dir models");
     println!("cmake -S vendor/qwentts.cpp -B vendor/qwentts.cpp/build -DCMAKE_BUILD_TYPE=Release");
     println!("cmake --build vendor/qwentts.cpp/build --config Release -j --target qwen-tts");
-    println!("echo 'Place GGUF files under ./models, then run cargo run -p qwen-tts-cli -- synth --text ...'");
+    println!("echo 'Run cargo run -p qwen-tts-cli -- synth --text ...'");
 }
 
 fn path_from_arg_env_or_default(
@@ -286,5 +382,19 @@ mod tests {
             panic!("expected setup-script command");
         };
         assert_eq!(args.target, SetupTarget::Cpu);
+    }
+
+    #[test]
+    fn parses_model_download_dry_run() {
+        let cli = parse(["qwen-tts", "models", "download", "--dry-run"]);
+
+        let Command::Models(args) = cli.command else {
+            panic!("expected models command");
+        };
+        let ModelsCommand::Download(download) = args.command else {
+            panic!("expected download command");
+        };
+        assert!(download.dry_run);
+        assert_eq!(download.models_dir, PathBuf::from(DEFAULT_MODELS_DIR));
     }
 }

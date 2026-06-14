@@ -1,1 +1,2 @@
-ad3b64132a3763a52a50d5425d97ca9fb01df455f4d25c175dc0f2c87fdbe9eb  qwen-tts.exe
+a34f4d9dd5aebf3c773abcfa402aee17a8d0ccc81899e2b5d9c27daaed47b2bb  qwen-tts.exe
+80014c22d5d4cb7baf1580aa806551ceeded16d5d97d3cee8083482db0613f87  qwen-tts-gui.exe

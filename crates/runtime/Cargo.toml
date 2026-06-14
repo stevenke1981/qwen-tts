@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ureq = "3.2.1"
 
 [lints]
 workspace = true

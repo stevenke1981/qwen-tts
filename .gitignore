@@ -2,6 +2,7 @@
 /.opencode/
 /${PROJECT_ROOT}/
 /models/*.gguf
+/models/*.part
 /output*.wav
 *.log
 

@@ -9,6 +9,7 @@ members = [
     "crates/backends/wgpu",
     "crates/backends/sycl",
     "crates/cli",
+    "crates/app",
 ]
 resolver = "2"
 
