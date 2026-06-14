@@ -8,16 +8,21 @@
 //! ```rust,no_run
 //! use qwen_tts_sys::safe::QwenTts;
 //!
+//! let talker = std::ffi::CString::new("model.gguf").unwrap();
+//! let codec  = std::ffi::CString::new("codec.gguf").unwrap();
+//! let text   = std::ffi::CString::new("Hello world").unwrap();
+//!
 //! let mut init = QwenTts::init_params();
-//! init.talker_path = std::ffi::CString::new("model.gguf").unwrap().into_raw();
-//! init.codec_path = std::ffi::CString::new("codec.gguf").unwrap().into_raw();
+//! init.talker_path = talker.as_ptr();
+//! init.codec_path = codec.as_ptr();
 //!
 //! let tts = QwenTts::new(&init).expect("qt_init failed");
 //!
 //! let mut params = QwenTts::tts_params();
-//! params.text = std::ffi::CString::new("Hello world").unwrap().into_raw();
+//! params.text = text.as_ptr();
 //!
-//! let audio = tts.synthesize(&params).expect("synthesis failed");
+//! // Safety: the CString pointers stay valid for the duration of the call.
+//! let audio = unsafe { tts.synthesize(&params).expect("synthesis failed") };
 //! println!("Got {} audio samples", audio.len());
 //! ```
 
