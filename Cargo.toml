@@ -11,6 +11,7 @@ members = [
     "crates/cli",
     "crates/app",
     "crates/codec",
+    "crates/qwentts-sys",
 ]
 resolver = "2"
 
