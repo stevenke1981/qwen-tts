@@ -27,3 +27,9 @@
 **Trigger:** DAC output blew up to ±47 (normal expected ±0.14) because SnakeBeta denominator was `1/beta` instead of `1/(exp(beta)+1e-9)`.
 **Rule:** When porting activation functions from ggml to Rust, examine the C++ load-time pre-computation, not just the runtime formula. The C++ code pre-computes `a = exp(alpha)` and `inv_b = 1/(exp(beta)+1e-9)` and stores those, not the raw parameters. If your Rust implementation computes `exp(alpha)` at runtime, make sure you also compute `exp(beta)` and the epsilon-guarded inverse. Don't assume `beta` is used directly as a denominator.
 **Source:** codec-decoder-rust (Task 1: Codec decoder RS)
+
+---
+## Lesson #6 - 2026-06-14
+**Trigger:** CLI `cmd_info()` used `probe.architecture()` and `probe.description()` which don't exist on `GgufProbe` struct.
+**Rule:** Before calling methods on a Rust type from a crate you didn't write today, read the struct definition and `impl` block to verify the method exists. Guess-by-name (e.g., `probe.architecture()`) is not reliable for types with limited public API. Use `grep "pub fn"` on the source file to enumerate available methods.
+**Source:** codec-decoder-rust (CLI tool)
