@@ -3,13 +3,14 @@
 Rust workspace for building a local speech generation app with Qwen3-TTS GGUF
 models.
 
-Three backends are available:
+Four backends are available:
 
 | Backend | Mode | Default | Description |
 |---------|------|---------|-------------|
 | `ffi` | In-process FFI | ✅ (since v0.1) | Direct calls into qwentts.cpp shared library |
 | `qwentts` | Subprocess | | External `qwen-tts` CLI executable |
 | `native-cpu` | In-process FFI | | Wraps qwentts.cpp via `qwentts-sys` with WAV write in Rust |
+| `pure-rust` | Pure Rust (candle) | 🚧 WIP | Zero C++ dependency — candle 0.10.x, GGUF dequant→F32 |
 
 ## Layout
 
@@ -22,6 +23,7 @@ qwen_tts/
 │   ├── runtime/       — Backend trait, scheduler, config, model download
 │   ├── backends/
 │   │   ├── cpu/       — Native CPU backend (FFI to qwentts.cpp)
+│   │   ├── pure-rust/ — Pure Rust backend (candle 0.10.x, no C++) 🚧
 │   │   ├── cuda/      — (skeleton)
 │   │   ├── rocm/      — (skeleton)
 │   │   ├── metal/     — (skeleton)
@@ -180,7 +182,7 @@ All available flags:
 | `--repetition-penalty` | Repetition penalty (≥ 1.0) |
 | `--max-tokens` | Maximum output tokens |
 | `--no-sample` | Disable random sampling (greedy decode) |
-| `--backend` | `ffi` (default), `qwentts`, or `native-cpu` |
+| `--backend` | `ffi` (default), `qwentts`, `native-cpu`, or `pure-rust` (🚧 WIP) |
 | `--device` | `auto`, `cpu`, `cuda`, `rocm`, `metal`, `wgpu`, `sycl` |
 | `--out` | Output WAV path (default: `output/voice-<timestamp>.wav`) |
 
@@ -194,9 +196,36 @@ QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --backend qwen
 
 ## Roadmap
 
+### ✅ Completed
 - [x] CLI: GGUF inspect, model download, TOML config, batch synth
 - [x] FFI: In-process qwentts.cpp backend (`--backend ffi`), voice cloning
 - [x] GUI: egui desktop app with model mgmt, synthesis form, audio playback
-- [ ] End-to-end integration test against real Qwen3-TTS GGUF files
-- [ ] Pure-Rust CPU backend (replace qwentts.cpp dependency)
+- [x] CLI/GUI integration test suite (4 e2e, 4 unit)
+- [x] Codec decoder + DAC in pure Rust (54 tests)
+- [x] Pure-Rust talker transformer: Qwen2 (RoPE, GQA, SwiGLU, RMSNorm)
+- [x] Pure-Rust code predictor (MTP heads, 15 acoustic codebooks)
+- [x] BPE tokenizer via `tokenizers` 0.21
+- [x] Top-k / top-p / temperature sampling (pure Rust)
+- [x] Pipeline wiring: tokenize → talker → code predictor → codec decoder → WAV
+- [x] Tensor naming + metadata correction for real qwen3-tts GGUF
+- [x] GGUF probe utilities for tensor/metadata discovery
+
+### 🚧 In Progress — Pure Rust Backend
+```
+Status: 83% (10/12 tasks)
+
+Core modules      ■■■■■■■■■■  all implemented
+Unit tests        ■■■■■■■■■■  19/19 pass
+E2E structure     ■■■■■■■■■■  3/3 pass
+Heavy e2e (8GB+)  □□□□□□□□□□  #[ignore] — needs real GGUF load
+Codebook 0 pred   □□□□□□□□□□  placeholder (talker.codec_head.weight)
+MRoPE support     □□□□□□□□□□  talker uses standard RoPE, model needs MRoPE
+```
+
+### 📋 Next Steps
+- [ ] Run heavy E2E tests (`test_talker_loads`, `test_code_predictor_loads`, `test_pipeline_full_synthesize`) — requires ~8-10 GB RAM
+- [ ] Replace codebook-0 placeholder with actual `talker.codec_head.weight` prediction
+- [ ] Implement MRoPE (Multi-Resolution RoPE) for talker — see `qwen3-tts.talker.rope.mrope_section`
+- [ ] Implement autoregressive frame generation (recurrent hidden state)
+- [ ] Cross-validate: pure-rust output == FFI backend output (same seed, bit-exact)
 - [ ] Native CUDA / Metal / WGPU / ROCm / SYCL backends
