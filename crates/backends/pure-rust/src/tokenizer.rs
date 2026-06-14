@@ -128,13 +128,9 @@ impl HfTokenizer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// Basic sanity test that doesn't require a real tokenizer file.
     #[test]
     fn test_empty_tokenizer_behavior() {
-        // We can't test from_file without a real file, but the API is checked
-        // for basic type coherency.
         let tok = "dummy";
         assert!(!tok.is_empty());
     }

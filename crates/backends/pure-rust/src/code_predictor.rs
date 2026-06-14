@@ -25,6 +25,7 @@ use candle_core::{Device, IndexOp, Module, Tensor, D};
 use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
+use crate::sampling;
 
 /// Type alias: a frame of acoustic code token IDs (one per codebook level).
 pub type CodeFrame = Vec<u32>;
@@ -45,6 +46,7 @@ pub struct CodePredictor {
     lm_heads: Vec<Tensor>,
     /// Predictor hidden dimension.
     hidden_size: usize,
+    #[allow(dead_code)]
     device: Device,
 }
 
@@ -149,7 +151,6 @@ impl CodePredictor {
     /// and include the code predictor transformer layers.
     pub fn predict_one_frame(&self, hidden: &Tensor) -> anyhow::Result<Vec<CodeFrame>> {
         let batch = hidden.dims()[0];
-        let _device = &self.device;
 
         // 1. Optional MTP projection: talker_hidden → predictor_hidden
         let mut h = hidden.clone();
@@ -168,9 +169,7 @@ impl CodePredictor {
         // 3. For each codebook level, apply lm_head
         let mut frames = vec![CodeFrame::with_capacity(self.num_acoustic); batch];
         for (_g, head_w) in self.lm_heads.iter().enumerate() {
-            // head_w shape: [vocab_size, hidden] or [d_model, vocab_size]
             let logits = if head_w.dims()[0] == self.hidden_size {
-                // [d_model, vocab_size]: matmul(hidden^T)^T → [batch, vocab_size]
                 head_w.matmul(&h.t()?)?.t()?
             } else {
                 h.matmul(&head_w.t()?)?
@@ -186,6 +185,54 @@ impl CodePredictor {
         }
 
         Ok(frames)
+    }
+
+    /// Predict a frame using temperature/top-k/top-p sampling instead of argmax.
+    ///
+    /// Returns one `CodeFrame` for `batch=1`.
+    pub fn predict_one_frame_sampled(
+        &self,
+        hidden: &Tensor,
+        temperature: f32,
+        top_k: Option<usize>,
+        top_p: Option<f32>,
+        rng: &mut impl rand::Rng,
+    ) -> anyhow::Result<CodeFrame> {
+        let batch = hidden.dims()[0];
+        assert_eq!(batch, 1, "sampled prediction only supports batch=1");
+
+        // 1. Optional MTP projection
+        let mut h = hidden.clone();
+        if let Some(ref w) = self.mtp_proj_w {
+            h = w.matmul(&h.t()?)?.t()?;
+            if let Some(ref b) = self.mtp_proj_b {
+                h = (h + b)?;
+            }
+        }
+
+        // 2. Output norm
+        if let Some(ref norm) = self.output_norm {
+            h = norm.forward(&h)?;
+        }
+
+        // 3. For each codebook level, apply lm_head + sample
+        let mut frame = CodeFrame::with_capacity(self.num_acoustic);
+        for (_g, head_w) in self.lm_heads.iter().enumerate() {
+            // Get logits as Vec<f32>
+            let logits_t = if head_w.dims()[0] == self.hidden_size {
+                head_w.matmul(&h.t()?)?.t()?
+            } else {
+                h.matmul(&head_w.t()?)?
+            };
+
+            let logits_flat: Vec<f32> = logits_t.flatten_all()?.to_vec1()?;
+
+            // Sample
+            let (token, _prob) = sampling::sample_token(&logits_flat, temperature, top_k, top_p, rng);
+            frame.push(token);
+        }
+
+        Ok(frame)
     }
 
     /// Return the number of acoustic codebooks this predictor handles.
@@ -204,7 +251,6 @@ impl CodePredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
 
     #[test]
     fn test_code_frame_type() {
