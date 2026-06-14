@@ -14,4 +14,5 @@
 pub mod conv;
 pub mod gguf;
 pub mod q8_0;
+pub mod pre_conv;
 pub mod quantizer;
