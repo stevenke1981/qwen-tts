@@ -585,6 +585,54 @@ mod tests {
         assert_eq!(args.backend, BackendMode::Ffi);
     }
 
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn parses_synth_ffi_advanced_params() {
+        let cli = parse([
+            "qwen-tts",
+            "synth",
+            "--text",
+            "hello",
+            "--backend",
+            "ffi",
+            "--speaker",
+            "ann",
+            "--instruct",
+            "speak slowly",
+            "--seed",
+            "42",
+            "--temperature",
+            "0.9",
+            "--top-k",
+            "50",
+            "--top-p",
+            "0.9",
+            "--repetition-penalty",
+            "1.2",
+            "--max-tokens",
+            "512",
+            "--no-sample",
+            "--flash-attention",
+            "--clamp-fp16",
+        ]);
+
+        let Command::Synth(args) = cli.command else {
+            panic!("expected synth command");
+        };
+        assert_eq!(args.backend, BackendMode::Ffi);
+        assert_eq!(args.speaker, Some(String::from("ann")));
+        assert_eq!(args.instruct, Some(String::from("speak slowly")));
+        assert_eq!(args.seed, Some(42));
+        assert_eq!(args.temperature, Some(0.9));
+        assert_eq!(args.top_k, Some(50));
+        assert_eq!(args.top_p, Some(0.9));
+        assert_eq!(args.repetition_penalty, Some(1.2));
+        assert_eq!(args.max_tokens, Some(512));
+        assert!(args.no_sample);
+        assert!(args.flash_attention);
+        assert!(args.clamp_fp16);
+    }
+
     #[test]
     fn parses_model_download_dry_run() {
         let cli = parse(["qwen-tts", "models", "download", "--dry-run"]);
