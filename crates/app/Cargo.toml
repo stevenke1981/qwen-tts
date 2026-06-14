@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.27.2"
+rodio = { version = "0.19", default-features = false, features = ["wav"] }
 qwen-tts-backend-cpu = { path = "../backends/cpu" }
 qwen-tts-core = { path = "../core" }
 qwen-tts-runtime = { path = "../runtime" }
