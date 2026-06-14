@@ -71,14 +71,14 @@ pub fn dequantize_q8_0_block(data: &[u8]) -> [f32; Q8_0_VALUES] {
 }
 
 /// Convert 2-byte half-float (IEEE 754-16) to f32.
-fn f16_to_f32(bytes: &[u8]) -> f32 {
+pub(crate) fn f16_to_f32(bytes: &[u8]) -> f32 {
     debug_assert!(bytes.len() >= 2);
     let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
     f16_bits_to_f32(bits)
 }
 
 /// Convert a u16 representing an IEEE 754 half-precision float to f32.
-fn f16_bits_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
     let raw_sign = (h >> 15) & 0x1;
     let raw_exp = (h >> 10) & 0x1F;   // 5-bit exponent
     let raw_mant = h & 0x03FF;         // 10-bit mantissa
