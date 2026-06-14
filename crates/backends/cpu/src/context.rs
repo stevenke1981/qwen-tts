@@ -6,8 +6,8 @@
 //! pipeline and returns mono f32 PCM samples at 24 kHz.
 
 use crate::ffi::{
-    qt_audio, qt_audio_free, qt_context, qt_free, qt_init, qt_init_default_params, qt_init_params,
-    qt_last_error, qt_synthesize, qt_tts_params, QT_ABI_VERSION, QT_STATUS_OK,
+    qt_audio, qt_audio_free, qt_context, qt_free, qt_init, qt_init_default_params, qt_last_error,
+    qt_synthesize, qt_tts_default_params, qt_tts_params, qt_version, QT_ABI_VERSION, QT_STATUS_OK,
 };
 use std::ffi::CString;
 use std::path::Path;
@@ -57,25 +57,39 @@ impl NativeContext {
         let talker_cstr = Self::path_to_cstr(talker_path, "talker")?;
         let codec_cstr = Self::path_to_cstr(codec_path, "codec")?;
 
-        let mut init_params = qt_init_params {
-            abi_version: QT_ABI_VERSION,
-            talker_path: talker_cstr.as_ptr(),
-            codec_path: codec_cstr.as_ptr(),
-            use_fa: false, // CPU only; flash attention is GPU-only
-            clamp_fp16: false,
-        };
-
         unsafe {
+            // Log library version
+            let ver = qt_version();
+            if !ver.is_null() {
+                let ver_str = std::ffi::CStr::from_ptr(ver).to_string_lossy();
+                eprintln!("[qwen-tts-cpu] qt_version: {ver_str}");
+            }
+
+            eprintln!(
+                "[qwen-tts-cpu] loading talker: {}",
+                talker_path.display()
+            );
+            eprintln!(
+                "[qwen-tts-cpu] loading codec:  {}",
+                codec_path.display()
+            );
+
+            // Use default params then override paths and CPU-specific flags
+            let mut init_params = std::mem::zeroed();
             qt_init_default_params(&mut init_params);
-            // Override fields we set manually
             init_params.talker_path = talker_cstr.as_ptr();
             init_params.codec_path = codec_cstr.as_ptr();
-            init_params.use_fa = false;
+            init_params.use_fa = false; // CPU always uses F32 chain
+            init_params.clamp_fp16 = false;
 
             let ctx = qt_init(&init_params);
             if ctx.is_null() {
-                return Err(NativeError(Self::last_error()));
+                let err = Self::last_error();
+                eprintln!("[qwen-tts-cpu] qt_init FAILED: {err}");
+                return Err(NativeError(err));
             }
+
+            eprintln!("[qwen-tts-cpu] context initialised successfully");
             Ok(Self { inner: ctx })
         }
     }
@@ -103,40 +117,24 @@ impl NativeContext {
             })
             .transpose()?;
 
-        let params = qt_tts_params {
-            abi_version: QT_ABI_VERSION,
-            text: text_cstr.as_ptr(),
-            lang: lang_cstr.as_ptr(),
-            instruct: std::ptr::null(),
-            speaker: speaker_cstr
-                .as_ref()
-                .map_or(std::ptr::null(), |c| c.as_ptr()),
-            ref_audio_24k: std::ptr::null(),
-            ref_n_samples: 0,
-            ref_text: std::ptr::null(),
-            seed: -1,
-            max_new_tokens: 2048,
-            do_sample: true,
-            temperature: 0.9,
-            top_k: 50,
-            top_p: 1.0,
-            repetition_penalty: 1.05,
-            subtalker_do_sample: true,
-            subtalker_temperature: 0.9,
-            subtalker_top_k: 50,
-            subtalker_top_p: 1.0,
-            dump_dir: std::ptr::null(),
-            cancel: None,
-            cancel_user_data: std::ptr::null_mut(),
-            on_chunk: None,
-            on_chunk_user_data: std::ptr::null_mut(),
-            codec_chunk_sec: 24.0,
-            codec_left_context_sec: 2.0,
-            ref_spk_emb: std::ptr::null(),
-            ref_spk_dim: 0,
-            ref_codes: std::ptr::null(),
-            ref_T: 0,
-        };
+        eprintln!(
+            "[qwen-tts-cpu] synthesize: lang={language}, speaker={} text_len={}",
+            speaker.unwrap_or("(none)"),
+            text.len()
+        );
+
+        // Use qt_tts_default_params for correct defaults, then override
+        let mut params: qt_tts_params;
+        unsafe {
+            params = std::mem::zeroed();
+            qt_tts_default_params(&mut params);
+        }
+        params.abi_version = QT_ABI_VERSION;
+        params.text = text_cstr.as_ptr();
+        params.lang = lang_cstr.as_ptr();
+        params.speaker = speaker_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut audio = qt_audio {
             samples: std::ptr::null_mut(),
@@ -150,6 +148,7 @@ impl NativeContext {
 
             if status != QT_STATUS_OK {
                 let err = Self::last_error();
+                eprintln!("[qwen-tts-cpu] synthesize FAILED (status={status}): {err}");
                 // Free any partial output
                 if !audio.samples.is_null() {
                     qt_audio_free(&mut audio);
@@ -158,15 +157,36 @@ impl NativeContext {
             }
 
             if audio.samples.is_null() || audio.n_samples <= 0 {
+                eprintln!(
+                    "[qwen-tts-cpu] synthesize returned empty audio (samples={:?}, n_samples={})",
+                    audio.samples, audio.n_samples
+                );
                 return Err(NativeError("synthesis returned empty audio".into()));
             }
 
-            // Copy f32 samples from C heap to Rust Vec
+            // Log output audio metadata
             #[allow(clippy::cast_sign_loss)]
             let n = audio.n_samples as usize;
+            eprintln!(
+                "[qwen-tts-cpu] output: n_samples={n} sample_rate={} channels={}",
+                audio.sample_rate, audio.channels
+            );
+
+            // Copy f32 samples from C heap to Rust Vec
             let mut samples = Vec::with_capacity(n);
             std::ptr::copy_nonoverlapping(audio.samples, samples.as_mut_ptr(), n);
             samples.set_len(n);
+
+            // Log sample statistics for diagnostics
+            let (min, max) = samples
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(mn, mx), &s| (mn.min(s), mx.max(s)));
+            let mean =
+                samples.iter().sum::<f32>() / n.max(1) as f32;
+            let first_10: Vec<f32> = samples.iter().take(10).copied().collect();
+            eprintln!(
+                "[qwen-tts-cpu] sample stats: min={min:.4} max={max:.4} mean={mean:.4} first_10={first_10:?}"
+            );
 
             // Free the C allocation
             qt_audio_free(&mut audio);
