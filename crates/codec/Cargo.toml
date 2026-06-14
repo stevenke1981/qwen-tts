@@ -1,0 +1,10 @@
+[package]
+name = "qwen-tts-codec"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qwen-tts-core = { path = "../core" }
+byteorder = "1.5"
+rayon = "1.10"
