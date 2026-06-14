@@ -21,6 +21,7 @@ qwen-tts-backend-wgpu = { path = "../backends/wgpu" }
 qwen-tts-backend-sycl = { path = "../backends/sycl" }
 
 [features]
+default = ["ffi"]
 ffi = ["qwen-tts-runtime/ffi"]
 
 [lints]

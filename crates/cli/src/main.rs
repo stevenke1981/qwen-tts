@@ -115,6 +115,22 @@ enum BackendMode {
     Ffi,
 }
 
+impl std::fmt::Display for BackendMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NativeCpu => write!(f, "native-cpu"),
+            Self::Qwentts => write!(f, "qwentts"),
+            #[cfg(feature = "ffi")]
+            Self::Ffi => write!(f, "ffi"),
+        }
+    }
+}
+
+#[cfg(feature = "ffi")]
+const DEFAULT_BACKEND: BackendMode = BackendMode::Ffi;
+#[cfg(not(feature = "ffi"))]
+const DEFAULT_BACKEND: BackendMode = BackendMode::NativeCpu;
+
 #[derive(Debug, Parser)]
 struct SynthArgs {
     #[arg(long)]
@@ -147,7 +163,7 @@ struct SynthArgs {
     no_sample: bool,
     #[arg(long, default_value = "auto")]
     device: DeviceKind,
-    #[arg(long, default_value = "native-cpu")]
+    #[arg(long, default_value_t = DEFAULT_BACKEND)]
     backend: BackendMode,
     #[arg(long = "bin")]
     qwen_tts_bin: Option<PathBuf>,
@@ -511,6 +527,9 @@ mod tests {
         assert_eq!(args.lang, "Chinese");
         assert_eq!(args.speaker, None);
         assert_eq!(args.device, DeviceKind::Auto);
+        #[cfg(feature = "ffi")]
+        assert_eq!(args.backend, BackendMode::Ffi);
+        #[cfg(not(feature = "ffi"))]
         assert_eq!(args.backend, BackendMode::NativeCpu);
         assert_eq!(args.qwen_tts_bin, None);
         assert_eq!(args.talker, None);
