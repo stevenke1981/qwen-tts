@@ -1,4 +1,4 @@
-use crate::{DeviceKind, ExternalQwenTtsBackend, SynthesisRequest};
+use crate::{DeviceKind, ExternalQwenTtsBackend, SynthesisRequest, DEFAULT_OUTPUT_DIR};
 use qwen_tts_core::TtsModelSet;
 use serde::Deserialize;
 use std::{
@@ -140,7 +140,7 @@ impl Default for RuntimeConfig {
             default_lang: "Chinese".to_owned(),
             default_device: DeviceKind::Auto,
             default_threads: None,
-            output_dir: PathBuf::from("./out"),
+            output_dir: PathBuf::from(DEFAULT_OUTPUT_DIR),
         }
     }
 }
@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(config.default_lang, "Chinese");
         assert_eq!(config.default_device, DeviceKind::Auto);
         assert_eq!(config.default_threads, Some(4));
-        assert_eq!(config.output_dir, PathBuf::from("./out"));
+        assert_eq!(config.output_dir, PathBuf::from("output"));
         assert_eq!(
             config.model_set().talker.path,
             PathBuf::from("./models/qwen-talker-1.7b-base-Q8_0.gguf")

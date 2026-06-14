@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 qwen-tts-core = { path = "../core" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

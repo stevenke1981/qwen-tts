@@ -1,7 +1,7 @@
 use clap::{error::ErrorKind, Parser, Subcommand, ValueEnum};
 use qwen_tts_core::{graph::TtsGraph, GgufProbe, TtsModelSet};
 use qwen_tts_runtime::{
-    backend_status, default_backend_executable, default_model_status,
+    backend_status, default_backend_executable, default_model_status, default_voice_output_path,
     ensure_default_models_with_progress, find_qwentts_executable, setup_qwentts_backend,
     BackendStatus, DeviceKind, ExternalQwenTtsBackend, ModelDownloadProgress, Scheduler,
     SynthesisRequest, DEFAULT_MODELS_DIR, DEFAULT_MODEL_FILES,
@@ -108,8 +108,8 @@ impl SetupTarget {
 struct SynthArgs {
     #[arg(long)]
     text: String,
-    #[arg(long, default_value = "output.wav")]
-    out: PathBuf,
+    #[arg(long)]
+    out: Option<PathBuf>,
     #[arg(long, default_value = "Chinese")]
     lang: String,
     #[arg(long)]
@@ -206,7 +206,7 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         text: args.text.clone(),
         language: args.lang.clone(),
         speaker: args.speaker.clone(),
-        out_path: args.out.clone(),
+        out_path: args.out.clone().unwrap_or_else(default_voice_output_path),
         device: args.device,
         models: TtsModelSet::new(talker, codec),
     };
@@ -450,7 +450,7 @@ mod tests {
             panic!("expected synth command");
         };
         assert_eq!(args.text, "hello");
-        assert_eq!(args.out, PathBuf::from("output.wav"));
+        assert_eq!(args.out, None);
         assert_eq!(args.lang, "Chinese");
         assert_eq!(args.speaker, None);
         assert_eq!(args.device, DeviceKind::Auto);
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(args.lang, "English");
         assert_eq!(args.speaker, Some(String::from("alice")));
         assert_eq!(args.device, DeviceKind::Cuda);
-        assert_eq!(args.out, PathBuf::from("speech.wav"));
+        assert_eq!(args.out, Some(PathBuf::from("speech.wav")));
         assert_eq!(args.qwen_tts_bin, Some(PathBuf::from("qwen-tts-bin")));
         assert_eq!(args.talker, Some(PathBuf::from("talker.gguf")));
         assert_eq!(args.codec, Some(PathBuf::from("codec.gguf")));

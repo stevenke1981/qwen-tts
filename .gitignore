@@ -5,6 +5,8 @@
 /models/*.part
 /vendor/qwentts.cpp/
 /output*.wav
+/output/
+/dist/output*.wav
 *.log
 
 .superpowers/

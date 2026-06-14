@@ -7,6 +7,7 @@ pub mod device;
 pub mod external_qwentts;
 pub mod logging;
 pub mod models;
+pub mod output;
 pub mod scheduler;
 
 pub use backend::{
@@ -27,5 +28,9 @@ pub use models::{
     DefaultModelStatus, ModelDownloadError, ModelDownloadProgress, ModelDownloadResult,
     ModelFileStatus, DEFAULT_CODEC_FILE, DEFAULT_MODELS_DIR, DEFAULT_MODEL_FILES,
     DEFAULT_MODEL_REPO, DEFAULT_TALKER_FILE,
+};
+pub use output::{
+    default_voice_output_path, default_voice_output_path_from, DEFAULT_OUTPUT_DIR,
+    DEFAULT_OUTPUT_PREFIX,
 };
 pub use scheduler::{BatchSynthesisItem, BatchSynthesisResponse, Scheduler};

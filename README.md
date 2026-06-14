@@ -122,14 +122,16 @@ cargo run -p qwen-tts-cli -- inspect \
 cargo run -p qwen-tts-cli -- synth \
   --text "你好，這是 Rust 本機語音生成測試。" \
   --lang Chinese \
-  --device auto \
-  --out output.wav
+  --device auto
 ```
+
+When `--out` is omitted, the WAV is written to `output/voice-<timestamp>.wav`.
+Pass `--out` only when you want a custom path.
 
 If your `qwen-tts` binary is elsewhere:
 
 ```bash
-QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --text "測試" --out output.wav
+QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --text "測試"
 ```
 
 ## Roadmap

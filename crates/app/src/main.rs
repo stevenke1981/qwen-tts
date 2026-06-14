@@ -1,7 +1,7 @@
 use eframe::egui;
 use qwen_tts_core::TtsModelSet;
 use qwen_tts_runtime::{
-    backend_status, default_backend_executable, default_model_status,
+    backend_status, default_backend_executable, default_model_status, default_voice_output_path,
     ensure_default_models_with_progress, find_qwentts_executable, setup_qwentts_backend,
     BackendStatus, DeviceKind, ExternalQwenTtsBackend, ModelDownloadProgress, Scheduler,
     SynthesisRequest, DEFAULT_CODEC_FILE, DEFAULT_MODELS_DIR, DEFAULT_TALKER_FILE,
@@ -99,7 +99,7 @@ impl Default for QwenTtsApp {
             speaker: String::new(),
             qwen_tts_bin: qwen_tts_bin.display().to_string(),
             models_dir: project_models_dir().display().to_string(),
-            output_path: "output.wav".to_owned(),
+            output_path: default_voice_output_path().display().to_string(),
             device: DeviceKind::Auto,
             status: "就緒".to_owned(),
             busy: false,
@@ -505,6 +505,9 @@ impl QwenTtsApp {
         }
 
         let models_dir = PathBuf::from(self.models_dir.clone());
+        if self.output_path.trim().is_empty() {
+            self.output_path = default_voice_output_path().display().to_string();
+        }
         let request = SynthesisRequest {
             text,
             language: self.language.clone(),

@@ -3,6 +3,7 @@ use crate::{
 };
 use qwen_tts_core::{validate_wav_file, AudioSpec};
 use std::{
+    fs,
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
@@ -47,6 +48,13 @@ impl RuntimeBackend for ExternalQwenTtsBackend {
                 "qwen-tts executable not found at {}",
                 self.qwen_tts_bin.display()
             )));
+        }
+        if let Some(parent) = request
+            .out_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
         }
 
         let mut command = Command::new(&self.qwen_tts_bin);
