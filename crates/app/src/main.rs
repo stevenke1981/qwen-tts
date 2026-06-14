@@ -1,6 +1,7 @@
 use eframe::egui;
 use qwen_tts_backend_cpu::CpuBackend;
 use qwen_tts_core::TtsModelSet;
+use rodio::source::Source;
 #[cfg(feature = "ffi")]
 use qwen_tts_runtime::FfiBackend;
 use qwen_tts_runtime::{
@@ -195,6 +196,66 @@ impl eframe::App for QwenTtsApp {
             ui.separator();
             self.synthesis_section(ui);
             ui.separator();
+
+            // ── Playback controls ──────────────────────────────────────
+            if self.last_wav_path.is_some() {
+                ui.horizontal(|ui| {
+                    if let Some(ref sink) = self.audio_sink {
+                        if sink.is_paused() {
+                            if ui.button("▶ 播放").clicked() {
+                                sink.play();
+                            }
+                        } else {
+                            if ui.button("⏸ 暫停").clicked() {
+                                sink.pause();
+                            }
+                        }
+                        if ui.button("⏹ 停止").clicked() {
+                            self.stop_playback();
+                        }
+                    } else {
+                        if ui.button("🔄 播放音檔").clicked() {
+                            self.start_playback();
+                        }
+                    }
+
+                    // ── Progress bar ──────────────────────────────────
+                    if self.audio_duration_secs > 0.0 {
+                        let progress = if let Some(ref sink) = self.audio_sink {
+                            let pos = sink.get_pos().as_secs_f64();
+                            (pos / self.audio_duration_secs).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let bar = egui::ProgressBar::new(progress as f32)
+                            .desired_width(200.0)
+                            .show_percentage();
+                        ui.add(bar);
+
+                        let pos_str = if let Some(ref sink) = self.audio_sink {
+                            format_duration(sink.get_pos())
+                        } else {
+                            "00:00".to_owned()
+                        };
+                        let total_str =
+                            format_duration(Duration::from_secs_f64(self.audio_duration_secs));
+                        ui.label(format!("{pos_str} / {total_str}"));
+                    }
+                });
+
+                // Auto-detect end of playback
+                if self.audio_sink.is_some() {
+                    if let Some(ref sink) = self.audio_sink {
+                        if sink.empty() {
+                            self.audio_sink = None;
+                            self.set_status("播放完成");
+                        }
+                    }
+                }
+
+                ui.separator();
+            }
+
             self.run_section(ui);
         });
 
@@ -237,10 +298,28 @@ impl QwenTtsApp {
             }
             Ok(WorkerMessage::SynthesisFinished(result)) => {
                 self.busy = false;
-                self.status = match result {
-                    Ok(message) => message,
-                    Err(message) => format!("Synthesis failed: {message}"),
-                };
+                match result {
+                    Ok(message) => {
+                        self.set_status(&message);
+                        // Auto-play: extract WAV path from
+                        // "已產生 <path>（<rate> Hz，<channels> 聲道）"
+                        if let Some(path_str) = message
+                            .split('（')
+                            .next()
+                            .and_then(|s| s.strip_prefix("已產生 "))
+                        {
+                            let path = std::path::PathBuf::from(path_str);
+                            if path.exists() {
+                                self.last_wav_path = Some(path);
+                                self.start_playback();
+                                return; // start_playback already set status
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        self.set_status(&format!("Synthesis failed: {message}"));
+                    }
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.receiver = Some(receiver);
@@ -637,7 +716,72 @@ impl QwenTtsApp {
         });
     }
 
+    fn start_playback(&mut self) {
+        let path = match self.last_wav_path.as_ref() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // Stop any previous playback first.
+        self.stop_playback();
+
+        // Create OutputStream + Sink
+        let (_stream, handle) = match rodio::OutputStream::try_default() {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.set_status(&format!("無法開啟音訊裝置: {err}"));
+                return;
+            }
+        };
+
+        // Read the WAV file
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(err) => {
+                self.set_status(&format!("無法讀取音檔: {err}"));
+                return;
+            }
+        };
+
+        // Decode WAV and compute duration
+        let source = match rodio::Decoder::new_wav(file) {
+            Ok(src) => src,
+            Err(err) => {
+                self.set_status(&format!("無法解碼 WAV: {err}"));
+                return;
+            }
+        };
+        self.audio_duration_secs = source
+            .total_duration()
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let sink = match rodio::Sink::try_new(&handle) {
+            Ok(s) => s,
+            Err(err) => {
+                self.set_status(&format!("無法建立播放器: {err}"));
+                return;
+            }
+        };
+        sink.append(source);
+        // sink.play() is the default state — auto-play.
+
+        self._audio_stream = Some(_stream);
+        self.audio_sink = Some(sink);
+        self.set_status("正在播放...");
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(sink) = self.audio_sink.take() {
+            sink.stop();
+        }
+    }
+
     fn start_synthesis(&mut self) {
+        // Stop any in-progress playback before starting synthesis.
+        self.stop_playback();
+        self.last_wav_path = None;
+
         let text = self.text.trim().to_owned();
         if text.is_empty() {
             self.set_status("文字不能空白");
@@ -829,6 +973,14 @@ fn find_ancestor_with_manifest(path: &std::path::Path) -> Option<PathBuf> {
         .ancestors()
         .find(|candidate| candidate.join("Cargo.toml").is_file())
         .map(PathBuf::from)
+}
+
+/// Format a Duration as MM:SS.
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let mins = secs / 60;
+    let secs = secs % 60;
+    format!("{mins:02}:{secs:02}")
 }
 
 #[cfg(test)]
