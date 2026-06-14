@@ -45,3 +45,33 @@
 **Trigger:** FfiBackend and CpuBackend both needed read_wav_f32_mono but in different crates
 **Rule:** Before duplicating a utility function across backends, check if it can be exported from `qwen-tts-core` (the shared core crate) instead of each backend implementing its own copy.
 **Source:** feat(cpu-backend): wire instruct, ref_audio, sampling params
+
+---
+## Lesson #9 - 2026-06-14
+**Trigger:** A TypeScript TUI plugin passed `tsc` but emitted an import of `@opentui/solid/jsx-runtime`, which is type-only and failed at runtime.
+**Rule:** Build OpenTUI Solid TSX with `jsx: preserve` and `@opentui/solid/bun-plugin`; include a Bun runtime import or slot-registration smoke test in validation.
+**Source:** OpenCode persistent status footer
+
+---
+## Lesson #10 - 2026-06-14
+**Trigger:** Testing `opencode plugin --global` with `OPENCODE_CONFIG_DIR` still updated the real global OpenCode config.
+**Rule:** Test OpenCode plugin installation in a temporary Git project without `--global`; reserve global installer tests for an explicitly disposable user config and verify cleanup immediately.
+**Source:** OpenCode persistent status footer
+
+---
+## Lesson #11 - 2026-06-15
+**Trigger:** Extracting a subdirectory (`opencode-tui/`) from a mono-repo (`qwen-tts`) into a standalone git repo with a separate remote.
+**Rule:** When splitting a subdirectory into its own git repo: (1) `git init` inside the subdirectory, (2) update `.gitignore` to exclude symlinks/mount-points like `${PROJECT_ROOT}/` that reference the parent, (3) use `git add -A` + `git commit` + `git remote add origin <url>` + `git push -u origin main`. Verify with `git status --short` that only the intended files are tracked before committing.
+**Source:** opencode-tui standalone repo setup
+
+---
+## Lesson #12 - 2026-06-15
+**Trigger:** `D:\qwen_tts\opencode-tui` directory was locked during `Move-Item` and `robocopy` because `${PROJECT_ROOT}/` is an opencode mount point containing active `memory.db` files.
+**Rule:** When moving a directory that contains an opencode `${PROJECT_ROOT}` mount point, use `robocopy /E /COPY:DAT /MOVE` to copy files, then accept that the mount point itself can't be deleted until the opencode process exits. Verify the target directory has `.git` and source code intact. The empty source shell can be cleaned on next reboot.
+**Source:** opencode-tui relocation to plugins directory
+
+---
+## Lesson #13 - 2026-06-15
+**Trigger:** Config metadata keys used `qwen3-tts.talker.*` prefix, not `llama.*` — ModelConfig returned defaults (24 layers, wrong vocab) instead of real values.
+**Rule:** Before trusting default metadata keys in GGUF parsing, probe real model metadata with a test that prints all keys, then update lookup to try architecture-specific prefixes first (`qwen3-tts.talker.*` → `qwen3-tts.*` → `llama.*`).
+**Source:** GGUF tensor naming fix
