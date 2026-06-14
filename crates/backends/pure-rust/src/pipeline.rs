@@ -1,39 +1,24 @@
-//! Pipeline orchestration: ties the talker transformer, MTP code predictor heads,
-//! and the qwen-tts-codec DAC decoder into a single `synthesize()` entry point.
-//!
-//! The pipeline:
-//!   1. Tokenize input text (instruct)
-//!   2. Talker forward pass → hidden states
-//!   3. Code predictor → audio code frames
-//!   4. Codec decode frames → WAV samples
+//! Pipeline orchestration: talker → code predictor → codec decoder.
 
 use std::path::Path;
 
 use candle_core::Device;
+use candle_core::IndexOp;
+use qwen_tts_codec::CodecDecoder;
 use qwen_tts_runtime::SynthesisRequest;
-use rand::Rng;
-use rand::SeedableRng;
 
 use crate::code_predictor::CodePredictor;
-use crate::sampling::sample_token;
 use crate::talker::Talker;
-
-/// Max token IDs to generate before producing audio codes.
-const MAX_TEXT_TOKENS: usize = 256;
-
-/// Pads the input sequence to at least this length for the talker.
-const MIN_SEQ_LEN: usize = 8;
 
 /// Loaded pipeline ready for synthesis.
 pub struct Pipeline {
     talker: Talker,
     code_predictor: CodePredictor,
-    /// Number of audio codebook levels.
-    num_codebooks: usize,
+    codec_decoder: CodecDecoder,
     device: Device,
 }
 
-/// Synthesis configuration derived from [`SynthesisRequest`].
+#[allow(dead_code)]
 struct SynthConfig {
     temperature: f32,
     top_k: Option<usize>,
@@ -43,136 +28,114 @@ struct SynthConfig {
 }
 
 impl Pipeline {
-    /// Load the talker GGUF and codec weights.
+    /// Load all model weights.
     ///
-    /// `talker_path` — path to the talker Qwen2 GGUF file.
-    /// `codec_path`  — path to a GGUF file containing the MTP code-predictor heads.
+    /// `talker_path` — GGUF with both talker + code predictor weights.
+    /// `codec_path`  — GGUF with DAC audio decoder weights.
     pub fn new(talker_path: &Path, codec_path: &Path) -> anyhow::Result<Self> {
         let device = Device::Cpu;
 
-        let talker = Talker::from_gguf(talker_path, &device)?;
-        let code_predictor = CodePredictor::from_gguf(codec_path, &device)?;
-        let num_codebooks = code_predictor.num_codebooks();
+        // Talker + code predictor share the same GGUF
+        let (talker, code_predictor) = Talker::load_with_predictor(talker_path, &device)?;
+
+        // Codec decoder from separate GGUF
+        let codec_decoder = CodecDecoder::load(codec_path)
+            .map_err(|e| anyhow::anyhow!("failed to load codec decoder: {e}"))?;
 
         Ok(Self {
             talker,
             code_predictor,
-            num_codebooks,
+            codec_decoder,
             device,
         })
     }
 
-    /// Full TTS synthesis: text → WAV samples.
-    ///
-    /// For the initial implementation we tokenize the instruct text, run it
-    /// through the talker, predict code frames, and decode.
+    /// Synthesize speech: text → WAV samples.
     pub fn synthesize(&self, request: &SynthesisRequest) -> anyhow::Result<Vec<i16>> {
         let cfg = self.build_config(request);
-        let mut rng = match cfg.seed {
-            Some(s) => rand::rngs::StdRng::seed_from_u64(s),
-            None => rand::rngs::StdRng::from_entropy(),
-        };
 
-        // For now, the tokenizer is a simple placeholder that uses a small
-        // fixed lookup. Real implementation will load tokenizer.json.
+        // 1. Tokenize instruct text (simple fallback — real tokenizer later)
         let instruct = request.instruct.as_deref().unwrap_or("");
-        let mut input_ids = self.simple_tokenize(instruct);
-
-        // Pad to minimum length
-        if input_ids.len() < MIN_SEQ_LEN {
-            let mut padded = vec![0u32; MIN_SEQ_LEN - input_ids.len()];
-            padded.extend_from_slice(&input_ids);
-            input_ids = padded;
+        let input_ids = self.simple_tokenize(instruct);
+        if input_ids.is_empty() {
+            anyhow::bail!("empty instruct text");
         }
 
-        // Run talker autoregressively
-        // We use a simple approach: run the talker once, get hidden, predict codes
-        let seq_len = input_ids.len();
-        let input_tensor = candle_core::Tensor::from_slice(
-            &input_ids,
-            (1, seq_len),
-            &self.device,
-        )?;
+        // Pad to minimum sequence length for the talker
+        let min_seq: usize = 8;
+        let pad_len = min_seq.saturating_sub(input_ids.len());
+        let mut padded = vec![0u32; pad_len];
+        padded.extend_from_slice(&input_ids);
 
-        let logits = self.talker.forward(&input_tensor)?;
-        // logits: [1, vocab_size]
+        let seq_len = padded.len();
+        let input_tensor = candle_core::Tensor::from_slice(&padded, (1, seq_len), &self.device)?;
 
-        // Sample next token
-        let logits_flat: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
-        let (next_token, _prob) = sample_token(
-            &logits_flat,
-            cfg.temperature,
-            cfg.top_k,
-            cfg.top_p,
-            &mut rng,
-        );
+        // 2. Talker forward: get hidden state at the last position
+        let (_, hidden) = self.talker.forward_hidden(&input_tensor)?;
+        // hidden: [batch=1, seq_len, d_model]
+        // Take the last position
+        let hidden = hidden.i((0, seq_len - 1, ..))?;
+        // hidden: [d_model]
+        let hidden = hidden.unsqueeze(0)?;
+        // hidden: [1, d_model]
 
-        // TODO: full autoregressive generation
-        // For now, use the talker's final hidden state directly as the
-        // audio code prediction input (simplification — real impl will
-        // accumulate hidden states across generated text tokens).
-        let _ = next_token;
+        // 3. Code predictor: predict frames of acoustic codes
+        let num_frames = cfg.max_new_tokens;
+        let mut all_codes: Vec<i32> = Vec::new();
+        let _num_acoustic = self.code_predictor.num_acoustic();
 
-        // Get the talker's hidden state (last layer, last position).
-        // In the current `forward()` API we only get logits, not hidden states.
-        // For a proper implementation we need to modify the talker to return
-        // hidden states as well.
-        //
-        // For now, we use logits → code predictor as a placeholder.
-        // The actual code predictor takes hidden states, not logits.
-
-        // Simulate code prediction: predict NUM_CODEBOOKS code tokens
-        // per audio frame. For the initial implementation we predict
-        // a single frame.
-        let mut audio_codes = Vec::new();
-        for _ in 0..cfg.max_new_tokens {
-            let code_frame: Vec<u32> = (0..self.num_codebooks)
-                .map(|_| rng.gen_range(0..1024))
-                .collect();
-            audio_codes.push(code_frame);
+        for _frame_idx in 0..num_frames {
+            let frames = self.code_predictor.predict_one_frame(&hidden)?;
+            // frames[0] has num_acoustic code tokens
+            if let Some(frame) = frames.first() {
+                // Codebook 0 (predicted by talker) — for now use 0
+                all_codes.push(0);
+                // Codebooks 1..N
+                for &token in frame {
+                    all_codes.push(token as i32);
+                }
+            }
         }
 
-        // Decode code frames to audio using qwen-tts-codec
-        // For now, produce silence — the codec integration will come in a
-        // follow-up change once the forward pass properly returns hidden states.
-        let sample_rate = 44100u32;
-        let num_samples = audio_codes.len() * 1024; // rough estimate: 1024 PCM frames per code step
-        let silence = vec![0i16; num_samples];
+        // Pad/truncate to match codec expectation: [num_frames, 16]
+        let codec_codebooks: usize = 16;
+        while all_codes.len() < num_frames * codec_codebooks {
+            all_codes.push(0);
+        }
+
+        // 4. Decode audio via codec
+        let audio_f32 = self.codec_decoder.decode(&all_codes, num_frames);
+
+        // 5. Convert f32 [-1,1] → i16 PCM
+        let audio_i16: Vec<i16> = audio_f32
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect();
 
         log::info!(
-            "pure-rust synth: {} code frames → {} samples @ {}Hz",
-            audio_codes.len(),
-            num_samples,
-            sample_rate,
+            "pure-rust synth: {} code frames → {} audio samples",
+            num_frames,
+            audio_i16.len(),
         );
 
-        Ok(silence)
+        Ok(audio_i16)
     }
 
-    // ------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------
-
     fn build_config(&self, request: &SynthesisRequest) -> SynthConfig {
-        let temperature = request.temperature.unwrap_or(1.0) as f32;
-        let top_k = request.top_k.map(|v| v as usize);
-        let top_p = request.top_p.map(|v| v as f32);
-        let max_new_tokens = request.max_new_tokens.unwrap_or(1024) as usize;
         SynthConfig {
-            temperature,
-            top_k,
-            top_p,
-            max_new_tokens,
+            temperature: request.temperature.unwrap_or(1.0),
+            top_k: request.top_k.map(|v| v as usize),
+            top_p: request.top_p.map(|v| v as f32),
+            max_new_tokens: request.max_new_tokens.unwrap_or(1024) as usize,
             seed: request.seed.map(|s| s as u64),
         }
     }
 
-    /// Simple fallback tokenizer (ASCII-by-character).
+    /// Simple fallback tokenizer (byte-level).
     fn simple_tokenize(&self, text: &str) -> Vec<u32> {
         if text.is_empty() {
-            return vec![0];
+            return vec![];
         }
-        // Use byte-level fallback: each byte becomes a token ID
         text.bytes().map(|b| b as u32 + 1).collect()
     }
 }

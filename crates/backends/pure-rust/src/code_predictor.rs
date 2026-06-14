@@ -1,133 +1,203 @@
-//! Audio code token predictor (MTP heads) for Qwen3-TTS.
+//! Audio code token predictor for Qwen3-TTS.
 //!
-//! The code predictor takes the final hidden state from the talker transformer
-//! and produces logits over audio code tokens for each codebook level.
+//! The code predictor is a full transformer (typically 5 layers) that takes
+//! the talker's final hidden state and iteratively predicts acoustic codebook
+//! tokens for levels 1..N (codebook 0 is predicted by the talker itself).
 //!
-//! Architecture: per-level linear head (with optional layer-norm). Each head
-//! predicts one code token per time-step.
+//! For each audio frame, the predictor runs one step per codebook level:
+//!   embed(prev_code_token[g]) → transformer_layers → lm_head[g] → logits
+//!
+//! Tensor naming (from the talker GGUF):
+//!   code_pred.output_norm.weight
+//!   code_pred.mtp_proj.weight / .bias         (optional → talker→pred hidden)
+//!   code_pred.codec_embd.{g}.weight            (g = 0..num_acoustic-1)
+//!   code_pred.lm_head.{g}.weight
+//!   code_pred.layers.{i}.input_layernorm.weight
+//!   code_pred.layers.{i}.post_attention_layernorm.weight
+//!   code_pred.layers.{i}.attn.{q,k,v,o}_proj.weight
+//!   code_pred.layers.{i}.attn.{q,k}_norm.weight
+//!   code_pred.layers.{i}.mlp.{gate,up,down}_proj.weight
 
-use std::path::Path;
+use std::fs::File;
 
+use candle_core::quantized::gguf_file::Content;
 use candle_core::{Device, IndexOp, Module, Tensor, D};
 use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
 
-/// Type alias: a list of code token IDs (one per codebook level).
+/// Type alias: a frame of acoustic code token IDs (one per codebook level).
 pub type CodeFrame = Vec<u32>;
 
-/// Number of audio codebook levels in Qwen3-TTS (DAC 44kHz).
-pub const NUM_CODEBOOKS: usize = 4;
-
-/// Code predictor: linear heads per codebook level, loaded from a GGUF file.
+/// Code predictor: projects talker hidden states → per-codebook logits.
+///
+/// For the initial implementation we load only the lm_head per codebook and
+/// a projection layer. Full multi-layer transformer will follow.
 pub struct CodePredictor {
-    config: ModelConfig,
-    heads: Vec<LinearHead>,
+    /// Number of acoustic codebooks (= total_code_groups - 1).
+    num_acoustic: usize,
+    /// Optional projection: talker_hidden_size → predictor_hidden_size.
+    mtp_proj_w: Option<Tensor>,
+    mtp_proj_b: Option<Tensor>,
+    /// Output norm after projection (before per-codebook heads).
+    output_norm: Option<RmsNorm>,
+    /// Linear heads: one per acoustic codebook, shape [vocab_size, hidden].
+    lm_heads: Vec<Tensor>,
+    /// Predictor hidden dimension.
+    hidden_size: usize,
     device: Device,
 }
 
-struct LinearHead {
-    norm: Option<RmsNorm>,
-    weight: Tensor,
-    bias: Option<Tensor>,
-}
-
 impl CodePredictor {
-    /// Load code predictor from a dedicated GGUF file.
+    /// Load code predictor weights from the **talker** GGUF content.
     ///
-    /// The GGUF is expected to contain tensors named:
-    /// - `code_predictor.{lvl}.weight`
-    /// - `code_predictor.{lvl}.bias` (optional)
-    /// - `code_predictor.{lvl}.norm.weight` (optional)
-    pub fn from_gguf(path: &Path, device: &Device) -> anyhow::Result<Self> {
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("failed to open codec GGUF {path:?}: {e}"))?;
-
-        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("bad GGUF header: {e}"))?;
-
+    /// # Arguments
+    /// * `content` — parsed GGUF content (from the talker file).
+    /// * `file`    — the open GGUF file (for tensor reading).
+    /// * `device`  — target device.
+    pub fn from_gguf(
+        content: &Content,
+        file: &mut File,
+        device: &Device,
+    ) -> anyhow::Result<Self> {
+        // Read code predictor metadata (with fallback to talker config)
         let cfg = ModelConfig::from_gguf(&content.metadata);
 
+        // Number of acoustic codebooks = total_code_groups - 1
+        let num_code_groups = content
+            .metadata
+            .get("qwen3-tts.num_code_groups")
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(16) as usize;
+        let num_acoustic = num_code_groups.saturating_sub(1);
+        if num_acoustic == 0 {
+            anyhow::bail!("num_code_groups <= 1, no acoustic codebooks to predict");
+        }
+
+        // Code predictor hidden size (may differ from talker hidden size)
+        let pred_hidden = content
+            .metadata
+            .get("qwen3-tts.code_pred.embedding_length")
+            .and_then(|v| v.to_u32().ok())
+            .map(|v| v as usize)
+            .unwrap_or(cfg.d_model);
+
+        // Helper: load tensor by name from GGUF, dequantized to F32
         let mut load = |name: &str| -> anyhow::Result<Tensor> {
             let qt = content
-                .tensor(&mut file, name, device)
-                .map_err(|e| anyhow::anyhow!("missing tensor {name}: {e}"))?;
+                .tensor(file, name, device)
+                .map_err(|e| anyhow::anyhow!("missing code_pred tensor {name}: {e}"))?;
             qt.dequantize(device)
                 .map_err(|e| anyhow::anyhow!("dequantize {name}: {e}"))
         };
 
-        let mut heads = Vec::with_capacity(NUM_CODEBOOKS);
-        for lvl in 0..NUM_CODEBOOKS {
-            let weight = load(&format!("code_predictor.{lvl}.weight"))?;
+        // Optional MTP projection (talker hidden → predictor hidden)
+        let mtp_proj_w = if content.tensor_infos.contains_key("code_pred.mtp_proj.weight") {
+            Some(load("code_pred.mtp_proj.weight")?)
+        } else {
+            None
+        };
+        let mtp_proj_b = if content.tensor_infos.contains_key("code_pred.mtp_proj.bias") {
+            Some(load("code_pred.mtp_proj.bias")?)
+        } else {
+            None
+        };
 
-            let bias = if content.tensor_infos.contains_key(&format!("code_predictor.{lvl}.bias")) {
-                Some(load(&format!("code_predictor.{lvl}.bias"))?)
-            } else {
-                None
-            };
+        // Output norm (optional — present in most checkpoints)
+        let output_norm = if content.tensor_infos.contains_key("code_pred.output_norm.weight") {
+            let w = load("code_pred.output_norm.weight")?;
+            let eps = content
+                .metadata
+                .get("qwen3-tts.code_pred.attention.layer_norm_rms_epsilon")
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(1e-6) as f64;
+            Some(RmsNorm::new(w, eps))
+        } else {
+            None
+        };
 
-            let norm = if content.tensor_infos.contains_key(&format!("code_predictor.{lvl}.norm.weight")) {
-                let w = load(&format!("code_predictor.{lvl}.norm.weight"))?;
-                Some(RmsNorm::new(w, cfg.norm_eps))
-            } else {
-                None
-            };
-
-            heads.push(LinearHead { norm, weight, bias });
+        // Per-codebook linear heads
+        let mut lm_heads = Vec::with_capacity(num_acoustic);
+        for g in 0..num_acoustic {
+            let name = format!("code_pred.lm_head.{g}.weight");
+            if !content.tensor_infos.contains_key(&name) {
+                anyhow::bail!("missing code_pred.lm_head.{g}.weight — expected {num_acoustic} heads");
+            }
+            let w = load(&name)?;
+            lm_heads.push(w);
         }
 
         Ok(Self {
-            config: cfg,
-            heads,
+            num_acoustic,
+            mtp_proj_w,
+            mtp_proj_b,
+            output_norm,
+            lm_heads,
+            hidden_size: pred_hidden,
             device: device.clone(),
         })
     }
 
-    /// Predict code tokens from talker hidden states.
+    /// Predict a single audio code frame from the talker's final hidden state.
     ///
-    /// `hidden`: talker output hidden state `[batch, d_model]`.
+    /// `hidden`: talker output `[batch, d_model]`.
     ///
-    /// Returns a `Vec<CodeFrame>`: for each item in the batch, a frame of
-    /// `NUM_CODEBOOKS` code token IDs.
-    pub fn predict_codes(&self, hidden: &Tensor) -> anyhow::Result<Vec<CodeFrame>> {
+    /// Returns a per-batch frame of `num_acoustic` code tokens.
+    ///
+    /// Note: this is a simplified single-step predictor. A full
+    /// implementation would iterate over codebooks with causal masking
+    /// and include the code predictor transformer layers.
+    pub fn predict_one_frame(&self, hidden: &Tensor) -> anyhow::Result<Vec<CodeFrame>> {
         let batch = hidden.dims()[0];
-        let mut out_frames = vec![CodeFrame::with_capacity(NUM_CODEBOOKS); batch];
+        let _device = &self.device;
 
-        for (lvl, head) in self.heads.iter().enumerate() {
-            let mut x = hidden.clone();
-
-            // Optional pre-norm
-            if let Some(ref norm) = head.norm {
-                x = norm.forward(&x)?;
+        // 1. Optional MTP projection: talker_hidden → predictor_hidden
+        let mut h = hidden.clone();
+        if let Some(ref w) = self.mtp_proj_w {
+            h = w.matmul(&h.t()?)?.t()?;
+            if let Some(ref b) = self.mtp_proj_b {
+                h = (h + b)?;
             }
+        }
 
-            // Linear projection
-            let mut logits = head.weight.matmul(&x.t()?)?.t()?;
-            if let Some(ref bias) = head.bias {
-                logits = (logits + bias)?;
-            }
+        // 2. Output norm (optional)
+        if let Some(ref norm) = self.output_norm {
+            h = norm.forward(&h)?;
+        }
 
-            // Argmax per item
+        // 3. For each codebook level, apply lm_head
+        let mut frames = vec![CodeFrame::with_capacity(self.num_acoustic); batch];
+        for (_g, head_w) in self.lm_heads.iter().enumerate() {
+            // head_w shape: [vocab_size, hidden] or [d_model, vocab_size]
+            let logits = if head_w.dims()[0] == self.hidden_size {
+                // [d_model, vocab_size]: matmul(hidden^T)^T → [batch, vocab_size]
+                head_w.matmul(&h.t()?)?.t()?
+            } else {
+                h.matmul(&head_w.t()?)?
+            };
+
+            // Argmax per batch item
             for b in 0..batch {
                 let row = logits.i(b)?;
                 let idx = row.argmax(D::Minus1)?;
                 let token: u32 = idx.flatten_all()?.to_vec0()?;
-                out_frames[b].push(token);
+                frames[b].push(token);
             }
         }
 
-        Ok(out_frames)
+        Ok(frames)
     }
 
-    /// Return the number of codebook levels.
+    /// Return the number of acoustic codebooks this predictor handles.
     #[must_use]
-    pub fn num_codebooks(&self) -> usize {
-        self.heads.len()
+    pub fn num_acoustic(&self) -> usize {
+        self.num_acoustic
     }
 
+    /// Return the predictor's hidden dimension.
     #[must_use]
-    pub fn device(&self) -> &Device {
-        &self.device
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
     }
 }
 
@@ -136,22 +206,9 @@ mod tests {
     use super::*;
     use candle_core::Device;
 
-    /// Basic test with fake loaded weights (empty predictor = 4 heads at size 0).
-    #[test]
-    fn test_code_predictor_structure() {
-        let dev = Device::Cpu;
-        // We can't test from_gguf without a real file, but verify NUM_CODEBOOKS
-        assert_eq!(NUM_CODEBOOKS, 4);
-        let _ = dev;
-    }
-
     #[test]
     fn test_code_frame_type() {
-        let mut frame = CodeFrame::with_capacity(NUM_CODEBOOKS);
-        frame.push(0);
-        frame.push(1);
-        frame.push(2);
-        frame.push(3);
-        assert_eq!(frame.len(), NUM_CODEBOOKS);
+        let frame: CodeFrame = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        assert_eq!(frame.len(), 15);
     }
 }

@@ -5,6 +5,24 @@
 **Source:** complete compiled version handoff
 
 ---
+## Lesson #3 — 2026-06-15
+**Trigger:** Used `candle_core` 0.10.x for GGUF loading but assumed `QTensor::matmul()` existed — it does not.
+**Rule:** Before using a crate's API, fetch the docs.rs page to verify method signatures exist before writing code against them.
+**Source:** pure-rust backend implementation
+
+---
+## Lesson #4 — 2026-06-15
+**Trigger:** `candle_nn::embedding()` is a builder that constructs an `Embedding` struct via `VarBuilder`, not a forward function. Passing a weight tensor directly fails.
+**Rule:** For GGUF-only models where VarBuilder isn't used, implement embedding lookup manually via `weights.gather(input_ids, 0)` instead of trying to use `candle_nn::embedding`.
+**Source:** pure-rust talker implementation
+
+---
+## Lesson #5 — 2026-06-15
+**Trigger:** `candle_nn::RmsNorm` takes `f64` epsilon (not `f32`), `Module::forward` requires explicit import, and `IndexOp::i()` also needs explicit import.
+**Rule:** When using candle-nn types like RmsNorm, import `candle_core::{Module, IndexOp}` explicitly. Always check the exact type signature (f64 vs f32) on docs.rs before writing constructors.
+**Source:** pure-rust talker implementation
+
+---
 ## Lesson #2 - 2026-06-14
 **Trigger:** Release copy failed because `dist/qwen-tts-gui.exe` was still running and locked on Windows.
 **Rule:** Before copying release GUI binaries into `dist`, check for running `qwen-tts-gui` processes and stop the old `dist` executable if it locks the target file.
@@ -45,6 +63,18 @@
 **Trigger:** FfiBackend and CpuBackend both needed read_wav_f32_mono but in different crates
 **Rule:** Before duplicating a utility function across backends, check if it can be exported from `qwen-tts-core` (the shared core crate) instead of each backend implementing its own copy.
 **Source:** feat(cpu-backend): wire instruct, ref_audio, sampling params
+
+---
+## Lesson #10 — 2026-06-15
+**Trigger:** Extracting a subdirectory (`opencode-tui/`) from a mono-repo (`qwen-tts`) into a standalone git repo with a separate remote.
+**Rule:** When splitting a subdirectory into its own git repo: (1) `git init` inside the subdirectory, (2) update `.gitignore` to exclude symlinks/mount-points like `${PROJECT_ROOT}/` that reference the parent, (3) use `git add -A` + `git commit` + `git remote add origin <url>` + `git push -u origin main`. Verify with `git status --short` that only the intended files are tracked before committing.
+**Source:** opencode-tui standalone repo setup
+
+---
+## Lesson #11 — 2026-06-15
+**Trigger:** `D:\qwen_tts\opencode-tui` directory was locked during `Move-Item` and `robocopy` because `${PROJECT_ROOT}/` is an opencode mount point containing active `memory.db` files.
+**Rule:** When moving a directory that contains an opencode `${PROJECT_ROOT}` mount point, use `robocopy /E /COPY:DAT /MOVE` to copy files, then accept that the mount point itself can't be deleted until the opencode process exits. Verify the target directory has `.git` and source code intact. The empty source shell can be cleaned on next reboot.
+**Source:** opencode-tui relocation to plugins directory
 
 ---
 ## Lesson #9 - 2026-06-14

@@ -11,6 +11,7 @@ use candle_core::{Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
+use crate::code_predictor::CodePredictor;
 
 const FN_TOKEN_EMBD: &str = "token_embd.weight";
 const FN_OUTPUT: &str = "output.weight";
@@ -69,6 +70,25 @@ impl Talker {
         let content = Content::read(&mut file)
             .map_err(|e| anyhow::anyhow!("bad GGUF header: {e}"))?;
 
+        Self::from_content(&content, &mut file, device)
+    }
+
+    /// Load from a GGUF file, also extracting the code predictor weights
+    /// from the same GGUF file.
+    pub fn load_with_predictor(path: &Path, device: &Device) -> anyhow::Result<(Self, CodePredictor)> {
+        let mut file = File::open(path)
+            .map_err(|e| anyhow::anyhow!("failed to open GGUF {path:?}: {e}"))?;
+
+        let content = Content::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("bad GGUF header: {e}"))?;
+
+        let talker = Self::from_content(&content, &mut file, device)?;
+        let code_predictor = CodePredictor::from_gguf(&content, &mut file, device)?;
+
+        Ok((talker, code_predictor))
+    }
+
+    fn from_content(content: &Content, mut file: &mut File, device: &Device) -> anyhow::Result<Self> {
         let cfg = ModelConfig::from_gguf(&content.metadata);
 
         // Helper bound to content & file (takes device only)
@@ -206,6 +226,87 @@ impl Talker {
         // Take last position
         let last = logits.i((.., seq_len.saturating_sub(1), ..))?;
         Ok(last)
+    }
+
+    /// Forward pass returning both logits and the final hidden state
+    /// (post-norm, before LM head). The hidden state is used by the
+    /// code predictor for acoustic code generation.
+    pub fn forward_hidden(&self, input_ids: &Tensor) -> anyhow::Result<(Tensor, Tensor)> {
+        let dev = &self.device;
+        let cfg = &self.config;
+        let batch = input_ids.dims()[0];
+        let seq_len = input_ids.dims()[1];
+
+        // --- Embedding lookup ---
+        let emb_w = &self.token_embd;
+        let d_model = cfg.d_model;
+        let vocab_size = cfg.vocab_size;
+
+        let emb_weights = if emb_w.dims()[0] == d_model && emb_w.dims()[1] == vocab_size {
+            emb_w.t()?
+        } else {
+            emb_w.clone()
+        };
+        let mut hidden = emb_weights.gather(input_ids, 0)?;
+        hidden = hidden.contiguous()?;
+
+        // --- RoPE precompute ---
+        let (cos, sin) = precompute_cos_sin(cfg, seq_len, dev)?;
+
+        // --- Decoder layers ---
+        for layer in &self.layers {
+            let residual = hidden.clone();
+            hidden = layer.attn_norm.forward(&hidden)?;
+
+            let n_heads = cfg.n_heads;
+            let n_kv = cfg.n_kv_heads;
+            let hd = cfg.head_dim();
+
+            let q = layer.attn_q.matmul(&hidden)?;
+            let k = layer.attn_k.matmul(&hidden)?;
+            let v = layer.attn_v.matmul(&hidden)?;
+
+            let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
+            let k = k.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
+            let v = v.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
+
+            let q = apply_rope(&q, &cos, &sin)?;
+            let k = apply_rope(&k, &cos, &sin)?;
+
+            let n_repeat = n_heads / n_kv;
+            let k = if n_repeat > 1 { repeat_kv(&k, n_repeat)? } else { k };
+            let v = if n_repeat > 1 { repeat_kv(&v, n_repeat)? } else { v };
+
+            let scale = (hd as f64).sqrt().recip();
+            let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+            let attn = (attn * scale)?;
+            let mask = build_causal_mask(seq_len, dev)?;
+            let attn = attn.broadcast_add(&mask)?;
+            let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
+            let attn_out = attn.matmul(&v)?;
+
+            let attn_out = attn_out.permute((0, 2, 1, 3))?.reshape((batch, seq_len, d_model))?;
+            let attn_out = layer.attn_o.matmul(&attn_out)?;
+            hidden = (residual + attn_out)?;
+
+            let residual = hidden.clone();
+            hidden = layer.ffn_norm.forward(&hidden)?;
+            let gate = candle_nn::ops::silu(&layer.ffn_gate.matmul(&hidden)?)?;
+            let up = layer.ffn_up.matmul(&hidden)?;
+            hidden = layer.ffn_down.matmul(&(gate * up)?)?;
+            hidden = (hidden + residual)?;
+        }
+
+        // Final norm
+        let hidden_normed = self.output_norm.forward(&hidden)?;
+
+        // LM head (output projection) — reuse token_embd if no separate output weight
+        let out_w = self.output.as_ref().unwrap_or(&self.token_embd);
+        let logits = hidden_normed.matmul(&out_w.t()?)?;
+
+        // Return both logits and the normed hidden state
+        let last_logits = logits.i((.., seq_len.saturating_sub(1), ..))?;
+        Ok((last_logits, hidden_normed))
     }
 
     pub fn device(&self) -> &Device { &self.device }
