@@ -58,6 +58,8 @@ pub struct SynthesisRequest {
     pub language: String,
     pub speaker: Option<String>,
     pub instruct: Option<String>,
+    pub ref_audio_path: Option<PathBuf>,
+    pub ref_text: Option<String>,
     pub seed: Option<i64>,
     pub max_new_tokens: Option<i32>,
     pub temperature: Option<f32>,

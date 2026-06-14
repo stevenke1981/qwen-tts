@@ -163,6 +163,10 @@ struct SynthArgs {
     no_sample: bool,
     #[arg(long, default_value = "auto")]
     device: DeviceKind,
+    #[arg(long)]
+    ref_audio: Option<PathBuf>,
+    #[arg(long)]
+    ref_text: Option<String>,
     #[arg(long, default_value_t = DEFAULT_BACKEND)]
     backend: BackendMode,
     #[arg(long = "bin")]
@@ -269,6 +273,8 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         language: args.lang.clone(),
         speaker: args.speaker.clone(),
         instruct: args.instruct.clone(),
+        ref_audio_path: args.ref_audio.clone(),
+        ref_text: args.ref_text.clone(),
         seed: args.seed,
         max_new_tokens: args.max_tokens,
         temperature: args.temperature,

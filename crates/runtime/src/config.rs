@@ -125,6 +125,8 @@ impl RuntimeConfig {
             language: self.default_lang.clone(),
             speaker: None,
             instruct: None,
+            ref_audio_path: None,
+            ref_text: None,
             seed: None,
             max_new_tokens: None,
             temperature: None,

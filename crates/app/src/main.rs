@@ -547,6 +547,8 @@ impl QwenTtsApp {
             language: self.language.clone(),
             speaker: non_empty_string(&self.speaker),
             instruct: None,
+            ref_audio_path: None,
+            ref_text: None,
             seed: None,
             max_new_tokens: None,
             temperature: None,
