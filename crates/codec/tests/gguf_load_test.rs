@@ -165,3 +165,5 @@ fn load_f32_codebook() {
     let mean = cb.iter().sum::<f32>() / cb.len() as f32;
     println!("tok_dec.vq_first.0.codebook: {} elems, mean={mean:.6}", cb.len());
 }
+
+
