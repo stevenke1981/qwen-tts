@@ -9,7 +9,7 @@ use crate::{
 };
 use qwen_tts_core::{validate_wav_file, AudioSpec};
 use qwen_tts_sys::safe::QwenTts;
-use std::{ffi::CString, fs, path::PathBuf};
+use std::{ffi::CString, fs, path::{Path, PathBuf}};
 use tracing::{info, instrument};
 
 /// In-process FFI backend.
@@ -102,6 +102,17 @@ impl RuntimeBackend for FfiBackend {
             ),
             None => None,
         };
+        let ref_audio_samples: Option<Vec<f32>> = match &request.ref_audio_path {
+            Some(path) => Some(read_wav_f32_mono(path)?),
+            None => None,
+        };
+        let ref_text_cstr = match &request.ref_text {
+            Some(s) => Some(
+                CString::new(s.as_str())
+                    .map_err(|_| BackendError::InvalidRequest("ref_text contains NUL".into()))?,
+            ),
+            None => None,
+        };
 
         // ── Initialise context ──────────────────────────────────────────
         let mut init = QwenTts::init_params();
@@ -147,6 +158,11 @@ impl RuntimeBackend for FfiBackend {
         if let Some(sample) = request.do_sample {
             params.do_sample = sample;
         }
+
+        // Voice reference (voice cloning)
+        params.ref_audio_24k = ref_audio_samples.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        params.ref_n_samples = ref_audio_samples.as_ref().map_or(0, |v| v.len() as i32);
+        params.ref_text = ref_text_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let samples = unsafe {
             // Safety: the C string pointers above stay valid for the
@@ -247,4 +263,122 @@ fn write_wav_f32(path: &PathBuf, sample_rate: u32, samples: &[f32]) -> BackendRe
 
     writer.flush()?;
     Ok(())
+}
+
+/// Read a 16-bit PCM mono WAV file into f32 samples normalized to [-1, 1].
+///
+/// Only supports the subset needed for voice reference: 16-bit PCM, 1 channel.
+fn read_wav_f32_mono(path: &Path) -> BackendResult<Vec<f32>> {
+    let data = fs::read(path).map_err(|e| {
+        BackendError::InvalidRequest(format!("cannot read ref audio WAV: {e}"))
+    })?;
+
+    if data.len() < 44 {
+        return Err(BackendError::InvalidRequest(
+            "ref audio WAV too small".into(),
+        ));
+    }
+    if &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err(BackendError::InvalidRequest(
+            "ref audio: not a WAV file".into(),
+        ));
+    }
+
+    // Parse chunks
+    let mut offset = 12;
+    let mut audio_format = None;
+    let mut num_channels = None;
+    let mut bits_per_sample = None;
+    let mut data_offset = None;
+    let mut data_size = None;
+
+    loop {
+        if offset + 8 > data.len() {
+            return Err(BackendError::InvalidRequest(
+                "ref audio: truncated WAV header".into(),
+            ));
+        }
+        let chunk_id = &data[offset..offset + 4];
+        let chunk_size =
+            u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+
+        match chunk_id {
+            b"fmt " => {
+                if offset + 16 > data.len() {
+                    return Err(BackendError::InvalidRequest(
+                        "ref audio: truncated fmt chunk".into(),
+                    ));
+                }
+                audio_format =
+                    Some(u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()));
+                num_channels =
+                    Some(u16::from_le_bytes(data[offset + 2..offset + 4].try_into().unwrap()));
+                bits_per_sample =
+                    Some(u16::from_le_bytes(data[offset + 14..offset + 16].try_into().unwrap()));
+            }
+            b"data" => {
+                data_offset = Some(offset);
+                data_size = Some(chunk_size);
+            }
+            _ => {}
+        }
+        offset += chunk_size;
+        if chunk_id == b"data" {
+            break;
+        }
+        if offset >= data.len() {
+            return Err(BackendError::InvalidRequest(
+                "ref audio: data chunk not found".into(),
+            ));
+        }
+    }
+
+    let af = audio_format
+        .ok_or_else(|| BackendError::InvalidRequest("ref audio: missing fmt chunk".into()))?;
+    let ch = num_channels
+        .ok_or_else(|| BackendError::InvalidRequest("ref audio: missing channels".into()))?;
+    let bps = bits_per_sample
+        .ok_or_else(|| BackendError::InvalidRequest("ref audio: missing bits_per_sample".into()))?;
+    let d_off = data_offset
+        .ok_or_else(|| BackendError::InvalidRequest("ref audio: missing data chunk".into()))?;
+    let d_sz = data_size.unwrap_or(0);
+
+    if af != 1 {
+        return Err(BackendError::InvalidRequest(format!(
+            "ref audio: only PCM supported, got format {af}"
+        )));
+    }
+    if ch != 1 {
+        return Err(BackendError::InvalidRequest(format!(
+            "ref audio: only mono supported, got {ch} channels"
+        )));
+    }
+    if bps != 16 {
+        return Err(BackendError::InvalidRequest(format!(
+            "ref audio: only 16-bit PCM supported, got {bps} bits"
+        )));
+    }
+
+    let sample_bytes = (bps / 8) as usize;
+    let total_samples = d_sz / sample_bytes;
+    let mut samples = Vec::with_capacity(total_samples);
+
+    for i in 0..total_samples {
+        let byte_start = d_off + i * sample_bytes;
+        if byte_start + sample_bytes > data.len() {
+            break;
+        }
+        let raw = i16::from_le_bytes(data[byte_start..byte_start + 2].try_into().unwrap());
+        samples.push(f32::from(raw) / i16::MAX as f32);
+    }
+
+    if samples.is_empty() {
+        return Err(BackendError::InvalidRequest(
+            "ref audio: no samples found".into(),
+        ));
+    }
+
+    info!("loaded ref audio: {} samples", samples.len());
+    Ok(samples)
 }
