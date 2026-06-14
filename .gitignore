@@ -3,3 +3,5 @@
 /models/*.gguf
 /output*.wav
 *.log
+
+.superpowers/
