@@ -127,6 +127,10 @@ struct SynthArgs {
     speaker: Option<String>,
     #[arg(long)]
     instruct: Option<String>,
+    #[arg(long)]
+    flash_attention: bool,
+    #[arg(long)]
+    clamp_fp16: bool,
     #[arg(long, default_value = "auto")]
     device: DeviceKind,
     #[arg(long, default_value = "native-cpu")]
@@ -223,7 +227,10 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         }
         #[cfg(feature = "ffi")]
         BackendMode::Ffi => {
-            scheduler.register(FfiBackend::new(talker.clone(), codec.clone(), args.device));
+            let mut ffi_bk = FfiBackend::new(talker.clone(), codec.clone(), args.device);
+            ffi_bk.use_flash_attn = args.flash_attention;
+            ffi_bk.clamp_fp16 = args.clamp_fp16;
+            scheduler.register(ffi_bk);
         }
     }
 

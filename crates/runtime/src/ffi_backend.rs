@@ -25,6 +25,10 @@ pub struct FfiBackend {
     pub codec_path: PathBuf,
     /// Device hint (CPU / CUDA / …).
     pub device: DeviceKind,
+    /// Enable Flash Attention (GPU backends only).
+    pub use_flash_attn: bool,
+    /// Clamp fp16 values to avoid NaN artifacts.
+    pub clamp_fp16: bool,
 }
 
 impl FfiBackend {
@@ -38,6 +42,8 @@ impl FfiBackend {
             talker_path: talker_path.into(),
             codec_path: codec_path.into(),
             device,
+            use_flash_attn: false,
+            clamp_fp16: false,
         }
     }
 }
@@ -101,6 +107,8 @@ impl RuntimeBackend for FfiBackend {
         let mut init = QwenTts::init_params();
         init.talker_path = talker_cstr.as_ptr();
         init.codec_path = codec_cstr.as_ptr();
+        init.use_fa = self.use_flash_attn;
+        init.clamp_fp16 = self.clamp_fp16;
 
         let tts = QwenTts::new(&init).map_err(|e| {
             BackendError::Unavailable(format!(
