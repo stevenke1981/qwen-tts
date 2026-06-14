@@ -14,6 +14,7 @@ use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::Duration,
 };
 
 fn main() -> eframe::Result<()> {
@@ -114,6 +115,14 @@ struct QwenTtsApp {
     no_sample: bool,
     flash_attention: bool,
     clamp_fp16: bool,
+    /// Path of the most recently synthesised WAV.
+    last_wav_path: Option<PathBuf>,
+    /// rodio output stream handle — must outlive every Sink.
+    _audio_stream: Option<rodio::OutputStream>,
+    /// Active playback sink (None when idle or stopped).
+    audio_sink: Option<rodio::Sink>,
+    /// Duration of the loaded WAV (used for progress bar).
+    audio_duration_secs: f64,
     status: String,
     busy: bool,
     prompted_for_missing_models: bool,
@@ -149,6 +158,10 @@ impl Default for QwenTtsApp {
             no_sample: false,
             flash_attention: false,
             clamp_fp16: false,
+            last_wav_path: None,
+            _audio_stream: None,
+            audio_sink: None,
+            audio_duration_secs: 0.0,
             status: "就緒".to_owned(),
             busy: false,
             prompted_for_missing_models: false,
