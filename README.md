@@ -36,6 +36,8 @@ The app can download the default qwentts.cpp GGUF files from
 cargo run -p qwen-tts-cli -- models download
 ```
 
+The CLI prints GGUF download progress while files are being fetched.
+
 Dry-run and status checks:
 
 ```bash
@@ -82,7 +84,12 @@ Get-Content dist/SHA256SUMS.txt
 cargo run -p qwen-tts-app
 ```
 
-The GUI can check/download the default GGUF files, edit synthesis settings, and run text-to-WAV generation through the external qwentts.cpp runtime.
+The GUI uses the project-level `models/` folder by default. When it opens and
+the default GGUF files are missing, it asks whether to download them into that
+folder and shows download progress in the status bar. It can also
+check/download the default GGUF files manually, edit
+synthesis settings, and run text-to-WAV generation through the external
+qwentts.cpp runtime.
 
 ## Build qwentts.cpp runtime
 

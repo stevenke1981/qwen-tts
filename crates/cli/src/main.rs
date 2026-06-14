@@ -1,10 +1,15 @@
 use clap::{error::ErrorKind, Parser, Subcommand, ValueEnum};
 use qwen_tts_core::{graph::TtsGraph, GgufProbe, TtsModelSet};
 use qwen_tts_runtime::{
-    default_model_status, ensure_default_models, DeviceKind, ExternalQwenTtsBackend, Scheduler,
-    SynthesisRequest, DEFAULT_MODELS_DIR, DEFAULT_MODEL_FILES,
+    default_model_status, ensure_default_models_with_progress, DeviceKind, ExternalQwenTtsBackend,
+    ModelDownloadProgress, Scheduler, SynthesisRequest, DEFAULT_MODELS_DIR, DEFAULT_MODEL_FILES,
 };
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    io::{self, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 const DEFAULT_QWEN_TTS_BIN: &str = "./vendor/qwentts.cpp/build/bin/qwen-tts";
 const DEFAULT_TALKER_MODEL: &str = "./models/qwen-talker-1.7b-base-Q8_0.gguf";
@@ -165,7 +170,7 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         let status = default_model_status(DEFAULT_MODELS_DIR);
         if !status.is_complete() {
             println!("default GGUF models missing; downloading to {DEFAULT_MODELS_DIR} ...");
-            ensure_default_models(DEFAULT_MODELS_DIR).map_err(|err| err.to_string())?;
+            ensure_models_with_cli_progress(DEFAULT_MODELS_DIR).map_err(|err| err.to_string())?;
         }
     }
 
@@ -229,7 +234,8 @@ fn models(args: &ModelsArgs) -> Result<(), String> {
                 return Ok(());
             }
 
-            let status = ensure_default_models(&args.models_dir).map_err(|err| err.to_string())?;
+            let status =
+                ensure_models_with_cli_progress(&args.models_dir).map_err(|err| err.to_string())?;
             print_model_status_from(&status);
             Ok(())
         }
@@ -255,6 +261,41 @@ fn print_model_status_from(status: &qwen_tts_runtime::DefaultModelStatus) {
             size,
             state
         );
+    }
+}
+
+fn ensure_models_with_cli_progress(
+    models_dir: impl AsRef<std::path::Path>,
+) -> qwen_tts_runtime::ModelDownloadResult<qwen_tts_runtime::DefaultModelStatus> {
+    ensure_default_models_with_progress(models_dir, |progress| {
+        print_download_progress(&progress);
+    })
+}
+
+fn print_download_progress(progress: &ModelDownloadProgress) {
+    let marker = if progress.finished {
+        "done"
+    } else {
+        "downloading"
+    };
+    match progress.total_bytes {
+        Some(total_bytes) if total_bytes > 0 => {
+            let percent = progress.downloaded_bytes.saturating_mul(100) / total_bytes;
+            eprint!(
+                "\r{marker}: {} {}/{} bytes ({}%)",
+                progress.file_name, progress.downloaded_bytes, total_bytes, percent
+            );
+        }
+        _ => {
+            eprint!(
+                "\r{marker}: {} {} bytes",
+                progress.file_name, progress.downloaded_bytes
+            );
+        }
+    }
+    let _ = io::stderr().flush();
+    if progress.finished {
+        eprintln!();
     }
 }
 

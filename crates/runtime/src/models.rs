@@ -1,7 +1,7 @@
 use qwen_tts_core::TtsModelSet;
 use std::{
     fmt, fs,
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -49,6 +49,15 @@ impl DefaultModelFile {
     pub fn path_in(self, models_dir: impl AsRef<Path>) -> PathBuf {
         models_dir.as_ref().join(self.file_name)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDownloadProgress {
+    pub role: &'static str,
+    pub file_name: &'static str,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub finished: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +143,19 @@ pub fn default_model_status(models_dir: impl AsRef<Path>) -> DefaultModelStatus 
 pub fn ensure_default_models(
     models_dir: impl AsRef<Path>,
 ) -> ModelDownloadResult<DefaultModelStatus> {
+    ensure_default_models_with_progress(models_dir, |_| {})
+}
+
+/// Ensures the default GGUF files exist and reports byte-level download progress.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be created, a model cannot be
+/// downloaded, or the completed download cannot be moved into place.
+pub fn ensure_default_models_with_progress(
+    models_dir: impl AsRef<Path>,
+    mut on_progress: impl FnMut(ModelDownloadProgress),
+) -> ModelDownloadResult<DefaultModelStatus> {
     let models_dir = models_dir.as_ref();
     fs::create_dir_all(models_dir)?;
 
@@ -142,7 +164,7 @@ pub fn ensure_default_models(
         if destination.is_file() {
             continue;
         }
-        download_model_file(file.url, &destination)?;
+        download_model_file_with_progress(file, &destination, &mut on_progress)?;
     }
 
     Ok(default_model_status(models_dir))
@@ -184,6 +206,80 @@ pub fn download_model_file(url: &str, destination: &Path) -> ModelDownloadResult
     drop(writer);
 
     fs::rename(&temporary, destination)?;
+    Ok(())
+}
+
+fn download_model_file_with_progress(
+    file: DefaultModelFile,
+    destination: &Path,
+    mut on_progress: impl FnMut(ModelDownloadProgress),
+) -> ModelDownloadResult<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temporary = destination.with_extension(format!(
+        "{}.part",
+        destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("download")
+    ));
+
+    let mut response = ureq::get(file.url)
+        .call()
+        .map_err(|err| ModelDownloadError::Http(err.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ModelDownloadError::Http(format!(
+            "GET {} returned {}",
+            file.url,
+            response.status()
+        )));
+    }
+    let total_bytes = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let mut reader = response.body_mut().as_reader();
+    let mut writer = BufWriter::new(fs::File::create(&temporary)?);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut downloaded_bytes = 0_u64;
+    on_progress(ModelDownloadProgress {
+        role: file.role,
+        file_name: file.file_name,
+        downloaded_bytes,
+        total_bytes,
+        finished: false,
+    });
+
+    loop {
+        let read_bytes = reader.read(&mut buffer)?;
+        if read_bytes == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read_bytes])?;
+        downloaded_bytes += u64::try_from(read_bytes).unwrap_or(0);
+        on_progress(ModelDownloadProgress {
+            role: file.role,
+            file_name: file.file_name,
+            downloaded_bytes,
+            total_bytes,
+            finished: false,
+        });
+    }
+    writer.flush()?;
+    drop(writer);
+
+    fs::rename(&temporary, destination)?;
+    on_progress(ModelDownloadProgress {
+        role: file.role,
+        file_name: file.file_name,
+        downloaded_bytes,
+        total_bytes,
+        finished: true,
+    });
     Ok(())
 }
 

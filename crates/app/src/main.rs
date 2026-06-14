@@ -1,13 +1,14 @@
 use eframe::egui;
 use qwen_tts_core::TtsModelSet;
 use qwen_tts_runtime::{
-    default_model_status, ensure_default_models, DeviceKind, ExternalQwenTtsBackend, Scheduler,
-    SynthesisRequest, DEFAULT_CODEC_FILE, DEFAULT_MODELS_DIR, DEFAULT_TALKER_FILE,
+    default_model_status, ensure_default_models_with_progress, DeviceKind, ExternalQwenTtsBackend,
+    ModelDownloadProgress, Scheduler, SynthesisRequest, DEFAULT_CODEC_FILE, DEFAULT_MODELS_DIR,
+    DEFAULT_TALKER_FILE,
 };
 use std::{
     fs,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
 };
 
@@ -62,6 +63,7 @@ fn load_cjk_font() -> Option<(String, egui::FontData)> {
 
 #[derive(Debug)]
 enum WorkerMessage {
+    DownloadProgress(String),
     DownloadFinished(Result<String, String>),
     SynthesisFinished(Result<String, String>),
 }
@@ -76,6 +78,8 @@ struct QwenTtsApp {
     device: DeviceKind,
     status: String,
     busy: bool,
+    prompted_for_missing_models: bool,
+    show_download_prompt: bool,
     receiver: Option<Receiver<WorkerMessage>>,
 }
 
@@ -86,11 +90,13 @@ impl Default for QwenTtsApp {
             language: "Chinese".to_owned(),
             speaker: String::new(),
             qwen_tts_bin: "./vendor/qwentts.cpp/build/bin/qwen-tts".to_owned(),
-            models_dir: DEFAULT_MODELS_DIR.to_owned(),
+            models_dir: project_models_dir().display().to_string(),
             output_path: "output.wav".to_owned(),
             device: DeviceKind::Auto,
             status: "就緒".to_owned(),
             busy: false,
+            prompted_for_missing_models: false,
+            show_download_prompt: false,
             receiver: None,
         }
     }
@@ -99,6 +105,7 @@ impl Default for QwenTtsApp {
 impl eframe::App for QwenTtsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_worker_messages();
+        self.prompt_for_missing_models_once();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -117,6 +124,8 @@ impl eframe::App for QwenTtsApp {
             self.run_section(ui);
         });
 
+        self.download_prompt_window(ctx);
+
         if self.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -130,6 +139,10 @@ impl QwenTtsApp {
         };
 
         match receiver.try_recv() {
+            Ok(WorkerMessage::DownloadProgress(message)) => {
+                self.status = message;
+                self.receiver = Some(receiver);
+            }
             Ok(WorkerMessage::DownloadFinished(result)) => {
                 self.busy = false;
                 self.status = match result {
@@ -157,6 +170,50 @@ impl QwenTtsApp {
     fn set_status(&mut self, value: &str) {
         self.status.clear();
         self.status.push_str(value);
+    }
+
+    fn prompt_for_missing_models_once(&mut self) {
+        if self.prompted_for_missing_models || self.busy {
+            return;
+        }
+
+        self.prompted_for_missing_models = true;
+        let status = default_model_status(&self.models_dir);
+        if !status.is_complete() {
+            self.show_download_prompt = true;
+            self.status = format!(
+                "專案 models 資料夾缺少 {} 個預設 GGUF 模型",
+                status.missing_files().len()
+            );
+        }
+    }
+
+    fn download_prompt_window(&mut self, ctx: &egui::Context) {
+        if !self.show_download_prompt {
+            return;
+        }
+
+        egui::Window::new("下載預設 GGUF 模型")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("專案 models 資料夾缺少 Qwen TTS 預設模型。");
+                ui.label(format!("下載位置：{}", self.models_dir));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("下載到 models"))
+                        .clicked()
+                    {
+                        self.show_download_prompt = false;
+                        self.start_download();
+                    }
+                    if ui.button("稍後").clicked() {
+                        self.show_download_prompt = false;
+                        self.set_status("已略過自動下載，可稍後按「下載 GGUF」");
+                    }
+                });
+            });
     }
 
     fn model_section(&mut self, ui: &mut egui::Ui) {
@@ -273,15 +330,20 @@ impl QwenTtsApp {
         self.set_status("正在下載預設 GGUF 模型...");
 
         thread::spawn(move || {
-            let result = ensure_default_models(&models_dir)
-                .map(|status| {
-                    format!(
-                        "已下載/確認 {} 個模型檔案：{}",
-                        status.files.len(),
-                        status.models_dir.display()
-                    )
-                })
-                .map_err(|err| err.to_string());
+            let progress_sender = sender.clone();
+            let result = ensure_default_models_with_progress(&models_dir, |progress| {
+                let _ = progress_sender.send(WorkerMessage::DownloadProgress(
+                    format_download_progress(&progress),
+                ));
+            })
+            .map(|status| {
+                format!(
+                    "已下載/確認 {} 個模型檔案：{}",
+                    status.files.len(),
+                    status.models_dir.display()
+                )
+            })
+            .map_err(|err| err.to_string());
             let _ = sender.send(WorkerMessage::DownloadFinished(result));
         });
     }
@@ -312,20 +374,29 @@ impl QwenTtsApp {
         self.set_status("正在合成...");
 
         thread::spawn(move || {
-            let result = run_synthesis(qwen_tts_bin, &request);
+            let result = run_synthesis(qwen_tts_bin, &request, &sender);
             let _ = sender.send(WorkerMessage::SynthesisFinished(result));
         });
     }
 }
 
-fn run_synthesis(qwen_tts_bin: PathBuf, request: &SynthesisRequest) -> Result<String, String> {
+fn run_synthesis(
+    qwen_tts_bin: PathBuf,
+    request: &SynthesisRequest,
+    sender: &Sender<WorkerMessage>,
+) -> Result<String, String> {
     let models_dir = request
         .models
         .talker
         .path
         .parent()
         .map_or_else(|| PathBuf::from(DEFAULT_MODELS_DIR), PathBuf::from);
-    ensure_default_models(models_dir).map_err(|err| err.to_string())?;
+    ensure_default_models_with_progress(models_dir, |progress| {
+        let _ = sender.send(WorkerMessage::DownloadProgress(format_download_progress(
+            &progress,
+        )));
+    })
+    .map_err(|err| err.to_string())?;
 
     let mut scheduler = Scheduler::new();
     scheduler.register(ExternalQwenTtsBackend::new(qwen_tts_bin, request.device));
@@ -362,6 +433,60 @@ fn format_bytes(value: u64) -> String {
     }
 }
 
+fn format_download_progress(progress: &ModelDownloadProgress) -> String {
+    let action = if progress.finished {
+        "下載完成"
+    } else {
+        "正在下載"
+    };
+    match progress.total_bytes {
+        Some(total_bytes) if total_bytes > 0 => {
+            let percent = progress.downloaded_bytes.saturating_mul(100) / total_bytes;
+            format!(
+                "{action} {}：{} / {} bytes（{}%）",
+                progress.file_name, progress.downloaded_bytes, total_bytes, percent
+            )
+        }
+        _ => format!(
+            "{action} {}：{} bytes",
+            progress.file_name, progress.downloaded_bytes
+        ),
+    }
+}
+
+fn project_models_dir() -> PathBuf {
+    project_root_dir().join("models")
+}
+
+fn project_root_dir() -> PathBuf {
+    if let Ok(current_dir) = std::env::current_dir() {
+        if current_dir.join("Cargo.toml").is_file() {
+            return current_dir;
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(root) = find_ancestor_with_manifest(&exe_path) {
+            return root;
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn find_ancestor_with_manifest(path: &std::path::Path) -> Option<PathBuf> {
+    let start = if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+
+    start
+        .ancestors()
+        .find(|candidate| candidate.join("Cargo.toml").is_file())
+        .map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +502,30 @@ mod tests {
         for device in [DeviceKind::Auto, DeviceKind::Cpu, DeviceKind::Cuda] {
             assert_eq!(device.to_string().parse::<DeviceKind>().unwrap(), device);
         }
+    }
+
+    #[test]
+    fn formats_download_progress_with_percent() {
+        let message = format_download_progress(&ModelDownloadProgress {
+            role: "talker",
+            file_name: "talker.gguf",
+            downloaded_bytes: 50,
+            total_bytes: Some(100),
+            finished: false,
+        });
+
+        assert!(message.contains("50%"));
+    }
+
+    #[test]
+    fn finds_project_root_from_nested_path() {
+        let app_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = app_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("app crate should live under workspace/crates/app");
+        let nested = workspace.join("dist").join("qwen-tts-gui.exe");
+
+        assert_eq!(find_ancestor_with_manifest(&nested).unwrap(), workspace);
     }
 }
