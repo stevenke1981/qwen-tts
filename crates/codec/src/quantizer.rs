@@ -33,7 +33,7 @@ const ACOUSTIC_CODEBOOKS: usize = NUM_QUANTIZERS - SEMANTIC_CODEBOOKS; // 15
 pub struct QuantizerDecoder {
     /// Codebook embedding tables, flat [16][256 * 2048].
     /// Index 0 = semantic, indices 1..16 = acoustic.
-    codebooks: Vec<Vec<f32>>,
+    pub(crate) codebooks: Vec<Vec<f32>>,
 
     /// Output projection weights for each group.
     /// [0] = semantic proj [256, 512]  — weight[ic + 256*oc] in GGUF layout

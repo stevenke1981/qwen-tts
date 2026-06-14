@@ -1,0 +1,176 @@
+[qwen-tts-cpu] qt_version: 0bf4a18 (2026-06-11)
+[qwen-tts-cpu] loading talker: D:\qwen_tts\models\qwen-talker-1.7b-base-Q8_0.gguf
+[qwen-tts-cpu] loading codec:  D:\qwen_tts\models\qwen-tokenizer-12hz-Q8_0.gguf
+[Qwen] qwentts.cpp 0bf4a18 (2026-06-11)
+[Load] Talker backend: CPU (CPU threads: 12)
+[GGUF] D:\qwen_tts\models\qwen-talker-1.7b-base-Q8_0.gguf: 480 tensors, data at offset 5954496
+[WeightCtx] Loaded 316 tensors, 1765.0 MB into backend
+[Talker] Loaded: 28 layers, hidden 2048, heads 16/8, head_dim 128, FFN 6144, RoPE theta 1000000, mrope sections [24,20,20] interleaved=0
+[WeightCtx] Loaded 88 tensors, 177.5 MB into backend
+[CodePredictor] Loaded: 5 layers, hidden 1024, heads 16/8, head_dim 128, FFN 3072, RoPE theta 1000000, 15 acoustic codebooks (vocab 2048 each), mtp_proj linear
+[WeightCtx] Loaded 76 tensors, 34.9 MB into backend
+[SpeakerEncoder] Loaded: enc_dim=2048 sr=24000 mel_dim=128 hidden=512 mfa=1536 asp_attn=128 se=128 scale=8
+[GGUF] D:\qwen_tts\models\qwen-tokenizer-12hz-Q8_0.gguf: 398 tensors, data at offset 29760
+[WeightCtx] Loaded 18 tensors, 33.0 MB into backend
+[Quantizer] Loaded: 16 codebooks (1 semantic + 15 acoustic), 2048 entries x 256 dim, hidden 512
+[WeightCtx] Loaded 93 tensors, 30.9 MB into backend
+[Transformer] Loaded: 8 layers, hidden 512, heads 16/16, head_dim 64, FFN 1024, RoPE theta 10000, sliding window 72
+[WeightCtx] Loaded 22 tensors, 33.1 MB into backend
+[Upsample] Loaded: 2 blocks (2x ratio per block), channels 1024, dwconv kernel 7
+[WeightCtx] Loaded 118 tensors, 142.9 MB into backend
+[DAC] Loaded: 4 blocks (strides 8/5/4/3), 24 kHz mono out, weights 142.9 MB
+[WeightCtx] Loaded 2 tensors, 3.0 MB into backend
+[WeightCtx] Loaded 28 tensors, 24.1 MB into backend
+[SEANet] Loaded: 4 stages (ratios 4/5/6/8), 64 -> 512 channels, weights 24.1 MB
+[WeightCtx] Loaded 96 tensors, 25.6 MB into backend
+[EncTransformer] Loaded: 8 layers, hidden 512, heads 8/8, head_dim 64, FFN 2048, RoPE theta 10000
+[WeightCtx] Loaded 1 tensors, 2.0 MB into backend
+[EncDownsample] Loaded: k=4 stride=2, 512 -> 512 channels, weights 2.0 MB
+[WeightCtx] Loaded 20 tensors, 34.0 MB into backend
+[EncQuantizer] Loaded: 16 codebooks (1 semantic + 15 acoustic), 2048 entries x 256 dim, hidden 512, weights 34.0 MB
+[Pipeline] Ready: hop 1920 samples @ 24000 Hz mono, 16 codebooks @ 12.5 Hz
+[KVCache] Allocated: 28 layers, 8 KV heads, head_dim 128, max_seq_len 4096 -> 896 MB
+[KVCache] Allocated: 5 layers, 8 KV heads, head_dim 128, max_seq_len 16 -> 0 MB
+[Pipeline] Loaded: arch=1b7 variant=base tokenizer=qwen3_tts_tokenizer_12hz codebooks=16 speaker_encoder=loaded speakers=0 fa=off clamp_fp16=off
+[BPE] Loaded from GGUF: 151676 vocab, 151291 merges, eos_id=151643
+[BPE] Registered 5 arch special tokens (total specials=6)
+[qwen-tts-cpu] context initialised successfully
+[qwen-tts-cpu] synthesize: lang=Chinese, speaker=(none) text_len=38
+[Prompt] Built: 20 ids, N_text=12, N_instruct=0, T_ctx=22, hidden=2048, lang=Chinese (id=2055), speaker=none (id=-1) ref_spk_emb=no icl=no
+[Sample] step=0 c0=1995 u=0.8812084794 subseq=0
+[Sample-CP] g=0 c=1486 u=0.8691408038 subseq=1
+[Sample-CP] g=1 c=1114 u=0.4797302485 subseq=2
+[Sample-CP] g=2 c=1399 u=0.6692442298 subseq=3
+[Sample-CP] g=3 c=1832 u=0.9616183639 subseq=4
+[Sample-CP] g=4 c=383 u=0.2417532653 subseq=5
+[Sample-CP] g=5 c=1579 u=0.8825008869 subseq=6
+[Sample-CP] g=6 c=1544 u=0.5641888976 subseq=7
+[Sample-CP] g=7 c=1611 u=0.8597153425 subseq=8
+[Sample-CP] g=8 c=2030 u=0.9539576173 subseq=9
+[Sample-CP] g=9 c=414 u=0.0704901367 subseq=10
+[Sample-CP] g=10 c=796 u=0.4809035361 subseq=11
+[Sample-CP] g=11 c=729 u=0.3551483750 subseq=12
+[Sample-CP] g=12 c=1575 u=0.7391551733 subseq=13
+[Sample-CP] g=13 c=1587 u=0.6571023464 subseq=14
+[Sample-CP] g=14 c=787 u=0.5200620294 subseq=15
+[Sample] step=1 c0=215 u=0.2769713998 subseq=16
+[Sample-CP] g=0 c=1221 u=0.1939753145 subseq=17
+[Sample-CP] g=1 c=928 u=0.4061380923 subseq=18
+[Sample-CP] g=2 c=1458 u=0.8653630614 subseq=19
+[Sample-CP] g=3 c=1442 u=0.7034346461 subseq=20
+[Sample-CP] g=4 c=1685 u=0.8953344822 subseq=21
+[Sample-CP] g=5 c=1421 u=0.5124464035 subseq=22
+[Sample-CP] g=6 c=370 u=0.0811286718 subseq=23
+[Sample-CP] g=7 c=1422 u=0.8047703505 subseq=24
+[Sample-CP] g=8 c=1446 u=0.7878295183 subseq=25
+[Sample-CP] g=9 c=1512 u=0.8089054227 subseq=26
+[Sample-CP] g=10 c=1615 u=0.8684030771 subseq=27
+[Sample-CP] g=11 c=1439 u=0.6869815588 subseq=28
+[Sample-CP] g=12 c=305 u=0.0360636525 subseq=29
+[Sample-CP] g=13 c=82 u=0.0256041083 subseq=30
+[Sample-CP] g=14 c=151 u=0.0722080097 subseq=31
+[Pipeline] Generated 8 frames
+[Pipeline] Generated 16 frames
+[Pipeline] Generated 24 frames
+[Pipeline] Generated 32 frames
+[Pipeline] Generated 40 frames
+[Pipeline] EOS at step 47, stopping
+[Pipeline] Generation done : 47 frames
+[Perf] PromptBuild 1.2 ms
+[Perf] Prefill 167.3 ms (T_ctx prefill)
+[Perf] TTFA 215.9 ms (first frame codes)
+[Perf] TalkerDecode 2437.2 ms (47 frames, 51.86 ms/frame)
+[Perf] CodePredictor 2413.2 ms (51.34 ms/frame)
+[Perf] HostCompose 4.6 ms (c0 sample + next emb)
+[Perf] CodecDecode 1632.5 ms
+[Perf] Total 6656.3 ms (47 frames, 103.30 ms/frame AR, audio 3.76 s, RTF 1.770)
+[qwen-tts-cpu] output: n_samples=90240 sample_rate=24000 channels=1
+[qwen-tts-cpu] sample stats: min=-0.2380 max=0.1737 mean=0.0000 first_10=[3.4477475e-6, 1.3254671e-6, -1.9913694e-5, -2.2777336e-5, -1.6420943e-5, -2.667952e-5, -5.1199844e-5, -5.0980518e-5, -8.508273e-5, -0.00013026338]
+[qwen-tts-cpu] qt_version: 0bf4a18 (2026-06-11)
+[qwen-tts-cpu] loading talker: D:\qwen_tts\models\qwen-talker-1.7b-base-Q8_0.gguf
+[qwen-tts-cpu] loading codec:  D:\qwen_tts\models\qwen-tokenizer-12hz-Q8_0.gguf
+[Qwen] qwentts.cpp 0bf4a18 (2026-06-11)
+[Load] Talker backend: CPU (CPU threads: 12)
+[GGUF] D:\qwen_tts\models\qwen-talker-1.7b-base-Q8_0.gguf: 480 tensors, data at offset 5954496
+[WeightCtx] Loaded 316 tensors, 1765.0 MB into backend
+[Talker] Loaded: 28 layers, hidden 2048, heads 16/8, head_dim 128, FFN 6144, RoPE theta 1000000, mrope sections [24,20,20] interleaved=0
+[WeightCtx] Loaded 88 tensors, 177.5 MB into backend
+[CodePredictor] Loaded: 5 layers, hidden 1024, heads 16/8, head_dim 128, FFN 3072, RoPE theta 1000000, 15 acoustic codebooks (vocab 2048 each), mtp_proj linear
+[WeightCtx] Loaded 76 tensors, 34.9 MB into backend
+[SpeakerEncoder] Loaded: enc_dim=2048 sr=24000 mel_dim=128 hidden=512 mfa=1536 asp_attn=128 se=128 scale=8
+[GGUF] D:\qwen_tts\models\qwen-tokenizer-12hz-Q8_0.gguf: 398 tensors, data at offset 29760
+[WeightCtx] Loaded 18 tensors, 33.0 MB into backend
+[Quantizer] Loaded: 16 codebooks (1 semantic + 15 acoustic), 2048 entries x 256 dim, hidden 512
+[WeightCtx] Loaded 93 tensors, 30.9 MB into backend
+[Transformer] Loaded: 8 layers, hidden 512, heads 16/16, head_dim 64, FFN 1024, RoPE theta 10000, sliding window 72
+[WeightCtx] Loaded 22 tensors, 33.1 MB into backend
+[Upsample] Loaded: 2 blocks (2x ratio per block), channels 1024, dwconv kernel 7
+[WeightCtx] Loaded 118 tensors, 142.9 MB into backend
+[DAC] Loaded: 4 blocks (strides 8/5/4/3), 24 kHz mono out, weights 142.9 MB
+[WeightCtx] Loaded 2 tensors, 3.0 MB into backend
+[WeightCtx] Loaded 28 tensors, 24.1 MB into backend
+[SEANet] Loaded: 4 stages (ratios 4/5/6/8), 64 -> 512 channels, weights 24.1 MB
+[WeightCtx] Loaded 96 tensors, 25.6 MB into backend
+[EncTransformer] Loaded: 8 layers, hidden 512, heads 8/8, head_dim 64, FFN 2048, RoPE theta 10000
+[WeightCtx] Loaded 1 tensors, 2.0 MB into backend
+[EncDownsample] Loaded: k=4 stride=2, 512 -> 512 channels, weights 2.0 MB
+[WeightCtx] Loaded 20 tensors, 34.0 MB into backend
+[EncQuantizer] Loaded: 16 codebooks (1 semantic + 15 acoustic), 2048 entries x 256 dim, hidden 512, weights 34.0 MB
+[Pipeline] Ready: hop 1920 samples @ 24000 Hz mono, 16 codebooks @ 12.5 Hz
+[KVCache] Allocated: 28 layers, 8 KV heads, head_dim 128, max_seq_len 4096 -> 896 MB
+[KVCache] Allocated: 5 layers, 8 KV heads, head_dim 128, max_seq_len 16 -> 0 MB
+[Pipeline] Loaded: arch=1b7 variant=base tokenizer=qwen3_tts_tokenizer_12hz codebooks=16 speaker_encoder=loaded speakers=0 fa=off clamp_fp16=off
+[BPE] Loaded from GGUF: 151676 vocab, 151291 merges, eos_id=151643
+[BPE] Registered 5 arch special tokens (total specials=6)
+[qwen-tts-cpu] context initialised successfully
+[qwen-tts-cpu] synthesize: lang=Chinese, speaker=(none) text_len=39
+[Prompt] Built: 21 ids, N_text=13, N_instruct=0, T_ctx=23, hidden=2048, lang=Chinese (id=2055), speaker=none (id=-1) ref_spk_emb=no icl=no
+[Sample] step=0 c0=1995 u=0.9153099060 subseq=0
+[Sample-CP] g=0 c=1159 u=0.7700930834 subseq=1
+[Sample-CP] g=1 c=412 u=0.7945001125 subseq=2
+[Sample-CP] g=2 c=575 u=0.8930301070 subseq=3
+[Sample-CP] g=3 c=1210 u=0.8461666703 subseq=4
+[Sample-CP] g=4 c=1020 u=0.4449461102 subseq=5
+[Sample-CP] g=5 c=392 u=0.3762314916 subseq=6
+[Sample-CP] g=6 c=392 u=0.0943292901 subseq=7
+[Sample-CP] g=7 c=249 u=0.2121772915 subseq=8
+[Sample-CP] g=8 c=1786 u=0.8164827228 subseq=9
+[Sample-CP] g=9 c=743 u=0.6516640186 subseq=10
+[Sample-CP] g=10 c=903 u=0.3125076294 subseq=11
+[Sample-CP] g=11 c=783 u=0.5726056695 subseq=12
+[Sample-CP] g=12 c=1860 u=0.7389875054 subseq=13
+[Sample-CP] g=13 c=1772 u=0.9271344543 subseq=14
+[Sample-CP] g=14 c=1520 u=0.7475820780 subseq=15
+[Sample] step=1 c0=2042 u=0.5479388833 subseq=16
+[Sample-CP] g=0 c=1752 u=0.9582142830 subseq=17
+[Sample-CP] g=1 c=1807 u=0.9236423969 subseq=18
+[Sample-CP] g=2 c=773 u=0.4735845923 subseq=19
+[Sample-CP] g=3 c=269 u=0.1504391730 subseq=20
+[Sample-CP] g=4 c=1188 u=0.2705312967 subseq=21
+[Sample-CP] g=5 c=66 u=0.0051976703 subseq=22
+[Sample-CP] g=6 c=459 u=0.3005987406 subseq=23
+[Sample-CP] g=7 c=706 u=0.4023722112 subseq=24
+[Sample-CP] g=8 c=343 u=0.3074165881 subseq=25
+[Sample-CP] g=9 c=276 u=0.0991862118 subseq=26
+[Sample-CP] g=10 c=281 u=0.2035388499 subseq=27
+[Sample-CP] g=11 c=702 u=0.3951842785 subseq=28
+[Sample-CP] g=12 c=441 u=0.4665063620 subseq=29
+[Sample-CP] g=13 c=409 u=0.3474681079 subseq=30
+[Sample-CP] g=14 c=1171 u=0.6882776618 subseq=31
+[Pipeline] Generated 8 frames
+[Pipeline] Generated 16 frames
+[Pipeline] Generated 24 frames
+[Pipeline] Generated 32 frames
+[Pipeline] Generated 40 frames
+[Pipeline] EOS at step 47, stopping
+[Pipeline] Generation done : 47 frames
+[Perf] PromptBuild 1.2 ms
+[Perf] Prefill 183.4 ms (T_ctx prefill)
+[Perf] TTFA 233.1 ms (first frame codes)
+[Perf] TalkerDecode 2415.8 ms (47 frames, 51.40 ms/frame)
+[Perf] CodePredictor 2410.7 ms (51.29 ms/frame)
+[Perf] HostCompose 4.6 ms (c0 sample + next emb)
+[Perf] CodecDecode 1633.8 ms
+[Perf] Total 6650.0 ms (47 frames, 102.79 ms/frame AR, audio 3.76 s, RTF 1.769)
+[qwen-tts-cpu] output: n_samples=90240 sample_rate=24000 channels=1
+[qwen-tts-cpu] sample stats: min=-0.5514 max=0.4069 mean=0.0000 first_10=[1.1352842e-5, 1.2644994e-5, 1.2095863e-5, 1.3962292e-5, 1.4435665e-5, 1.4260111e-5, 1.4621028e-5, 1.3346396e-5, 1.2787748e-5, 1.1474554e-5]

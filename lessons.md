@@ -9,3 +9,21 @@
 **Trigger:** Release copy failed because `dist/qwen-tts-gui.exe` was still running and locked on Windows.
 **Rule:** Before copying release GUI binaries into `dist`, check for running `qwen-tts-gui` processes and stop the old `dist` executable if it locks the target file.
 **Source:** qwentts backend implementation
+
+---
+## Lesson #3 - 2026-06-14
+**Trigger:** MSVC link error LNK1181: ggml.lib not found because import libraries were in `build/ggml/src/Release/` not `build/Release/`.
+**Rule:** When linking pre-built CMake shared libraries, check both the DLL directory and the subproject object directory for import libraries (.lib). Run `Get-ChildItem -Recurse -Filter "*.lib"` on the build tree rather than guessing the location.
+**Source:** native-cpu-backend-m2-ffi-inference
+
+---
+## Lesson #4 - 2026-06-14
+**Trigger:** GGUF F16 and Q8_0 tensor reads produced all-zero values because `f16_bits_to_f32` normal-branch bit manipulation was wrong (treated `exp` as raw field value instead of bit-shifted position).
+**Rule:** When implementing IEEE 754 half-precision conversion, shift the raw bit fields right to their proper positions FIRST (raw_exp = (h>>10)&0x1F, raw_mant = h&0x3FF), compute the f32 exponent as `raw_exp - 15 + 127`, then construct the final f32 bits with `(sign<<31)|(f32_exp<<23)|(raw_mant<<13)`. Test with 0x3C00→1.0, 0x3800→0.5, 0xC000→-2.0.
+**Source:** codec-decoder-rust (Task 1: GGUF loader)
+
+---
+## Lesson #5 - 2026-06-14
+**Trigger:** DAC output blew up to ±47 (normal expected ±0.14) because SnakeBeta denominator was `1/beta` instead of `1/(exp(beta)+1e-9)`.
+**Rule:** When porting activation functions from ggml to Rust, examine the C++ load-time pre-computation, not just the runtime formula. The C++ code pre-computes `a = exp(alpha)` and `inv_b = 1/(exp(beta)+1e-9)` and stores those, not the raw parameters. If your Rust implementation computes `exp(alpha)` at runtime, make sure you also compute `exp(beta)` and the epsilon-guarded inverse. Don't assume `beta` is used directly as a denominator.
+**Source:** codec-decoder-rust (Task 1: Codec decoder RS)

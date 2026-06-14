@@ -285,8 +285,7 @@ impl QwenTtsApp {
         });
 
         if self.backend_mode == BackendMode::NativeCpu {
-            ui.label("狀態：原生 Rust CPU backend 可用（逐步改寫中）");
-            ui.label("目前會驗證 GGUF 模型並由 Rust 產生 WAV；完整 Qwen 推論仍在後續階段。");
+            ui.label("狀態：原生 Rust CPU backend — 透過 FFI 呼叫 qwentts.cpp 進行完整合成");
             return;
         }
 

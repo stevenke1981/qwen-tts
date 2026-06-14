@@ -7,4 +7,10 @@ license.workspace = true
 [dependencies]
 qwen-tts-core = { path = "../core" }
 byteorder = "1.5"
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
 rayon = "1.10"
+
+[[bin]]
+name = "qwen-codec"
+path = "src/bin/codec.rs"
