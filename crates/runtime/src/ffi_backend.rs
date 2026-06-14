@@ -89,6 +89,13 @@ impl RuntimeBackend for FfiBackend {
             ),
             None => None,
         };
+        let instruct_cstr = match &request.instruct {
+            Some(s) => Some(
+                CString::new(s.as_str())
+                    .map_err(|_| BackendError::InvalidRequest("instruct contains NUL".into()))?,
+            ),
+            None => None,
+        };
 
         // ── Initialise context ──────────────────────────────────────────
         let mut init = QwenTts::init_params();
@@ -108,6 +115,7 @@ impl RuntimeBackend for FfiBackend {
         params.text = text_cstr.as_ptr();
         params.lang = lang_cstr.as_ptr();
         params.speaker = speaker_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        params.instruct = instruct_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let samples = unsafe {
             // Safety: the C string pointers above stay valid for the

@@ -57,6 +57,7 @@ pub struct SynthesisRequest {
     pub text: String,
     pub language: String,
     pub speaker: Option<String>,
+    pub instruct: Option<String>,
     pub out_path: PathBuf,
     pub device: DeviceKind,
     pub models: TtsModelSet,

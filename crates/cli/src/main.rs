@@ -125,6 +125,8 @@ struct SynthArgs {
     lang: String,
     #[arg(long)]
     speaker: Option<String>,
+    #[arg(long)]
+    instruct: Option<String>,
     #[arg(long, default_value = "auto")]
     device: DeviceKind,
     #[arg(long, default_value = "native-cpu")]
@@ -229,6 +231,7 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         text: args.text.clone(),
         language: args.lang.clone(),
         speaker: args.speaker.clone(),
+        instruct: args.instruct.clone(),
         out_path: args.out.clone().unwrap_or_else(default_voice_output_path),
         device: args.device,
         models: TtsModelSet::new(talker, codec),

@@ -124,6 +124,7 @@ impl RuntimeConfig {
             text: text.into(),
             language: self.default_lang.clone(),
             speaker: None,
+            instruct: None,
             out_path: out_path.into(),
             device: self.default_device,
             models: self.model_set(),
