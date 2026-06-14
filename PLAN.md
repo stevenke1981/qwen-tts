@@ -23,30 +23,37 @@
 - [x] Add batch synthesis.
 - [x] Add default GGUF model status and download workflow.
 
-## Phase 3 — qwentts.cpp FFI
+## Phase 3 — qwentts.cpp FFI ✅
 
-- [ ] Add `crates/qwentts-sys`.
-- [ ] Generate bindings from qwentts.cpp public C ABI.
-- [ ] Add safe wrapper crate.
-- [ ] Replace process execution with direct in-process inference.
+- [x] Add `crates/qwentts-sys`.
+- [x] Generate bindings from qwentts.cpp public C ABI.
+- [x] Add safe wrapper crate.
+- [x] Replace process execution with direct in-process inference.
+- [x] `--backend ffi` is now the default CLI backend.
+- [x] Voice reference (ref_audio / ref_text) support.
+- [x] Instruct / speaker / sampling params (seed, temp, top-k/p, rep-penalty).
 
-## Phase 4 — GUI
+## Phase 4 — GUI ✅
 
 - [x] Add GUI crate: `crates/app`.
 - [x] Choose Tauri, egui, or Slint.
 - [x] Add model path settings.
 - [x] Add text box, language selector, voice selector, output path selector.
-- [ ] Add playback.
+- [x] FfiBackend backend selection.
+- [x] Instruct / ref_audio / ref_text form fields.
+- [x] Collapsible advanced params (seed, temp, top-k/p, flash attention, etc.)
+- [x] Audio playback via rodio (auto-play + play/pause/stop + progress bar).
 
 ## Phase 5 — Native backend experiments
 
 Recommended order:
 
-1. CPU backend.
-2. CUDA backend.
-3. Metal backend.
-4. WGPU backend.
-5. ROCm backend.
-6. SYCL backend.
+1. CPU backend — `crates/backends/cpu` (FFI-to-C++ via qwentts-sys, functional).
+2. CUDA backend — skeleton crate exists.
+3. Metal backend — skeleton crate exists.
+4. WGPU backend — skeleton crate exists.
+5. ROCm backend — skeleton crate exists.
+6. SYCL backend — skeleton crate exists.
 
-Do not implement every backend at once. Stabilize the runtime trait and FFI first.
+Pure Rust reimplementation of the TTS pipeline (ggml-free) is a future
+milestone once the FFI path is fully stabilized.

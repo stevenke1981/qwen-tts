@@ -1,11 +1,15 @@
 # Qwen TTS
 
-Rust workspace for building a local speech generation app with Qwen3-TTS GGUF.
+Rust workspace for building a local speech generation app with Qwen3-TTS GGUF
+models.
 
-The app/runtime layer is Rust-first. Native Rust CPU synthesis is available as
-the first rewrite milestone, while the `qwentts.cpp` `qwen-tts` executable is
-still kept as the fallback for full Qwen3-TTS model inference during the
-incremental port.
+Three backends are available:
+
+| Backend | Mode | Default | Description |
+|---------|------|---------|-------------|
+| `ffi` | In-process FFI | ✅ (since v0.1) | Direct calls into qwentts.cpp shared library |
+| `qwentts` | Subprocess | | External `qwen-tts` CLI executable |
+| `native-cpu` | In-process FFI | | Wraps qwentts.cpp via `qwentts-sys` with WAV write in Rust |
 
 ## Layout
 
@@ -14,16 +18,20 @@ qwen_tts/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── crates/
-│   ├── core/
-│   ├── runtime/
+│   ├── core/          — Model paths, GGUF probe, audio spec types
+│   ├── runtime/       — Backend trait, scheduler, config, model download
 │   ├── backends/
-│   │   ├── cpu/
-│   │   ├── cuda/
-│   │   ├── rocm/
-│   │   ├── metal/
-│   │   ├── wgpu/
-│   │   └── sycl/
-│   └── cli/
+│   │   ├── cpu/       — Native CPU backend (FFI to qwentts.cpp)
+│   │   ├── cuda/      — (skeleton)
+│   │   ├── rocm/      — (skeleton)
+│   │   ├── metal/     — (skeleton)
+│   │   ├── wgpu/      — (skeleton)
+│   │   └── sycl/      — (skeleton)
+│   ├── qwentts-sys/   — Unsafe raw FFI + safe Rust wrapper
+│   ├── cli/           — CLI binary
+│   └── app/           — egui desktop GUI
+├── vendor/
+│   └── qwentts.cpp/   — Upstream C++ TTS library
 ├── examples/
 ├── scripts/
 ├── docs/
@@ -83,16 +91,34 @@ Get-Content dist/SHA256SUMS.txt
 
 ## Run the egui desktop app
 
+The GUI supports all three backends. With the `ffi` feature (default), it
+uses the in-process FFI backend for synthesis:
+
 ```bash
+# Default (FFI in-process backend)
+cargo run -p qwen-tts-app --features ffi
+
+# Fallback: subprocess backend (requires qwen-tts executable)
 cargo run -p qwen-tts-app
 ```
 
 The GUI uses the project-level `models/` folder by default. When it opens and
 the default GGUF files are missing, it asks whether to download them into that
-folder and shows download progress in the status bar. It can also
-check/download the default GGUF files manually, edit
-synthesis settings, and run text-to-WAV generation through the external
-qwentts.cpp runtime.
+folder and shows download progress in the status bar.
+
+Synthesis controls:
+- **Text**, **language**, **speaker**, **instruct** (voice style guide)
+- **Reference audio** for voice cloning (WAV path + reference text)
+- **Backend selection** (FFI / Native CPU / qwentts.cpp subprocess)
+- **Device** selection (Auto / CPU / CUDA / ROCm / Metal / WGPU / SYCL)
+- **Advanced params** — seed, temperature, top-k, top-p, repetition penalty,
+  max tokens, do_sample, flash attention, clamp fp16
+
+Playback:
+- **Auto-play** after synthesis completes
+- Manual **Play / Pause / Stop** controls
+- **Progress bar** with elapsed / total time display
+- Powered by `rodio` (cross-platform, non-blocking)
 
 ## Build qwentts.cpp runtime
 
@@ -121,22 +147,46 @@ cargo run -p qwen-tts-cli -- inspect \
 
 ## Generate speech
 
+Default (FFI in-process backend):
+
 ```bash
 cargo run -p qwen-tts-cli -- synth \
-  --text "你好，這是 Rust 本機語音生成測試。" \
-  --lang Chinese \
-  --backend native-cpu
+  --text "你好，這是 Qwen TTS 語音合成測試。" \
+  --lang Chinese
 ```
 
+Use the legacy subprocess backend:
+
+```bash
+cargo run -p qwen-tts-cli -- synth \
+  --text "你好" \
+  --backend qwentts
+```
+
+All available flags:
+
+| Flag | Description |
+|------|-------------|
+| `--text` | Input text to synthesise |
+| `--lang` | Language (Chinese, English, Japanese, etc.) |
+| `--speaker` | Speaker ID or name |
+| `--instruct` | Voice style / emotion guide |
+| `--ref-audio` | Reference WAV path (voice cloning) |
+| `--ref-text` | Transcription of the reference audio |
+| `--seed` | Random seed for reproducibility |
+| `--temperature` | Sampling temperature (0.0–2.0) |
+| `--top-k` | Top-K sampling |
+| `--top-p` | Top-P (nucleus) sampling |
+| `--repetition-penalty` | Repetition penalty (≥ 1.0) |
+| `--max-tokens` | Maximum output tokens |
+| `--no-sample` | Disable random sampling (greedy decode) |
+| `--backend` | `ffi` (default), `qwentts`, or `native-cpu` |
+| `--device` | `auto`, `cpu`, `cuda`, `rocm`, `metal`, `wgpu`, `sycl` |
+| `--out` | Output WAV path (default: `output/voice-<timestamp>.wav`) |
+
 When `--out` is omitted, the WAV is written to `output/voice-<timestamp>.wav`.
-Pass `--out` only when you want a custom path.
 
-`--backend native-cpu` is the native Rust CPU rewrite path. It currently
-validates the GGUF files and emits a valid WAV from Rust as the first CPU
-milestone; use `--backend qwentts` when you need the full upstream Qwen voice
-quality while the remaining graph/codec layers are being ported.
-
-If your `qwen-tts` binary is elsewhere:
+If your `qwen-tts` binary is elsewhere (only needed for `--backend qwentts`):
 
 ```bash
 QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --backend qwentts --text "測試"
@@ -144,6 +194,9 @@ QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --backend qwen
 
 ## Roadmap
 
-1. Port the CPU GGUF loaders, tokenizer, sampler, and codec layers to native Rust.
-2. Replace the experimental CPU waveform path with full Qwen3-TTS inference.
-3. Add native CUDA/Metal/WGPU/ROCm/SYCL implementations crate by crate.
+- [x] CLI: GGUF inspect, model download, TOML config, batch synth
+- [x] FFI: In-process qwentts.cpp backend (`--backend ffi`), voice cloning
+- [x] GUI: egui desktop app with model mgmt, synthesis form, audio playback
+- [ ] End-to-end integration test against real Qwen3-TTS GGUF files
+- [ ] Pure-Rust CPU backend (replace qwentts.cpp dependency)
+- [ ] Native CUDA / Metal / WGPU / ROCm / SYCL backends
