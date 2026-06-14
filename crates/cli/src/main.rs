@@ -612,6 +612,29 @@ mod tests {
 
     #[cfg(feature = "ffi")]
     #[test]
+    fn parses_synth_ffi_voice_ref() {
+        let cli = parse([
+            "qwen-tts",
+            "synth",
+            "--text",
+            "hello",
+            "--backend",
+            "ffi",
+            "--ref-audio",
+            "speaker.wav",
+            "--ref-text",
+            "original utterance",
+        ]);
+
+        let Command::Synth(args) = cli.command else {
+            panic!("expected synth command");
+        };
+        assert_eq!(args.ref_audio, Some(PathBuf::from("speaker.wav")));
+        assert_eq!(args.ref_text, Some(String::from("original utterance")));
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
     fn parses_synth_ffi_advanced_params() {
         let cli = parse([
             "qwen-tts",
