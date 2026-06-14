@@ -78,6 +78,8 @@ enum WorkerMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendMode {
     NativeCpu,
+    #[cfg(feature = "pure-rust")]
+    PureRust,
     Qwentts,
     #[cfg(feature = "ffi")]
     Ffi,
@@ -87,6 +89,8 @@ impl BackendMode {
     const fn label(self) -> &'static str {
         match self {
             Self::NativeCpu => "Native CPU (Rust)",
+            #[cfg(feature = "pure-rust")]
+            Self::PureRust => "Pure Rust (candle)",
             Self::Qwentts => "qwentts.cpp",
             #[cfg(feature = "ffi")]
             Self::Ffi => "FFI (in-process)",
@@ -857,6 +861,13 @@ fn run_synthesis(
     let mut scheduler = Scheduler::new();
     match backend_mode {
         BackendMode::NativeCpu => scheduler.register(CpuBackend::new()),
+        #[cfg(feature = "pure-rust")]
+        BackendMode::PureRust => {
+            scheduler.register(qwen_tts_backend_pure_rust::PureRustBackend::new(
+                request.models.talker.path.clone(),
+                request.models.codec.path.clone(),
+            ));
+        }
         #[cfg(feature = "ffi")]
         BackendMode::Ffi => {
             let use_flash_attn = _use_flash_attn;

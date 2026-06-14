@@ -1,5 +1,7 @@
 use clap::{error::ErrorKind, Parser, Subcommand, ValueEnum};
 use qwen_tts_backend_cpu::CpuBackend;
+#[cfg(feature = "pure-rust")]
+use qwen_tts_backend_pure_rust::PureRustBackend;
 use qwen_tts_core::{graph::TtsGraph, GgufProbe, TtsModelSet};
 #[cfg(feature = "ffi")]
 use qwen_tts_runtime::FfiBackend;
@@ -110,6 +112,8 @@ impl SetupTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BackendMode {
     NativeCpu,
+    #[cfg(feature = "pure-rust")]
+    PureRust,
     Qwentts,
     #[cfg(feature = "ffi")]
     Ffi,
@@ -119,6 +123,8 @@ impl std::fmt::Display for BackendMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NativeCpu => write!(f, "native-cpu"),
+            #[cfg(feature = "pure-rust")]
+            Self::PureRust => write!(f, "pure-rust"),
             Self::Qwentts => write!(f, "qwentts"),
             #[cfg(feature = "ffi")]
             Self::Ffi => write!(f, "ffi"),
@@ -254,6 +260,11 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
     let mut scheduler = Scheduler::new();
     match args.backend {
         BackendMode::NativeCpu => scheduler.register(CpuBackend::new()),
+        #[cfg(feature = "pure-rust")]
+        BackendMode::PureRust => {
+            let bk = PureRustBackend::new(talker.clone(), codec.clone());
+            scheduler.register(bk);
+        }
         BackendMode::Qwentts => {
             let qwen_tts_bin =
                 resolve_backend_executable(&project_root, args.qwen_tts_bin.as_ref())?;

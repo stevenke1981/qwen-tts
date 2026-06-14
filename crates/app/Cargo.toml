@@ -15,9 +15,12 @@ rodio = { version = "0.19", default-features = false, features = ["wav"] }
 qwen-tts-backend-cpu = { path = "../backends/cpu" }
 qwen-tts-core = { path = "../core" }
 qwen-tts-runtime = { path = "../runtime" }
+qwen-tts-backend-pure-rust = { path = "../backends/pure-rust", optional = true }
 
 [features]
+default = ["ffi"]
 ffi = ["qwen-tts-runtime/ffi"]
+pure-rust = ["qwen-tts-backend-pure-rust"]
 
 [lints]
 workspace = true

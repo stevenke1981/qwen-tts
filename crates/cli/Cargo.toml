@@ -19,10 +19,12 @@ qwen-tts-backend-rocm = { path = "../backends/rocm" }
 qwen-tts-backend-metal = { path = "../backends/metal" }
 qwen-tts-backend-wgpu = { path = "../backends/wgpu" }
 qwen-tts-backend-sycl = { path = "../backends/sycl" }
+qwen-tts-backend-pure-rust = { path = "../backends/pure-rust", optional = true }
 
 [features]
 default = ["ffi"]
 ffi = ["qwen-tts-runtime/ffi"]
+pure-rust = ["qwen-tts-backend-pure-rust"]
 
 [lints]
 workspace = true
