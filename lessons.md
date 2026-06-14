@@ -39,3 +39,9 @@
 **Trigger:** Adding fields to `SynthesisRequest` broke 6 construction sites (config.rs, scheduler.rs, backend tests, CLI, app, CPU backend).
 **Rule:** Before adding required fields to a widely-used struct, grep for every construction site (`StructName {`) and update all of them in the same commit to avoid intermediate broken states.
 **Source:** ffi-backend-completeness
+
+---
+## Lesson #8 - 2026-06-14
+**Trigger:** FfiBackend and CpuBackend both needed read_wav_f32_mono but in different crates
+**Rule:** Before duplicating a utility function across backends, check if it can be exported from `qwen-tts-core` (the shared core crate) instead of each backend implementing its own copy.
+**Source:** feat(cpu-backend): wire instruct, ref_audio, sampling params
