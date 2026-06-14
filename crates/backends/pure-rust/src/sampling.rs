@@ -7,6 +7,8 @@
 
 use rand::Rng;
 
+use candle_core::Tensor;
+
 /// Apply temperature scaling to a logits slice (in-place).
 pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
     if (temperature - 1.0).abs() <= f32::EPSILON {
@@ -81,6 +83,17 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
         }
     }
     exps
+}
+
+/// Sample a single token from logits using argmax (greedy).
+///
+/// `logits`: `[batch, 1, vocab_size]` — returns `u32` token ID for batch 0.
+pub fn sample_argmax(logits: &Tensor) -> anyhow::Result<u32> {
+    use candle_core::IndexOp;
+    let logits_1d = logits.i((0, 0, ..))?;
+    let token = logits_1d.argmax(0)?;
+    let val: u32 = token.to_vec0()?;
+    Ok(val)
 }
 
 /// Sample a single token ID from a flat logits array.

@@ -1,15 +1,15 @@
-//! Pipeline orchestration: talker → code predictor → codec decoder.
+//! Pipeline orchestration: autoregressive talker → code predictor → codec decoder.
 
 use std::path::Path;
 
-use candle_core::Device;
-use candle_core::IndexOp;
+use candle_core::{Device, IndexOp, Tensor};
 use qwen_tts_codec::CodecDecoder;
 use qwen_tts_runtime::SynthesisRequest;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::code_predictor::CodePredictor;
+use crate::sampling;
 use crate::talker::Talker;
 use crate::tokenizer::HfTokenizer;
 
@@ -24,20 +24,13 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Load all model weights, discover tokenizer alongside talker GGUF.
-    ///
-    /// `talker_path` — GGUF with both talker + code predictor weights.
-    /// `codec_path`  — GGUF with DAC audio decoder weights.
     pub fn new(talker_path: &Path, codec_path: &Path) -> anyhow::Result<Self> {
         let device = Device::Cpu;
 
-        // Talker + code predictor share the same GGUF
         let (talker, code_predictor) = Talker::load_with_predictor(talker_path, &device)?;
-
-        // Codec decoder from separate GGUF
         let codec_decoder = CodecDecoder::load(codec_path)
             .map_err(|e| anyhow::anyhow!("failed to load codec decoder: {e}"))?;
 
-        // Discover tokenizer.json alongside talker GGUF
         let tokenizer = discover_tokenizer(talker_path).ok();
 
         log::info!(
@@ -47,24 +40,17 @@ impl Pipeline {
             if tokenizer.is_some() { "found" } else { "not-found" },
         );
 
-        Ok(Self {
-            talker,
-            code_predictor,
-            codec_decoder,
-            tokenizer,
-            device,
-        })
+        Ok(Self { talker, code_predictor, codec_decoder, tokenizer, device })
     }
 
-    /// Synthesize speech: text → WAV samples.
+    /// Synthesize speech: text → WAV samples via autoregressive code generation.
     pub fn synthesize(&self, request: &SynthesisRequest) -> anyhow::Result<Vec<i16>> {
-        // 1. Encode text with BPE tokenizer (fallback: byte-level)
         let raw_text = &request.text;
         if raw_text.trim().is_empty() {
             anyhow::bail!("text cannot be empty");
         }
 
-        // Build input IDs with BOS
+        // --- 1. Tokenize ---
         let input_ids = if let Some(ref tok) = self.tokenizer {
             let mut ids = tok.encode(raw_text)?;
             let bos = tok.bos_id();
@@ -75,27 +61,23 @@ impl Pipeline {
         } else {
             byte_tokenize(raw_text)
         };
-
         if input_ids.is_empty() {
             anyhow::bail!("tokenization produced empty input");
         }
 
-        // Pad to minimum sequence length for the talker
+        // Pad to minimum sequence length
         let min_seq: usize = 8;
         let pad_len = min_seq.saturating_sub(input_ids.len());
         let mut padded = vec![0u32; pad_len];
         padded.extend_from_slice(&input_ids);
-
         let seq_len = padded.len();
-        let input_tensor =
-            candle_core::Tensor::from_slice(&padded, (1, seq_len), &self.device)?;
+        let input_tensor = Tensor::from_slice(&padded, (1, seq_len), &self.device)?;
 
-        // 2. Talker forward: get hidden state at the last position
-        let (_, hidden) = self.talker.forward_hidden(&input_tensor)?;
-        let hidden = hidden.i((0, seq_len - 1, ..))?;
-        let hidden = hidden.unsqueeze(0)?;
+        // --- 2. Initial text embeddings ---
+        let mut seq = self.talker.embed_text(&input_tensor)?;
+        // seq: [1, seq_len, d_model]
 
-        // 3. Sampling configuration
+        // --- 3. Sampling configuration ---
         let temperature = request.temperature.unwrap_or(1.0);
         let top_k = request.top_k.map(|v| v as usize);
         let top_p = request.top_p.map(|v| v as f32);
@@ -104,48 +86,74 @@ impl Pipeline {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_entropy(),
         };
-
         let num_frames = request.max_new_tokens.unwrap_or(1024) as usize;
+        let do_sample = request.do_sample.unwrap_or(true);
 
-        // 4. Code predictor: predict frames of acoustic codes with sampling
-        let mut all_codes: Vec<i32> = Vec::new();
+        // --- 4. Autoregressive frame generation ---
         let _num_acoustic = self.code_predictor.num_acoustic();
+        let codec_codebooks: usize = 16;
+        let mut all_codes: Vec<i32> = Vec::with_capacity(num_frames * codec_codebooks);
 
-        for _frame_idx in 0..num_frames {
-            // Predict one frame using the talker hidden state.
-            // We pass the same hidden state for each frame (simplified).
+        for frame_idx in 0..num_frames {
+            let current_len = seq.dims()[1];
+
+            // 4a. Talker forward on current sequence
+            let hidden = self.talker.forward_embeddings(&seq)?;
+            // hidden: [1, current_len, d_model]
+            let last_hidden = hidden.i((0, current_len - 1, ..))?.unsqueeze(0)?;
+            // last_hidden: [1, 1, d_model]
+
+            // 4b. Predict codebook 0 via codec_head
+            let cb0_logits = self.talker.predict_codebook0(&last_hidden)?;
+            // cb0_logits: [1, 1, vocab_cb0]
+            let cb0_token = if do_sample {
+                sample_logits_tensor(&cb0_logits, temperature, top_k, top_p, &mut rng)?
+            } else {
+                sampling::sample_argmax(&cb0_logits)?
+            };
+            all_codes.push(cb0_token as i32);
+
+            // 4c. Embed codebook 0 token and append to sequence
+            let cb0_emb = self.talker.embed_codebook0(cb0_token)?;
+            // cb0_emb: [1, 1, d_model]
+            seq = Tensor::cat(&[&seq, &cb0_emb], 1)?;
+
+            // 4d. Predict acoustic codebooks 1..N via code predictor
             let frame = self
                 .code_predictor
-                .predict_one_frame_sampled(&hidden, temperature, top_k, top_p, &mut rng)?;
-
-            // Codebook 0 (not predicted by code predictor) — use 0 placeholder
-            all_codes.push(0);
-
-            // Acoustic codebooks 1..N
+                .predict_one_frame_sampled(&last_hidden, temperature, top_k, top_p, &mut rng)?;
             for &token in &frame {
                 all_codes.push(token as i32);
             }
+
+            // Pad to full 16 codebooks if necessary
+            while all_codes.len() < (frame_idx + 1) * codec_codebooks {
+                all_codes.push(0);
+            }
+
+            // Optional: early stopping on EOS (codebook 0 = 0 is padding/silence)
+            // For now we just generate all requested frames.
+            _ = frame_idx;
         }
 
-        // Pad to match codec expectation: [num_frames, 16]
-        let codec_codebooks: usize = 16;
-        while all_codes.len() < num_frames * codec_codebooks {
-            all_codes.push(0);
-        }
+        // Trim to exact multiples
+        let total_frames = all_codes.len() / codec_codebooks;
+        all_codes.truncate(total_frames * codec_codebooks);
 
-        // 5. Decode audio via codec
-        let audio_f32 = self.codec_decoder.decode(&all_codes, num_frames);
+        // --- 5. Decode audio via codec ---
+        let audio_f32 = self.codec_decoder.decode(&all_codes, total_frames);
 
-        // 6. Convert f32 [-1,1] → i16 PCM
+        // --- 6. Convert f32 → i16 PCM ---
         let audio_i16: Vec<i16> = audio_f32
             .iter()
             .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             .collect();
 
         log::info!(
-            "pure-rust synth: {} text tokens → {} code frames → {} audio samples ({}s)",
+            "pure-rust synth: {} text tokens → {} code frames ({} code tokens) → {} audio samples ({}s)",
             seq_len,
-            num_frames,
+            total_frames,
+            all_codes.len(),
             audio_i16.len(),
             audio_i16.len() / 24000,
         );
@@ -155,8 +163,24 @@ impl Pipeline {
 }
 
 // -----------------------------------------------------------------------
-// Tokenizer discovery
+// Helpers
 // -----------------------------------------------------------------------
+
+/// Sample from a `[batch, 1, vocab]` logits tensor.
+fn sample_logits_tensor(
+    logits: &Tensor,
+    temperature: f32,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    rng: &mut impl rand::Rng,
+) -> anyhow::Result<u32> {
+    let vocab_size = logits.dims()[2];
+    let logits_1d: Vec<f32> = logits.squeeze(0)?.squeeze(0)?.to_vec1()?;
+    // Ensure correct length
+    assert_eq!(logits_1d.len(), vocab_size);
+    let (token, _prob) = sampling::sample_token(&logits_1d, temperature, top_k, top_p, rng);
+    Ok(token)
+}
 
 /// Look for `tokenizer.json` in the same directory as the talker GGUF.
 fn discover_tokenizer(talker_path: &Path) -> anyhow::Result<HfTokenizer> {
@@ -164,7 +188,6 @@ fn discover_tokenizer(talker_path: &Path) -> anyhow::Result<HfTokenizer> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("talker path has no parent"))?;
 
-    // Try common names
     for name in &["tokenizer.json", "tokenizer.json"] {
         let candidate = parent.join(name);
         if candidate.exists() {

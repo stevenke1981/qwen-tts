@@ -25,6 +25,9 @@ const FN_FFN_NORM: &str = "ffn_norm.weight";
 const FN_FFN_GATE: &str = "ffn_gate.weight";
 const FN_FFN_UP: &str = "ffn_up.weight";
 const FN_FFN_DOWN: &str = "ffn_down.weight";
+/// Codebook 0 embedding and LM head (for autoregressive TTS).
+const FN_CODEC_EMBD: &str = "talker.codec_embd.weight";
+const FN_CODEC_HEAD: &str = "talker.codec_head.weight";
 
 /// Prefix for talker transformer layer tensors.
 const BLK_PREFIX: &str = "talker.blk";
@@ -35,6 +38,10 @@ pub struct Talker {
     token_embd: Tensor,
     output: Option<Tensor>,
     output_norm: RmsNorm,
+    /// Embedding for codebook 0 tokens (autoregressive TTS).
+    codec_embd: Option<Tensor>,
+    /// LM head for codebook 0 prediction.
+    codec_head: Option<Tensor>,
     layers: Vec<DecoderLayer>,
     device: Device,
 }
@@ -107,6 +114,18 @@ impl Talker {
 
         let output_norm = RmsNorm::new(load(FN_OUTPUT_NORM)?, cfg.norm_eps);
 
+        // Optional: codebook 0 embedding + LM head (for autoregressive TTS)
+        let codec_embd = if content.tensor_infos.contains_key(FN_CODEC_EMBD) {
+            Some(load(FN_CODEC_EMBD)?)
+        } else {
+            None
+        };
+        let codec_head = if content.tensor_infos.contains_key(FN_CODEC_HEAD) {
+            Some(load(FN_CODEC_HEAD)?)
+        } else {
+            None
+        };
+
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let blk = |n: &str| format!("{BLK_PREFIX}.{i}.{n}");
@@ -128,6 +147,8 @@ impl Talker {
             token_embd,
             output,
             output_norm,
+            codec_embd,
+            codec_head,
             layers,
             device: device.clone(),
         })
@@ -310,6 +331,119 @@ impl Talker {
         // Return both logits and the normed hidden state
         let last_logits = logits.i((.., seq_len.saturating_sub(1), ..))?;
         Ok((last_logits, hidden_normed))
+    }
+
+    /// Forward with pre-computed embeddings (skips embedding lookup).
+    ///
+    /// `embeddings`: `[batch, seq_len, d_model]` — pre-mixed text + code embeddings.
+    /// Returns the output-normed hidden state: `[batch, seq_len, d_model]`.
+    pub fn forward_embeddings(&self, embeddings: &Tensor) -> anyhow::Result<Tensor> {
+        let dev = &self.device;
+        let cfg = &self.config;
+        let (batch, seq_len, d_model) = embeddings.dims3()?;
+        assert_eq!(d_model, cfg.d_model, "embedding dim mismatch");
+
+        let mut hidden = embeddings.clone();
+
+        // --- RoPE precompute ---
+        let (cos, sin) = precompute_cos_sin(cfg, seq_len, dev)?;
+
+        // --- Decoder layers ---
+        for layer in &self.layers {
+            let residual = hidden.clone();
+            hidden = layer.attn_norm.forward(&hidden)?;
+
+            let n_heads = cfg.n_heads;
+            let n_kv = cfg.n_kv_heads;
+            let hd = cfg.head_dim();
+
+            let q = layer.attn_q.matmul(&hidden)?;
+            let k = layer.attn_k.matmul(&hidden)?;
+            let v = layer.attn_v.matmul(&hidden)?;
+
+            let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
+            let k = k.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
+            let v = v.reshape((batch, seq_len, n_kv, hd))?.permute((0, 2, 1, 3))?;
+
+            let q = apply_rope(&q, &cos, &sin)?;
+            let k = apply_rope(&k, &cos, &sin)?;
+
+            let n_repeat = n_heads / n_kv;
+            let k = if n_repeat > 1 { repeat_kv(&k, n_repeat)? } else { k };
+            let v = if n_repeat > 1 { repeat_kv(&v, n_repeat)? } else { v };
+
+            let scale = (hd as f64).sqrt().recip();
+            let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+            let attn = (attn * scale)?;
+            let mask = build_causal_mask(seq_len, dev)?;
+            let attn = attn.broadcast_add(&mask)?;
+            let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
+            let attn_out = attn.matmul(&v)?;
+
+            let attn_out = attn_out.permute((0, 2, 1, 3))?.reshape((batch, seq_len, d_model))?;
+            let attn_out = layer.attn_o.matmul(&attn_out)?;
+            hidden = (residual + attn_out)?;
+
+            let residual = hidden.clone();
+            hidden = layer.ffn_norm.forward(&hidden)?;
+            let gate = candle_nn::ops::silu(&layer.ffn_gate.matmul(&hidden)?)?;
+            let up = layer.ffn_up.matmul(&hidden)?;
+            hidden = layer.ffn_down.matmul(&(gate * up)?)?;
+            hidden = (hidden + residual)?;
+        }
+
+        // Final norm
+        let hidden_normed = self.output_norm.forward(&hidden)?;
+        Ok(hidden_normed)
+    }
+
+    /// Predict codebook 0 token logits from the final hidden state.
+    ///
+    /// `hidden`: `[batch, 1, d_model]` — the last position's hidden state.
+    /// Returns logits: `[batch, 1, codebook0_vocab]`.
+    pub fn predict_codebook0(&self, hidden: &Tensor) -> anyhow::Result<Tensor> {
+        let head = self.codec_head.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("codec_head not loaded (no codec_head.weight in GGUF)"))?;
+        // codec_head shape: [d_model, vocab_size_cb0]
+        // hidden shape: [batch, 1, d_model]
+        // logits = hidden @ head^T → [batch, 1, vocab_size_cb0]
+        let logits = hidden.matmul(&head.t()?)?;
+        Ok(logits)
+    }
+
+    /// Embed a codebook 0 token ID into `[batch, 1, d_model]`.
+    pub fn embed_codebook0(&self, token_id: u32) -> anyhow::Result<Tensor> {
+        let emb = self.codec_embd.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("codec_embd not loaded"))?;
+        let d_model = self.config.d_model;
+        // Determine layout: [d_model, vocab_size] (transposed) or [vocab_size, d_model]
+        let emb_w = if emb.dims()[0] == d_model {
+            // Transposed: [d_model, vocab_size] — transpose to [vocab_size, d_model]
+            emb.t()?
+        } else {
+            emb.clone()
+        };
+        let ids = Tensor::from_slice(&[token_id], (1, 1), &self.device)?;
+        // emb_w: [vocab_size, d_model]
+        let result = emb_w.gather(&ids, 0)?;
+        // result: [1, 1, d_model]
+        Ok(result.contiguous()?)
+    }
+
+    /// Embed text token IDs into `[batch, seq_len, d_model]` using the
+    /// text embedding table (`text_embd.weight`).
+    pub fn embed_text(&self, input_ids: &Tensor) -> anyhow::Result<Tensor> {
+        let cfg = &self.config;
+        let emb_w = &self.token_embd;
+        let d_model = cfg.d_model;
+        let vocab_size = cfg.vocab_size;
+        let emb_weights = if emb_w.dims()[0] == d_model && emb_w.dims()[1] == vocab_size {
+            emb_w.t()?
+        } else {
+            emb_w.clone()
+        };
+        let hidden = emb_weights.gather(input_ids, 0)?;
+        Ok(hidden.contiguous()?)
     }
 
     pub fn device(&self) -> &Device { &self.device }
