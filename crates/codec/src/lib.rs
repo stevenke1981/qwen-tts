@@ -9,5 +9,6 @@
 //!
 //! The goal is to eventually replace the C++ `pipeline_codec_decode` FFI call.
 
+pub mod conv;
 pub mod gguf;
 pub mod q8_0;
