@@ -125,6 +125,29 @@ impl RuntimeBackend for FfiBackend {
         params.speaker = speaker_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         params.instruct = instruct_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
+        // Sampling params (None = keep C defaults)
+        if let Some(seed) = request.seed {
+            params.seed = seed;
+        }
+        if let Some(tokens) = request.max_new_tokens {
+            params.max_new_tokens = tokens;
+        }
+        if let Some(temp) = request.temperature {
+            params.temperature = temp;
+        }
+        if let Some(k) = request.top_k {
+            params.top_k = k;
+        }
+        if let Some(p) = request.top_p {
+            params.top_p = p;
+        }
+        if let Some(rp) = request.repetition_penalty {
+            params.repetition_penalty = rp;
+        }
+        if let Some(sample) = request.do_sample {
+            params.do_sample = sample;
+        }
+
         let samples = unsafe {
             // Safety: the C string pointers above stay valid for the
             // duration of the call.

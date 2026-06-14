@@ -131,6 +131,20 @@ struct SynthArgs {
     flash_attention: bool,
     #[arg(long)]
     clamp_fp16: bool,
+    #[arg(long)]
+    seed: Option<i64>,
+    #[arg(long)]
+    max_tokens: Option<i32>,
+    #[arg(long)]
+    temperature: Option<f32>,
+    #[arg(long)]
+    top_k: Option<i32>,
+    #[arg(long)]
+    top_p: Option<f32>,
+    #[arg(long)]
+    repetition_penalty: Option<f32>,
+    #[arg(long)]
+    no_sample: bool,
     #[arg(long, default_value = "auto")]
     device: DeviceKind,
     #[arg(long, default_value = "native-cpu")]
@@ -239,6 +253,13 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         language: args.lang.clone(),
         speaker: args.speaker.clone(),
         instruct: args.instruct.clone(),
+        seed: args.seed,
+        max_new_tokens: args.max_tokens,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        repetition_penalty: args.repetition_penalty,
+        do_sample: if args.no_sample { Some(false) } else { None },
         out_path: args.out.clone().unwrap_or_else(default_voice_output_path),
         device: args.device,
         models: TtsModelSet::new(talker, codec),
