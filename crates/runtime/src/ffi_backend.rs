@@ -82,6 +82,13 @@ impl RuntimeBackend for FfiBackend {
         let lang_cstr =
             CString::new(request.language.as_str())
                 .map_err(|_| BackendError::InvalidRequest("language contains NUL".into()))?;
+        let speaker_cstr = match &request.speaker {
+            Some(s) => Some(
+                CString::new(s.as_str())
+                    .map_err(|_| BackendError::InvalidRequest("speaker contains NUL".into()))?,
+            ),
+            None => None,
+        };
 
         // ── Initialise context ──────────────────────────────────────────
         let mut init = QwenTts::init_params();
@@ -100,10 +107,7 @@ impl RuntimeBackend for FfiBackend {
         let mut params = QwenTts::tts_params();
         params.text = text_cstr.as_ptr();
         params.lang = lang_cstr.as_ptr();
-
-        // NOTE: speaker / instruct / ref_audio can be set here when the
-        // SynthesisRequest is extended.  For now we keep the baseline
-        // text-only path.
+        params.speaker = speaker_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let samples = unsafe {
             // Safety: the C string pointers above stay valid for the
