@@ -142,7 +142,7 @@ fn pure_rust_synthesize(
     };
 
     let start = std::time::Instant::now();
-    let audio = pipeline.synthesize(&request)
+    let audio = pipeline.synthesize_simple(&request)
         .expect("Pure Rust synthesis should succeed");
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -331,4 +331,81 @@ fn test_pure_rust_sample_vs_argmax() {
         matching < audio_argmax.len(),
         "Sampling with different seed should differ from argmax"
     );
+}
+
+/// End-to-end benchmark with cold/warm timing, using Pipeline + TimingRecorder.
+///
+/// NOTE: Uses 4 frames for quick CI verification. Increase `max_new_tokens` to 128
+/// for a representative measurement matching the 128-frame benchmarks in q8_bench.
+#[test]
+#[ignore = "requires model files — run manually with --release"]
+fn bench_end2end() {
+    use qwen_tts_backend_pure_rust::timing::TimingRecorder;
+
+    let device = Device::Cpu;
+    let t0 = std::time::Instant::now();
+    let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &device)
+        .expect("load pipeline");
+    let load_s = t0.elapsed().as_secs_f64();
+
+    let mut timing = TimingRecorder::new();
+    timing.record("model_load".into(), "load".into(), load_s, 0);
+
+    // Use 4 frames for quick verification (increase to 128 for real measurements).
+    let n_frames = 4i32;
+    let request = SynthesisRequest {
+        text: "純 Rust 語音合成測試。".to_string(),
+        language: "zh".into(),
+        speaker: None,
+        instruct: None,
+        ref_audio_path: None,
+        ref_text: None,
+        seed: Some(42),
+        max_new_tokens: Some(n_frames),
+        temperature: Some(1.0),
+        top_k: Some(40),
+        top_p: Some(0.9),
+        repetition_penalty: None,
+        do_sample: Some(true),
+        out_path: std::path::PathBuf::new(),
+        device: qwen_tts_runtime::DeviceKind::Cpu,
+        models: qwen_tts_core::TtsModelSet::new(&talker_path(), &codec_path()),
+    };
+
+    let t1 = std::time::Instant::now();
+    let audio = pipeline.synthesize(&request, Some(&mut timing))
+        .expect("cold synthesis");
+    let cold_total = t1.elapsed().as_secs_f64();
+
+    // Warm run (same text, second synthesis)
+    let t2 = std::time::Instant::now();
+    let audio2 = pipeline.synthesize(&request, Some(&mut timing))
+        .expect("warm synthesis");
+    let warm_total = t2.elapsed().as_secs_f64();
+
+    println!();
+    println!("=== End-to-End benchmark (cross_val, {n_frames} frames) ===");
+    println!("  cold: {:.3}s", cold_total);
+    println!("  warm: {:.3}s", warm_total);
+    println!("  audio samples: {} (cold), {} (warm)", audio.len(), audio2.len());
+
+    // Export timing
+    let bench_dir = project_root().join("target").join("bench-results");
+    let _ = std::fs::create_dir_all(&bench_dir);
+    std::fs::write(bench_dir.join("bench_end2end.json"), &timing.to_json())
+        .expect("write end2end JSON");
+    std::fs::write(bench_dir.join("bench_end2end.csv"), &timing.to_csv())
+        .expect("write end2end CSV");
+
+    println!();
+    println!("Timing summary (includes both cold + warm):");
+    for (cat, total) in timing.summary() {
+        println!("  {:<12} {:>8.3}s", cat, total);
+    }
+
+    // Basic sanity: audio should be non-empty
+    assert!(!audio.is_empty(), "cold synthesis produced no audio");
+    assert!(!audio2.is_empty(), "warm synthesis produced no audio");
+    assert_eq!(audio.len(), audio2.len(),
+        "cold and warm should produce same number of samples");
 }
