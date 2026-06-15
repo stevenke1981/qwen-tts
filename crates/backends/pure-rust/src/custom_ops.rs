@@ -6,6 +6,7 @@
 //! overhead (reshape, permute, narrow, etc.) for the hot path.
 
 use candle_core::{Device, Tensor};
+use rayon::prelude::*;
 
 // ── RMS Norm ───────────────────────────────────────────────────────────
 
@@ -72,6 +73,27 @@ pub fn per_head_rms_norm_f32(x: &[f32], weight: &[f32], n_heads: usize, head_dim
     out
 }
 
+/// Parallel per-head RMS normalization using `par_chunks_mut`.
+#[allow(unused_variables)]
+pub fn per_head_rms_norm_f32_par(
+    x: &[f32], weight: &[f32],
+    n_heads: usize, head_dim: usize, eps: f64,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; x.len()];
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(h, chunk)| {
+            let start = h * head_dim;
+            let slice = &x[start..start + head_dim];
+            let mean_sq = slice.iter().map(|&v| v * v).sum::<f32>() / head_dim as f32;
+            let inv_rms = (1.0 / ((mean_sq as f64 + eps).sqrt())) as f32;
+            for d in 0..head_dim {
+                chunk[d] = slice[d] * inv_rms * weight[d];
+            }
+        });
+    out
+}
+
 /// Tensor wrapper: applies per-head RMS norm.
 ///
 /// `x`: `[B, n_heads, 1, head_dim]`
@@ -113,6 +135,32 @@ pub fn rope_f32(x: &[f32], cos: &[f32], sin: &[f32], n_heads: usize, head_dim: u
     out
 }
 
+/// Parallel 1D NEOX RoPE using `par_chunks_mut`.
+#[allow(unused_variables)]
+pub fn rope_f32_par(
+    x: &[f32], cos: &[f32], sin: &[f32],
+    n_heads: usize, head_dim: usize,
+) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = vec![0.0f32; x.len()];
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(h, chunk)| {
+            let off = h * head_dim;
+            for d in 0..half {
+                let x1 = x[off + d];
+                let x2 = x[off + d + half];
+                chunk[d] = x1 * cos[d] - x2 * sin[d];
+            }
+            for d in 0..half {
+                let x1 = x[off + d];
+                let x2 = x[off + d + half];
+                chunk[half + d] = x2 * cos[d] + x1 * sin[d];
+            }
+        });
+    out
+}
+
 /// Tensor wrapper: applies 1D NEOX RoPE.
 ///
 /// `x`: `[B, n_heads, 1, head_dim]`
@@ -139,6 +187,17 @@ pub fn silu_f32(x: &[f32]) -> Vec<f32> {
     x.iter()
         .map(|&v| v * (1.0 / (1.0 + (-v as f64).exp())) as f32)
         .collect()
+}
+
+/// Parallel SiLU activation using `par_iter_mut`.
+pub fn silu_f32_par(x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0f32; x.len()];
+    out.par_iter_mut()
+        .zip(x)
+        .for_each(|(dst, &v)| {
+            *dst = v * (1.0 / (1.0 + (-v as f64).exp())) as f32;
+        });
+    out
 }
 
 /// Tensor wrapper: applies SiLU without going through candle_nn::ops::silu.
@@ -219,6 +278,65 @@ pub fn attention_f32(
             output[q_off + d] = acc * inv_sum;
         }
     }
+    output
+}
+
+/// Parallel scaled dot-product attention using `par_chunks_mut`.
+///
+/// Same signature/layout as [`attention_f32`]. The head loop runs in
+/// parallel via Rayon. Each head allocates a temporary scores vec of
+/// `kv_len` (small — typically 1-30 during decode, up to ~2000 during
+/// prefill). The `output` head slices are written independently.
+pub fn attention_f32_par(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    kv_len: usize,
+    head_dim: usize,
+    head_stride: usize,
+) -> Vec<f32> {
+    let n_repeat = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut output = vec![0.0f32; n_heads * head_dim];
+    let hd = head_dim;
+
+    output.par_chunks_mut(hd)
+        .enumerate()
+        .for_each(|(h, chunk)| {
+            let kv_h = h / n_repeat;
+            let q_off = h * hd;
+            let k_base = kv_h * head_stride * hd;
+            let v_base = kv_h * head_stride * hd;
+
+            // scores
+            let mut max_s = f32::NEG_INFINITY;
+            let mut scores = vec![0.0f32; kv_len];
+            for t in 0..kv_len {
+                let k_off = k_base + t * hd;
+                let dot = (0..hd).fold(0.0f32, |acc, d| acc + q[q_off + d] * k[k_off + d]);
+                let s = dot * scale;
+                scores[t] = s;
+                if s > max_s { max_s = s; }
+            }
+
+            // softmax
+            let mut sum = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - max_s).exp();
+                sum += *s;
+            }
+            let inv_sum = 1.0 / sum;
+
+            // weighted sum of V
+            for d in 0..hd {
+                let acc = (0..kv_len).fold(0.0f32, |acc, t| {
+                    acc + scores[t] * v[v_base + t * hd + d]
+                });
+                chunk[d] = acc * inv_sum;
+            }
+        });
     output
 }
 
