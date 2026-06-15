@@ -141,3 +141,21 @@
 **Trigger:** E2E test failed with "index-select only supports contiguous tensors" after transposing a square embedding weight [2048,2048] for index_select in the new code predictor.
 **Rule:** After any `Tensor::t()` (transpose) in candle, call `.contiguous()?` before `index_select()` — transpose produces a non-contiguous view, and index_select requires contiguous storage. For square matrices where transpose is a no-op, skip the transpose entirely.
 **Source:** Full code predictor E2E verification
+
+---
+## Lesson #20 — 2026-06-15
+**Trigger:** Investigated KV cache pre-allocation optimization using `slice_assign`, discovered candle's implementation uses `where_cond` + `pad_with_zeros`, creating 3× full-capacity copies per step — worse than `cat`'s growing allocation.
+**Rule:** Before optimizing anything, read the actual library source code first (candle source is in `~/.cargo/registry/src/`). Verify that the optimization primitive (`slice_assign`, `expand`, etc.) is actually in-place. Many functional tensor libraries (including candle) return NEW tensors from every operation.
+**Source:** KV cache pre-allocation analysis
+
+---
+## Lesson #21 — 2026-06-15
+
+---
+## Lesson #22 — 2026-06-15
+**Trigger:** Q8_0 quantized matmul (QMatMul) was 30× slower than F32 gemm for autoregressive inference.
+**Rule:** Before replacing F32 matmul with quantized matmul for autoregressive inference, benchmark the M=1 (GEMV) case. candle's `k_quants::matmul` uses Rayon parallelism via `into_par_iter()` with chunk sizes 128-512, which adds overhead that dominates for single-token autoregressive steps. Use `linear_fwd(x @ W^T)` with F32 weights (gemm crate) instead. If quantized matmul is needed, write a custom single-threaded GEMV that avoids Rayon.
+**Source:** qmatmul-dequant-revert
+**Trigger:** Release mode benchmark showed 21× speedup over debug mode (513s → 24s for 4-frame E2E test), confirming debug mode F32 matmul as the real bottleneck.
+**Rule:** Before spending time on algorithmic optimizations (KV cache pre-alloc, F16, etc.), always benchmark in release mode first. The debug/release gap for candle F32 matmuls can be ~100× due to naive scalar loops vs SIMD auto-vectorization.
+**Source:** Release mode benchmark

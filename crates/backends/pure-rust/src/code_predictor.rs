@@ -68,7 +68,7 @@ pub struct CodePredictor {
     max_seq_len: usize,
 
     // ── weights ───────────────────────────────────────────────────────────
-    /// Transformer decoder layers.
+    /// Transformer decoder layers (weights loaded as F32).
     layers: Vec<DecoderLayer>,
     /// Per-codebook embedding tables for acoustic codebooks 1..14.
     /// codec_embd[g-1] embeds the predicted code of book g → talker_hidden.
@@ -179,9 +179,9 @@ impl CodePredictor {
         // Sequence length per frame = num_acoustic + 1 (prefill 2 + decode N-1)
         let max_seq_len = num_acoustic + 1; // 16 for num_acoustic=15
 
-        // ── helper: load + dequantize tensor ─────────────────────────────
-        let mut load = |name: &str| -> anyhow::Result<Tensor> {
-            let qt = content.tensor(file, name, device).map_err(|e| {
+        // ── helpers: load tensors (pass `f: &mut File` to reborrow per call) ──
+        let load_f32 = |name: &str, f: &mut File| -> anyhow::Result<Tensor> {
+            let qt = content.tensor(f, name, device).map_err(|e| {
                 anyhow::anyhow!("missing code_pred tensor {name}: {e}")
             })?;
             qt.dequantize(&device)
@@ -193,30 +193,30 @@ impl CodePredictor {
         for i in 0..n_layers {
             let blk = |name: &str| -> String { format!("code_pred.blk.{i}.{name}") };
             layers.push(DecoderLayer {
-                attn_norm: RmsNorm::new(load(&blk("attn_norm.weight"))?, norm_eps),
-                attn_q: load(&blk("attn_q.weight"))?,
-                attn_k: load(&blk("attn_k.weight"))?,
-                attn_v: load(&blk("attn_v.weight"))?,
-                attn_o: load(&blk("attn_output.weight"))?,
-                attn_q_norm: RmsNorm::new(load(&blk("attn_q_norm.weight"))?, norm_eps),
-                attn_k_norm: RmsNorm::new(load(&blk("attn_k_norm.weight"))?, norm_eps),
-                ffn_norm: RmsNorm::new(load(&blk("ffn_norm.weight"))?, norm_eps),
-                ffn_gate: load(&blk("ffn_gate.weight"))?,
-                ffn_up: load(&blk("ffn_up.weight"))?,
-                ffn_down: load(&blk("ffn_down.weight"))?,
+                attn_norm: RmsNorm::new(load_f32(&blk("attn_norm.weight"), &mut *file)?, norm_eps),
+                attn_q: load_f32(&blk("attn_q.weight"), &mut *file)?,
+                attn_k: load_f32(&blk("attn_k.weight"), &mut *file)?,
+                attn_v: load_f32(&blk("attn_v.weight"), &mut *file)?,
+                attn_o: load_f32(&blk("attn_output.weight"), &mut *file)?,
+                attn_q_norm: RmsNorm::new(load_f32(&blk("attn_q_norm.weight"), &mut *file)?, norm_eps),
+                attn_k_norm: RmsNorm::new(load_f32(&blk("attn_k_norm.weight"), &mut *file)?, norm_eps),
+                ffn_norm: RmsNorm::new(load_f32(&blk("ffn_norm.weight"), &mut *file)?, norm_eps),
+                ffn_gate: load_f32(&blk("ffn_gate.weight"), &mut *file)?,
+                ffn_up: load_f32(&blk("ffn_up.weight"), &mut *file)?,
+                ffn_down: load_f32(&blk("ffn_down.weight"), &mut *file)?,
             });
         }
 
         // ── MTP projection ───────────────────────────────────────────────
         let mtp_proj_w =
             if content.tensor_infos.contains_key("code_pred.mtp_proj.weight") {
-                Some(load("code_pred.mtp_proj.weight")?)
+                Some(load_f32("code_pred.mtp_proj.weight", &mut *file)?)
             } else {
                 None
             };
         let mtp_proj_b =
             if content.tensor_infos.contains_key("code_pred.mtp_proj.bias") {
-                Some(load("code_pred.mtp_proj.bias")?)
+                Some(load_f32("code_pred.mtp_proj.bias", &mut *file)?)
             } else {
                 None
             };
@@ -224,20 +224,19 @@ impl CodePredictor {
         // ── output norm ──────────────────────────────────────────────────
         let (output_norm_w, output_norm_eps_val) =
             if content.tensor_infos.contains_key("code_pred.output_norm.weight") {
-                (Some(load("code_pred.output_norm.weight")?), norm_eps)
+                (Some(load_f32("code_pred.output_norm.weight", &mut *file)?), norm_eps)
             } else {
                 (None, norm_eps)
             };
 
         // ── per-codebook embedding tables ────────────────────────────────
         // Load up to (num_acoustic - 1) tables for codes 1..14.
-        // If the GGUF has fewer (or more), we load what exists.
         let num_embd = num_acoustic.saturating_sub(1); // 14
         let mut codec_embd = Vec::with_capacity(num_embd);
         for g in 0..num_embd {
             let name = format!("code_pred.codec_embd.{g}.weight");
             if content.tensor_infos.contains_key(&name) {
-                codec_embd.push(load(&name)?);
+                codec_embd.push(load_f32(&name, &mut *file)?);
             } else {
                 anyhow::bail!("missing {name} — expected {num_embd} embedding tables");
             }
@@ -252,7 +251,7 @@ impl CodePredictor {
                     "missing {name} — expected {num_acoustic} lm heads"
                 );
             }
-            lm_heads.push(load(&name)?);
+            lm_heads.push(load_f32(&name, &mut *file)?);
         }
 
         // ── precompute RoPE cos/sin ──────────────────────────────────────
@@ -319,10 +318,9 @@ impl CodePredictor {
     /// `h`: `[1, 1, pred_hidden]`.
     /// Returns `Vec<f32>` logits of length `vocab_size`.
     fn apply_lm_head(&self, g: usize, h: &Tensor) -> anyhow::Result<Vec<f32>> {
-        let head_w = &self.lm_heads[g]; // [vocab_size, pred_hidden]
-        let h_flat = h.reshape(((), self.pred_hidden))?; // [1, pred_hidden]
-        let logits_t = h_flat.matmul(&head_w.t()?)?; // [1, vocab_size]
-        Ok(logits_t.squeeze(0)?.to_vec1()?)
+        let head = &self.lm_heads[g]; // QMatMul [vocab_size, pred_hidden]
+        let logits_t = linear_fwd(head, h)?; // [1, 1, vocab_size]
+        Ok(logits_t.flatten_all()?.to_vec1()?)
     }
 
     /// Forward one position through all transformer layers, updating the KV cache.
@@ -343,11 +341,11 @@ impl CodePredictor {
             let residual = x.clone();
             x = layer.attn_norm.forward(&x)?;
 
-            // QKV projections
+            // QKV projections using Q8_0 quantized matmul
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let q = h_2d.matmul(&layer.attn_q.t()?)?; // [B, n_q_hd * hd]
-            let k = h_2d.matmul(&layer.attn_k.t()?)?; // [B, n_kv_hd * hd]
-            let v = h_2d.matmul(&layer.attn_v.t()?)?; // [B, n_kv_hd * hd]
+            let q = linear_fwd(&layer.attn_q, &h_2d)?; // [B, n_q_hd * hd]
+            let k = linear_fwd(&layer.attn_k, &h_2d)?; // [B, n_kv_hd * hd]
+            let v = linear_fwd(&layer.attn_v, &h_2d)?; // [B, n_kv_hd * hd]
 
             // Reshape to multi-head: [B, n_heads, 1, head_dim]
             let q = q.reshape((batch, self.n_q_heads, 1, self.head_dim))?;
@@ -399,17 +397,17 @@ impl CodePredictor {
             let attn_out = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch, head_dim_sum))?;
-            let attn_proj = attn_out.matmul(&layer.attn_o.t()?)?;
+            let attn_proj = linear_fwd(&layer.attn_o, &attn_out)?;
             x = (residual + attn_proj.reshape((batch, 1, self.pred_hidden))?)?;
 
             // SwiGLU FFN
             let residual = x.clone();
             x = layer.ffn_norm.forward(&x)?;
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let gate = candle_nn::ops::silu(&h_2d.matmul(&layer.ffn_gate.t()?)?)?;
-            let up = h_2d.matmul(&layer.ffn_up.t()?)?;
+            let gate = candle_nn::ops::silu(&linear_fwd(&layer.ffn_gate, &h_2d)?)?;
+            let up = linear_fwd(&layer.ffn_up, &h_2d)?;
             let hid = (gate * up)?;
-            let hid_out = hid.matmul(&layer.ffn_down.t()?)?;
+            let hid_out = linear_fwd(&layer.ffn_down, &hid)?;
             x = (residual + hid_out.reshape((batch, 1, self.pred_hidden))?)?;
         }
 
