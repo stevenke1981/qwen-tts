@@ -140,6 +140,13 @@ pub struct KvCacheFlat {
 }
 
 impl KvCacheFlat {
+    /// The head stride (max_seq) used when allocating this cache.
+    /// This is the number of positions between consecutive heads in the flat buffer,
+    /// needed by `attention_f32` to correctly compute head offsets.
+    pub fn head_stride(&self) -> usize {
+        self.max_seq
+    }
+
     /// Create a new cache with pre-allocated buffers of `max_seq` per head.
     pub fn new(n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> Self {
         let per_layer = n_kv_heads * max_seq * head_dim;
@@ -849,7 +856,6 @@ impl Talker {
         let n_heads = cfg.n_heads;
         let n_kv = cfg.n_kv_heads;
         let hd = cfg.head_dim();
-        let max_seq = cfg.max_seq_len;
         let eps = cfg.norm_eps;
         let qk_eps = eps; // QK-norm eps matches norm eps
 
@@ -893,7 +899,7 @@ impl Talker {
                 n_kv,
                 pos + 1, // kv_len = positions written so far
                 hd,
-                max_seq, // head_stride
+                cache.head_stride(), // stride between heads in the flat buffer
             );
 
             // ── Output projection into q_buf (reuse — attn_dim == d_model) ─
@@ -1061,7 +1067,7 @@ pub(crate) fn precompute_cos_sin(cfg: &ModelConfig, max_s: usize, dev: &Device) 
 /// Returns `(cos, sin)` each of length `max_s * head_dim` with layout
 /// `[pos, d]` where `cos[pos * hd + d]` = cos(pos * inv_freq[d % half])
 /// (interleaved pairs for 1D NEOX RoPE).
-pub(crate) fn precompute_cos_sin_flat(cfg: &ModelConfig, max_s: usize) -> (Vec<f32>, Vec<f32>) {
+pub fn precompute_cos_sin_flat(cfg: &ModelConfig, max_s: usize) -> (Vec<f32>, Vec<f32>) {
     let hd = cfg.head_dim();
     let half = hd / 2;
     let inv_freq: Vec<f64> = (0..hd)

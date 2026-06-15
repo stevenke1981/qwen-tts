@@ -164,42 +164,38 @@ fn bench_load_time() {
         predictor.num_acoustic(),
     );
 
-    // Minimal sanity: forward pass 1 step through talker
-    let device = Device::Cpu;
-    let batch = 1;
-    let d_model = talker.config().d_model;
+    // Minimal sanity: forward pass 10 steps through talker (fused f32 path)
+    use qwen_tts_backend_pure_rust::talker::precompute_cos_sin_flat;
     let cfg = talker.config();
+    let d_model = cfg.d_model;
     let max_seq = 2048;
     let mut cache = KvCacheFlat::new(cfg.n_layers, cfg.n_kv_heads, cfg.head_dim(), max_seq);
-    let (cos, sin) = precompute_cos_sin(cfg.head_dim(), cfg.rope_theta, max_seq, &device)
-        .expect("precompute cos/sin");
+    let (cos_flat, sin_flat) = precompute_cos_sin_flat(cfg, max_seq);
 
-    // Simulate a single token embedding
-    let x = Tensor::ones((batch, 1, d_model), candle_core::DType::F32, &device)
-        .expect("create input");
-
-    // Measure 10 steps
-    for _ in 0..10 {
+    let mut x: Vec<f32> = vec![1.0; d_model];
+    for step in 0..10 {
         let start = Instant::now();
-        let _h = talker
-            .forward_step(&x, &mut cache, &cos, &sin)
-            .expect("forward_step");
+        let h = talker.forward_step_fused(&x, &mut cache, step, &cos_flat, &sin_flat);
         let step_s = start.elapsed().as_secs_f64();
         timing.talker_step.push(step_s);
+        x = h;
     }
 
-    println!("\n  after 10 forward_step calls:");
-    timing.report("Talker forward_step (Q8_0 GEMV)");
-    println!("  cache pos: {}", cache.current_len());
+    println!("\n  after 10 forward_step_fused calls:");
+    timing.report("Talker forward_step_fused (Q8_0 GEMV, fused f32)");
 }
 
 // ---------------------------------------------------------------------------
-// Full benchmark: 128 frames of autoregressive synthesis
+// Full fused-f32 benchmark: 128 frames of autoregressive synthesis
+// Uses forward_step_fused (allocation-free, zero Tensor round-trips) and
+// predict_one_frame_sampled(&[f32], &[f32]) for the code predictor.
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "run manually with --release -- --nocapture"]
-fn bench_128_frames() {
+fn bench_fused_128_frames() {
+    use qwen_tts_backend_pure_rust::talker::precompute_cos_sin_flat;
+
     let device = Device::Cpu;
 
     // Create timing recorder
@@ -224,8 +220,16 @@ fn bench_128_frames() {
         load_talker_s + load_predictor_s, 0,
     );
 
+    let cfg = talker.config();
+    let n_layers = cfg.n_layers;
+    let d_model = cfg.d_model;
+    let max_seq = 2048;
+
+    // Flat RoPE tables (no Tensor involved)
+    let (cos_flat, sin_flat) = precompute_cos_sin_flat(cfg, max_seq);
+
     println!(
-        "=== 128-frame benchmark (Q8_0 GEMV) ==="
+        "=== 128-frame fused-f32 benchmark ==="
     );
     println!(
         "Load: talker={:.3}s  predictor={:.3}s  total={:.3}s",
@@ -234,64 +238,50 @@ fn bench_128_frames() {
         load_talker_s + load_predictor_s,
     );
     println!(
-        "Model: {} layers, {} dim, {} vocab",
-        talker.config().n_layers,
-        talker.config().d_model,
-        talker.config().vocab_size,
+        "Model: {} layers, {} dim, {} vocab  (fused f32 path)",
+        cfg.n_layers, d_model, cfg.vocab_size,
     );
     println!();
 
-    let cfg = talker.config();
-    let n_layers = cfg.n_layers;
-    let max_seq = 2048;
-    let (cos, sin) = precompute_cos_sin(cfg.head_dim(), cfg.rope_theta, max_seq, &device).expect("cos/sin");
-
-    // Pre-allocate input embedding (text token 0 as placeholder)
-    let d_model = cfg.d_model;
-    let input = Tensor::zeros((1, 1, d_model), candle_core::DType::F32, &device)
-        .expect("input tensor");
-
-    // ---- Talker prefill (128 tokens, streaming) ----
+    // ---- Talker prefill: 128 steps, fused f32 path ----
     let mut talker_cache = KvCacheFlat::new(n_layers, cfg.n_kv_heads, cfg.head_dim(), max_seq);
+    // x is a dummy f32 hidden state (all 1s, length d_model)
+    let mut x: Vec<f32> = vec![1.0; d_model];
 
     for step in 0..128 {
         let start = Instant::now();
-        let _h = talker
-            .forward_step(&input, &mut talker_cache, &cos, &sin)
-            .expect("talker forward_step");
+        let h = talker.forward_step_fused(
+            &x, &mut talker_cache, step, &cos_flat, &sin_flat,
+        );
         timing.record(
-            "talker_step".into(), "step".into(),
+            "talker_step_fused".into(), "step_fused".into(),
             start.elapsed().as_secs_f64(), step,
         );
+        x = h; // chain: use output as next step input
     }
 
     // Stats
-    let talker_total = timing.category_total("step");
-    let talker_step_events: Vec<_> = timing.events.iter().filter(|e| e.category == "step").collect();
-    let n_steps = talker_step_events.len() as f64;
+    let talker_total = timing.category_total("step_fused");
+    let talker_events: Vec<_> = timing.events.iter()
+        .filter(|e| e.category == "step_fused").collect();
+    let n_steps = talker_events.len() as f64;
     let talker_mean = talker_total / n_steps;
-    println!("--- Talker 128-step ---");
+    println!("--- Talker 128-step (fused f32) ---");
     println!(
         "  total: {:.3}s  mean: {:.4}s/step  tok/s: {:.0}",
-        talker_total,
-        talker_mean,
-        1.0 / talker_mean,
+        talker_total, talker_mean, 1.0 / talker_mean,
     );
-    if let Some(first) = talker_step_events.first() {
+    if let Some(first) = talker_events.first() {
+        let sub_mean = (talker_total - first.duration_s) / (n_steps - 1.0);
         println!(
             "  first step (cold cache): {:.4}s  subsequent mean: {:.4}s",
-            first.duration_s,
-            (talker_total - first.duration_s) / (n_steps - 1.0),
+            first.duration_s, sub_mean,
         );
     }
 
-    // ---- Code predictor: 128 frames ----
-    // Use the last talker hidden state as input
-    let talker_hidden = Tensor::ones((1, 1, d_model), candle_core::DType::F32, &device)
-        .expect("talker hidden");
-    let c0_embed = Tensor::ones((1, 1, d_model), candle_core::DType::F32, &device)
-        .expect("c0 embd");
-
+    // ---- Code predictor: 128 frames (f32 all the way) ----
+    let talker_hidden: Vec<f32> = vec![0.5; d_model];
+    let c0_embed: Vec<f32> = vec![0.5; d_model];
     let mut total_tokens = 0usize;
 
     for frame in 0..128 {
@@ -299,92 +289,119 @@ fn bench_128_frames() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
         let start = Instant::now();
-        // Full frame: prefill 2 positions + decode 14 positions = 16 forward steps
-        let _codes = predictor
-            .predict_one_frame_sampled(
-                &talker_hidden,
-                &c0_embed,
-                1.0,
-                Some(40),
-                Some(0.9),
-                &mut rng,
-            )
-            .expect("predict frame");
+        let codes = predictor.predict_one_frame_sampled(
+            &talker_hidden, &c0_embed,
+            1.0, Some(40), Some(0.9), &mut rng,
+        );
         timing.record(
-            "predictor_frame".into(), "frame".into(),
+            "predictor_frame_fused".into(), "frame_fused".into(),
             start.elapsed().as_secs_f64(), frame,
         );
-        total_tokens += 16; // 2 prefill + 14 decode
+        total_tokens += codes.len();
     }
 
-    let frame_total = timing.category_total("frame");
+    let frame_total = timing.category_total("frame_fused");
     let n_frames = 128.0;
     let frame_mean = frame_total / n_frames;
     println!();
-    println!("--- Code Predictor 128-frame ---");
+    println!("--- Code Predictor 128-frame (fused f32) ---");
     println!(
         "  total: {:.3}s  mean: {:.4}s/frame  frame/s: {:.1}",
-        frame_total,
-        frame_mean,
-        1.0 / frame_mean,
+        frame_total, frame_mean, 1.0 / frame_mean,
     );
     println!(
         "  decoder tokens: {}  token/s (decoder): {:.0}",
-        total_tokens,
-        total_tokens as f64 / frame_total,
+        total_tokens, total_tokens as f64 / frame_total,
     );
 
     // ---- Total synthesis estimate ----
-    let all_talker = timing.category_total("step");
-    let all_frames = timing.category_total("frame");
+    let all_talker = timing.category_total("step_fused");
+    let all_frames = timing.category_total("frame_fused");
     let total = timing.category_total("load") + all_talker + all_frames;
     println!();
-    println!("=== Total 128-frame synthesis estimate ===");
-    println!(
-        "  {:6.3}s  talker forward (128 steps)",
-        all_talker
-    );
-    println!(
-        "  {:6.3}s  code predictor (128 frames x 16 tokens)",
-        all_frames
-    );
-    println!(
-        "  {:6.3}s  + load time",
-        timing.category_total("load"),
-    );
-    println!(
-        "  {:6.3}s  TOTAL (dominates: talker)",
-        total
-    );
-    println!(
-        "  vs C++ FFI target: ~2-5s  (gap: {:.0}x)",
-        total / 3.0
-    );
+    println!("=== Total 128-frame synthesis estimate (fused f32) ===");
+    println!("  {:6.3}s  talker forward (128 steps, fused f32)", all_talker);
+    println!("  {:6.3}s  code predictor (128 frames, fused f32)", all_frames);
+    println!("  {:6.3}s  + load time", timing.category_total("load"));
+    println!("  {:6.3}s  TOTAL", total);
+    println!("  vs C++ FFI target: ~2-5s  (gap: {:.0}x)", total / 3.0);
 
     // ---- Export timing results ----
-    let bench_dir = project_root()
-        .join("target")
-        .join("bench-results");
+    let bench_dir = project_root().join("target").join("bench-results");
     let _ = std::fs::create_dir_all(&bench_dir);
-    let json_path = bench_dir.join("bench_128_frames.json");
-    let csv_path = bench_dir.join("bench_128_frames.csv");
-    std::fs::write(&json_path, &timing.to_json())
-        .expect("write JSON results");
-    std::fs::write(&csv_path, &timing.to_csv())
-        .expect("write CSV results");
+    let json_path = bench_dir.join("bench_fused_128_frames.json");
+    let csv_path = bench_dir.join("bench_fused_128_frames.csv");
+    std::fs::write(&json_path, &timing.to_json()).expect("write JSON results");
+    std::fs::write(&csv_path, &timing.to_csv()).expect("write CSV results");
     println!();
     println!("Timing results written to:");
     println!("  {}", json_path.display());
     println!("  {}", csv_path.display());
+}
 
-    // Print summary
-    let summary = timing.summary();
+// ---------------------------------------------------------------------------
+// Microbenchmark: gemv vs gemv_into (comparing allocation overhead)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "microbenchmark for profiling"]
+fn microbench_gemv_into() {
+    use qwen_tts_backend_pure_rust::qgemv::{Q8Weights, Q8Workspace};
+    use candle_core::quantized::k_quants::{BlockQ8_0, GgmlType, QK8_0};
+
+    // Sizes from the actual model (talker, d_model=2048)
+    let sizes: &[(usize, usize, &str)] = &[
+        (2048, 2048, "attn_q/o   (2048×2048)"),
+        (256, 2048,  "attn_k/v   (256×2048)"),
+        (5461, 2048, "ffn_gate/up (5461×2048)"),
+        (2048, 5461, "ffn_down   (2048×5461)"),
+    ];
+
     println!();
-    println!("=== Timing Summary ===");
-    for cat in ["load", "step", "frame", "decode"] {
-        if let Some(total) = summary.get(cat) {
-            println!("  {:<12} {:>8.3}s", cat, total);
+    println!("=== gemv vs gemv_into microbenchmark ===");
+    println!("{:40} {:>12} {:>12} {:>10}", "matrix", "gemv (µs)", "gemv_into (µs)", "ratio");
+
+    for &(n, k, label) in sizes {
+        let bpr = k.div_ceil(QK8_0);
+        let padded_k = bpr * QK8_0;
+
+        // Build random Q8_0 weights
+        let f32_w: Vec<f32> = (0..n * k).map(|i| ((i * 7 + 3) % 100) as f32 / 10.0).collect();
+        let mut data = vec![BlockQ8_0::zeros(); n * bpr];
+        for row in 0..n {
+            let mut row_data = f32_w[row * k..(row + 1) * k].to_vec();
+            row_data.resize(padded_k, 0.0);
+            let dst = &mut data[row * bpr..(row + 1) * bpr];
+            <BlockQ8_0 as GgmlType>::from_float(&row_data, dst);
         }
+        let w = Q8Weights::from_raw(n, k, bpr, padded_k, data);
+
+        let x: Vec<f32> = (0..k).map(|i| ((i * 3) % 50) as f32).collect();
+        let n_iters = 1000;
+
+        // Benchmark gemv (allocation each call)
+        let mut ws = Q8Workspace::new();
+        let _ = w.gemv(&x, &mut ws); // warm-up
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            let _y = w.gemv(&x, &mut ws);
+        }
+        let gemv_us = start.elapsed().as_secs_f64() * 1_000_000.0 / n_iters as f64;
+
+        // Benchmark gemv_into (pre-allocated buffer)
+        let mut dst = vec![0.0f32; n];
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            w.gemv_into(&x, &mut ws, &mut dst);
+        }
+        let into_us = start.elapsed().as_secs_f64() * 1_000_000.0 / n_iters as f64;
+
+        println!("{label:40} {gemv_us:9.1}µs  {into_us:9.1}µs  {ratio:7.2}×",
+            label = label,
+            gemv_us = gemv_us,
+            into_us = into_us,
+            ratio = gemv_us / into_us.max(0.001),
+        );
     }
 }
 
@@ -456,7 +473,7 @@ fn microbench_gemv_sizes() {
         let padded_k = bpr * QK8_0;
 
         // Build random Q8_0 weights by quantizing random F32 data
-        let mut f32_w: Vec<f32> = (0..n * k).map(|i| ((i * 7 + 3) % 100) as f32 / 10.0).collect();
+        let f32_w: Vec<f32> = (0..n * k).map(|i| ((i * 7 + 3) % 100) as f32 / 10.0).collect();
         let mut data = vec![BlockQ8_0::zeros(); n * bpr];
         for row in 0..n {
             let mut row_data = f32_w[row * k..(row + 1) * k].to_vec();

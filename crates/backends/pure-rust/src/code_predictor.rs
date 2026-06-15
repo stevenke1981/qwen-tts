@@ -150,7 +150,9 @@ struct PredScratch {
     ffn_mid: Vec<f32>,
 
     // ── Pre-allocated GEMV output buffers (allocation-free hot path) ──
-    /// Q/attn_o/ffn_down projection output [pred_hidden].
+    /// Q projection output [attn_dim] (separate from q_buf because sizes differ).
+    attn_q_buf: Vec<f32>,
+    /// attn_o/ffn_down projection output [pred_hidden].
     q_buf: Vec<f32>,
     /// K projection output [kv_dim].
     k_buf: Vec<f32>,
@@ -163,11 +165,12 @@ struct PredScratch {
 }
 
 impl PredScratch {
-    fn new(pred_hidden: usize, ffn_dim: usize, kv_dim: usize) -> Self {
+    fn new(pred_hidden: usize, attn_dim: usize, ffn_dim: usize, kv_dim: usize) -> Self {
         Self {
             residual: vec![0.0f32; pred_hidden],
             h: vec![0.0f32; pred_hidden],
             ffn_mid: vec![0.0f32; ffn_dim],
+            attn_q_buf: vec![0.0f32; attn_dim],
             q_buf: vec![0.0f32; pred_hidden],
             k_buf: vec![0.0f32; kv_dim],
             v_buf: vec![0.0f32; kv_dim],
@@ -432,7 +435,8 @@ impl CodePredictor {
             .first()
             .map(|l| l.attn_k.out_features())
             .unwrap_or(pred_hidden);
-        let pred_scratch = PredScratch::new(pred_hidden, ffn_dim, kv_dim);
+        let attn_dim = n_q_heads * head_dim;
+        let pred_scratch = PredScratch::new(pred_hidden, attn_dim, ffn_dim, kv_dim);
         let q8_ws = Q8Workspace::new();
 
         Ok(Self {
@@ -571,12 +575,12 @@ impl CodePredictor {
             rms_norm_f32_inplace(&mut scr.h, &layer.attn_norm_w, eps);
 
             // ── QKV gemv (allocation-free gemv_into) ──────────────────────
-            layer.attn_q.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.q_buf);
+            layer.attn_q.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.attn_q_buf);
             layer.attn_k.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.k_buf);
             layer.attn_v.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.v_buf);
 
             // ── Per-head QK-norm ─────────────────────────────────────────
-            let q = per_head_rms_norm_f32(&scr.q_buf, &layer.attn_q_norm_w, n_qh, hd, eps);
+            let q = per_head_rms_norm_f32(&scr.attn_q_buf, &layer.attn_q_norm_w, n_qh, hd, eps);
             let k = per_head_rms_norm_f32(&scr.k_buf, &layer.attn_k_norm_w, n_kvh, hd, eps);
 
             // ── RoPE ─────────────────────────────────────────────────────
