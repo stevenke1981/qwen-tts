@@ -34,11 +34,13 @@ use candle_core::quantized::gguf_file::Content;
 use candle_core::{Device, Tensor};
 use candle_nn::RmsNorm;
 use rand::SeedableRng;
+use rayon::prelude::*;
 
 use crate::sampling;
 use crate::custom_ops::{
-    attention_f32, per_head_rms_norm_f32, rms_norm_f32, rms_norm_f32_inplace,
-    rope_f32,
+    attention_f32_par, per_head_rms_norm_f32_par,
+    rms_norm_f32, rms_norm_f32_inplace,
+    rope_f32_par, silu_f32_par,
 };
 use crate::qgemv::{Q8Weights, Q8Workspace};
 use crate::talker::{
@@ -574,26 +576,29 @@ impl CodePredictor {
             scr.residual.copy_from_slice(&scr.h);
             rms_norm_f32_inplace(&mut scr.h, &layer.attn_norm_w, eps);
 
-            // ── QKV gemv (allocation-free gemv_into) ──────────────────────
-            layer.attn_q.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.attn_q_buf);
-            layer.attn_k.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.k_buf);
-            layer.attn_v.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.v_buf);
+            // ── QKV gemv (quantize-once multi gemv) ───────────────────────
+            Q8Weights::gemv_multi_into(
+                &[&layer.attn_q, &layer.attn_k, &layer.attn_v],
+                &mut [&mut scr.attn_q_buf, &mut scr.k_buf, &mut scr.v_buf],
+                &scr.h,
+                &mut self.q8_ws,
+            );
 
-            // ── Per-head QK-norm ─────────────────────────────────────────
-            let q = per_head_rms_norm_f32(&scr.attn_q_buf, &layer.attn_q_norm_w, n_qh, hd, eps);
-            let k = per_head_rms_norm_f32(&scr.k_buf, &layer.attn_k_norm_w, n_kvh, hd, eps);
+            // ── Per-head QK-norm (parallel) ──────────────────────────────
+            let q = per_head_rms_norm_f32_par(&scr.attn_q_buf, &layer.attn_q_norm_w, n_qh, hd, eps);
+            let k = per_head_rms_norm_f32_par(&scr.k_buf, &layer.attn_k_norm_w, n_kvh, hd, eps);
 
-            // ── RoPE ─────────────────────────────────────────────────────
-            let q = rope_f32(&q, cos, sin, n_qh, hd);
-            let k = rope_f32(&k, cos, sin, n_kvh, hd);
+            // ── RoPE (parallel) ──────────────────────────────────────────
+            let q = rope_f32_par(&q, cos, sin, n_qh, hd);
+            let k = rope_f32_par(&k, cos, sin, n_kvh, hd);
 
             // ── KV cache append ──────────────────────────────────────────
             self.k_cache_data[i].extend_from_slice(&k);
             self.v_cache_data[i].extend_from_slice(&scr.v_buf); // V not normed/ROPEd
 
-            // ── GQA attention ────────────────────────────────────────────
+            // ── GQA attention (parallel) ─────────────────────────────────
             let kv_len = self.k_cache_data[i].len() / kv_dim;
-            let attn = attention_f32(
+            let attn = attention_f32_par(
                 &q, &self.k_cache_data[i], &self.v_cache_data[i],
                 n_qh, n_kvh, kv_len, hd, kv_len,
             );
@@ -601,10 +606,13 @@ impl CodePredictor {
             // ── Output projection gemv into q_buf (reuse) ────────────────
             layer.attn_o.gemv_into(&attn, &mut self.q8_ws, &mut scr.q_buf);
 
-            // ── Residual add ─────────────────────────────────────────────
-            for j in 0..pred_h {
-                scr.h[j] = scr.residual[j] + scr.q_buf[j];
-            }
+            // ── Residual add (parallel) ──────────────────────────────────
+            scr.h.par_iter_mut()
+                .zip(scr.residual.par_iter())
+                .zip(scr.q_buf.par_iter())
+                .for_each(|((h_j, &r), &q)| {
+                    *h_j = r + q;
+                });
 
             // ── FFN residual save ────────────────────────────────────────
             scr.residual.copy_from_slice(&scr.h);
@@ -612,26 +620,35 @@ impl CodePredictor {
             // ── FFN norm (in-place) ──────────────────────────────────────
             rms_norm_f32_inplace(&mut scr.h, &layer.ffn_norm_w, eps);
 
-            // ── FFN gate + up gemv (allocation-free) ─────────────────────
-            layer.ffn_gate.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.gate_buf);
-            layer.ffn_up.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.up_buf);
+            // ── FFN gate + up gemv (quantize-once multi gemv) ────────────
+            Q8Weights::gemv_multi_into(
+                &[&layer.ffn_gate, &layer.ffn_up],
+                &mut [&mut scr.gate_buf, &mut scr.up_buf],
+                &scr.h,
+                &mut self.q8_ws,
+            );
 
-            // ── SiLU(gate) * up → scr.ffn_mid ────────────────────────────
+            // ── SiLU(gate) * up → scr.ffn_mid (parallel) ─────────────────
             let ffn_dim = scr.gate_buf.len();
             let fm = &mut scr.ffn_mid[..ffn_dim];
-            for j in 0..ffn_dim {
-                let g = scr.gate_buf[j];
-                let sig = 1.0 / (1.0 + (-g as f64).exp()) as f32;
-                fm[j] = g * sig * scr.up_buf[j];
-            }
+            let silu_gate = silu_f32_par(&scr.gate_buf);
+            fm.par_iter_mut()
+                .zip(silu_gate.par_iter())
+                .zip(scr.up_buf.par_iter())
+                .for_each(|((dst, &g_act), &u)| {
+                    *dst = g_act * u;
+                });
 
             // ── Down projection gemv into q_buf (reuse) ──────────────────
             layer.ffn_down.gemv_into(fm, &mut self.q8_ws, &mut scr.q_buf);
 
-            // ── Residual add ─────────────────────────────────────────────
-            for j in 0..pred_h {
-                scr.h[j] = scr.residual[j] + scr.q_buf[j];
-            }
+            // ── Residual add (parallel) ──────────────────────────────────
+            scr.h.par_iter_mut()
+                .zip(scr.residual.par_iter())
+                .zip(scr.q_buf.par_iter())
+                .for_each(|((h_j, &r), &q)| {
+                    *h_j = r + q;
+                });
         }
 
         // ── Final output norm ────────────────────────────────────────────
