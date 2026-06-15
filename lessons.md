@@ -173,6 +173,18 @@
 **Source:** q8_linear ws-parameter migration
 
 ---
+## Lesson #27 — 2026-06-15
+**Trigger:** The codec decode stage (~35s for 8 calls) dominates total pipeline time, not the talker or predictor.
+**Rule:** Always add end-to-end timing before optimizing. The perceived bottleneck (talker/predictor) may not be the real one — the codec decoder can dominate. Use per-stage timing to guide optimization priority.
+**Source:** stage timing implementation (sub-task 1)
+
+---
+## Lesson #26 — 2026-06-15
+**Trigger:** The predictor's `head_dim_sum` (= n_q_heads * head_dim = 2048) was mistakenly used as both the attention output dimension AND the FFN hidden intermediate dimension, but FFN hidden was 3072 (ffn_gate.out_features()).
+**Rule:** In GQA + SwiGLU architectures, do not assume attention and FFN dimensions are the same. Compute `attn_dim = n_q_heads * head_dim` for attention output, and `ffn_dim = ffn_gate.out_features()` for the SwiGLU intermediate — these can differ (2048 vs 3072 in Qwen2-TTS 1.7B predictor).
+**Source:** code_predictor dimension fix
+
+---
 ## Lesson #25 — 2026-06-15
 **Trigger:** Custom attention_tensor at small cache sizes (kv_len<5) was slower than candle's native matmul due to to_vec1 copy overhead dominating the tiny computation.
 **Rule:** When replacing tensor ops with custom f32 ops, benchmark at representative sizes (not just microbenchmark). For tiny tensors (<10KB), tensor dispatch overhead is negligible and vanilla candle ops may be faster. For larger tensors (>100KB) or operations that scale with data size (attention grows with kv_len), custom f32 ops win due to fusion eliminating intermediate allocations.
