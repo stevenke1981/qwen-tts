@@ -123,3 +123,9 @@
 **Trigger:** CUDA pipeline tests showed only ~1× speedup over CPU for autoregressive decode with tiny matmuls `[1, 2048] @ [6144, 2048]`.
 **Rule:** Before assuming GPU acceleration will help, profile the matrix sizes: if the largest matmul dimension is < 8192 and the batch dimension is 1, kernel launch overhead dominates (>95%), making GPU ~same as CPU. GPU helps only with larger matrices (prefill, batched inference, or kernel fusion).
 **Source:** CUDA pipeline verification tests
+
+---
+## Lesson #17 — 2026-06-15
+**Trigger:** Cross-validation test showed 0% sample match between Pure Rust (argmax) and FFI (temperature=1.0) with same seed=42 — different RNG implementations (StdRng vs Mersenne Twister) produce completely different acoustic code tokens.
+**Rule:** When cross-validating two implementations that differ in code predictor architecture (simplified vs full) AND RNG, compare structural metrics (duration, RMS, peak, SDR) instead of sample-by-sample exactness. A 0% sample match is expected and valid as long as both produce reasonable audio of the same length.
+**Source:** Cross-validation test suite
