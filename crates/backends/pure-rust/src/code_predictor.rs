@@ -600,6 +600,77 @@ impl CodePredictor {
         }
     }
 
+    // ── batched helpers (M>1, parallel over sequences) ──────────────
+
+    /// Apply RMS norm to each row of a batched [m, dim] matrix in-place.
+    fn rms_norm_batched_par(&self, h: &mut [f32], w: &[f32], m: usize, dim: usize) {
+        assert_eq!(h.len(), m * dim);
+        h.par_chunks_mut(dim)
+            .for_each(|row| rms_norm_f32_inplace(row, w, 1e-6_f64));
+    }
+
+    /// Apply per-head QK-norm to each sequence independently.
+    fn qk_norm_batched_par(
+        &self, x: &[f32], w: &[f32], m: usize, n_heads: usize, hd: usize,
+    ) -> Vec<f32> {
+        assert_eq!(x.len(), m * n_heads * hd);
+        (0..m).into_par_iter()
+            .flat_map(|seq| {
+                let x_s = &x[seq * n_heads * hd..(seq + 1) * n_heads * hd];
+                per_head_rms_norm_f32_par(x_s, w, n_heads, hd, 1e-6_f64)
+            })
+            .collect()
+    }
+
+    /// Apply RoPE to each sequence independently.
+    fn rope_batched_par(
+        &self, x: &[f32], cos: &[f32], sin: &[f32],
+        m: usize, n_heads: usize, hd: usize,
+    ) -> Vec<f32> {
+        assert_eq!(x.len(), m * n_heads * hd);
+        (0..m).into_par_iter()
+            .flat_map(|seq| {
+                let x_s = &x[seq * n_heads * hd..(seq + 1) * n_heads * hd];
+                rope_f32_par(x_s, cos, sin, n_heads, hd)
+            })
+            .collect()
+    }
+
+    /// Apply SiLU to each row of a batched [m, dim] matrix.
+    fn silu_batched_par(&self, x: &[f32], m: usize, dim: usize) -> Vec<f32> {
+        assert_eq!(x.len(), m * dim);
+        (0..m).into_par_iter()
+            .flat_map(|seq| {
+                let x_s = &x[seq * dim..(seq + 1) * dim];
+                silu_f32_par(x_s)
+            })
+            .collect()
+    }
+
+    /// Attention for M independent sequences.
+    /// q: [m, n_q_heads, hd]
+    /// Returns: [m, n_q_heads * hd]
+    fn batch_attention_f32_par(
+        &self,
+        q: &[f32],
+        k_caches: &[&[f32]],
+        v_caches: &[&[f32]],
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        hd: usize,
+        m: usize,
+    ) -> Vec<f32> {
+        (0..m).into_par_iter()
+            .flat_map(|seq| {
+                let q_s = &q[seq * n_q_heads * hd..(seq + 1) * n_q_heads * hd];
+                let k_s = k_caches[seq];
+                let v_s = v_caches[seq];
+                let kv_len = k_s.len() / (n_kv_heads * hd);
+                attention_f32_par(q_s, k_s, v_s, n_q_heads, n_kv_heads, kv_len, hd, kv_len)
+            })
+            .collect()
+    }
+
     // ── public API ─────────────────────────────────────────────────────
 
     /// Predict a single audio code frame using temperature/top-k/top-p sampling.
