@@ -12,6 +12,7 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use candle_core::Device;
 use qwen_tts_runtime::{BackendError, BackendResult, DeviceKind, RuntimeBackend, SynthesisRequest, SynthesisResponse};
 
 use pipeline::Pipeline;
@@ -20,15 +21,17 @@ use pipeline::Pipeline;
 pub struct PureRustBackend {
     talker_path: PathBuf,
     codec_path: PathBuf,
+    device: DeviceKind,
     pipeline: Mutex<Option<Pipeline>>,
 }
 
 impl PureRustBackend {
     #[must_use]
-    pub fn new(talker_path: PathBuf, codec_path: PathBuf) -> Self {
+    pub fn new(talker_path: PathBuf, codec_path: PathBuf, device: DeviceKind) -> Self {
         Self {
             talker_path,
             codec_path,
+            device,
             pipeline: Mutex::new(None),
         }
     }
@@ -43,10 +46,29 @@ impl PureRustBackend {
             return Ok(());
         }
 
-        let p = Pipeline::new(&self.talker_path, &self.codec_path)
+        let candle_device = device_to_candle(self.device)?;
+        let p = Pipeline::new(&self.talker_path, &self.codec_path, &candle_device)
             .map_err(|e| BackendError::Unavailable(format!("pipeline init failed: {e}")))?;
         *guard = Some(p);
         Ok(())
+    }
+}
+
+/// Convert a [`DeviceKind`] to a candle [`Device`].
+///
+/// Supports `Cpu`, `Cuda`, and `Auto` (Auto tries CUDA first, falls back to CPU).
+fn device_to_candle(kind: DeviceKind) -> BackendResult<Device> {
+    match kind {
+        DeviceKind::Cpu => Ok(Device::Cpu),
+        DeviceKind::Cuda => Device::new_cuda(0)
+            .map_err(|e| BackendError::Unavailable(format!("CUDA device 0 not available: {e}"))),
+        DeviceKind::Auto => {
+            // Try CUDA first, silently fall back to CPU
+            Ok(Device::new_cuda(0).unwrap_or(Device::Cpu))
+        }
+        other => Err(BackendError::Unavailable(format!(
+            "device {other} not supported by pure-rust backend (use cpu, cuda, or auto)"
+        ))),
     }
 }
 
@@ -56,7 +78,7 @@ impl RuntimeBackend for PureRustBackend {
     }
 
     fn device_kind(&self) -> DeviceKind {
-        DeviceKind::Cpu
+        self.device
     }
 
     fn is_available(&self) -> bool {

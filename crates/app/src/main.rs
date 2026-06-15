@@ -866,6 +866,7 @@ fn run_synthesis(
             scheduler.register(qwen_tts_backend_pure_rust::PureRustBackend::new(
                 request.models.talker.path.clone(),
                 request.models.codec.path.clone(),
+                request.device,
             ));
         }
         #[cfg(feature = "ffi")]

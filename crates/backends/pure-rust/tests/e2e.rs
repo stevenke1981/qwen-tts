@@ -9,6 +9,7 @@ use std::fs::File;
 use std::path::Path;
 
 use candle_core::quantized::gguf_file;
+use candle_core::Device;
 
 use qwen_tts_backend_pure_rust::config::ModelConfig;
 use qwen_tts_backend_pure_rust::pipeline::Pipeline;
@@ -199,6 +200,18 @@ fn test_codec_tensors() {
     );
 }
 
+/// Quick test: check if CUDA is available at runtime.
+#[test]
+fn test_cuda_available() {
+    let result = Device::new_cuda(0);
+    if let Ok(dev) = result {
+        eprintln!("CUDA device available: {dev:?}");
+    } else {
+        eprintln!("CUDA not available (expected on non-CUDA builds): {:?}", result.err());
+    }
+    // Not asserting — CUDA may be absent in CPU-only builds
+}
+
 /// Verify Talker loads from the real GGUF (dequantizes all weights to F32).
 /// This is the heaviest test — ~8 GB RAM for the 1.7B Q8_0 model.
 #[test]
@@ -238,7 +251,7 @@ fn test_code_predictor_loads() {
 #[test]
 #[ignore = "requires ~10 GB RAM and ~19 minutes (128 frames, KV cache)"]
 fn test_pipeline_full_synthesize() {
-    let pipeline = Pipeline::new(&talker_path(), &codec_path())
+    let pipeline = Pipeline::new(&talker_path(), &codec_path(), &Device::Cpu)
         .expect("pipeline should load");
 
     let request = SynthesisRequest {

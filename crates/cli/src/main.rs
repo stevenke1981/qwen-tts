@@ -262,7 +262,7 @@ fn synth(args: &SynthArgs) -> Result<(), String> {
         BackendMode::NativeCpu => scheduler.register(CpuBackend::new()),
         #[cfg(feature = "pure-rust")]
         BackendMode::PureRust => {
-            let bk = PureRustBackend::new(talker.clone(), codec.clone());
+            let bk = PureRustBackend::new(talker.clone(), codec.clone(), args.device);
             scheduler.register(bk);
         }
         BackendMode::Qwentts => {

@@ -24,23 +24,24 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Load all model weights, discover tokenizer alongside talker GGUF.
-    pub fn new(talker_path: &Path, codec_path: &Path) -> anyhow::Result<Self> {
-        let device = Device::Cpu;
-
-        let (talker, code_predictor) = Talker::load_with_predictor(talker_path, &device)?;
+    ///
+    /// `device` — the device (CPU or CUDA) to load weights onto and run on.
+    pub fn new(talker_path: &Path, codec_path: &Path, device: &Device) -> anyhow::Result<Self> {
+        let (talker, code_predictor) = Talker::load_with_predictor(talker_path, device)?;
         let codec_decoder = CodecDecoder::load(codec_path)
             .map_err(|e| anyhow::anyhow!("failed to load codec decoder: {e}"))?;
 
         let tokenizer = discover_tokenizer(talker_path).ok();
 
         log::info!(
-            "pipeline loaded: talker={}, code_predictor={}, tokenizer={}",
+            "pipeline loaded: device={:?}, talker={}, code_predictor={}, tokenizer={}",
+            device,
             talker_path.display(),
             codec_path.display(),
             if tokenizer.is_some() { "found" } else { "not-found" },
         );
 
-        Ok(Self { talker, code_predictor, codec_decoder, tokenizer, device })
+        Ok(Self { talker, code_predictor, codec_decoder, tokenizer, device: device.clone() })
     }
 
     /// Synthesize speech: text → WAV samples via autoregressive code generation.
