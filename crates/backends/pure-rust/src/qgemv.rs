@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::quantized::gguf_file::Content;
 use candle_core::quantized::k_quants::{BlockQ8_0, GgmlType, QK8_0};
@@ -130,6 +131,141 @@ impl Q8Weights {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q8_0 vec_dot — runtime-dispatched SIMD implementation
+// ---------------------------------------------------------------------------
+
+/// Convert IEEE 754 half-precision (16-bit) to single-precision (32-bit).
+#[inline]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) as u32) << 31;
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let mant = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        // Zero or subnormal — Q8_0 scales are never subnormal in practice,
+        // but zero-initialized blocks may have this pattern.
+        f32::from_bits(sign)
+    } else if exp == 31 {
+        // NaN or Inf
+        f32::from_bits(sign | 0x7f800000 | (mant << 13))
+    } else {
+        f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (mant << 13))
+    }
+}
+
+/// Read f16 scale from a BlockQ8_0 via raw pointer (offset 0).
+#[inline]
+unsafe fn block_d_f32(b: &BlockQ8_0) -> f32 {
+    let ptr = b as *const BlockQ8_0 as *const u16;
+    f16_bits_to_f32(*ptr)
+}
+
+/// Read qs pointer from a BlockQ8_0 via raw pointer (offset 2, after f16).
+#[inline]
+unsafe fn block_qs_ptr(b: &BlockQ8_0) -> *const i8 {
+    (b as *const BlockQ8_0 as *const u8).add(2) as *const i8
+}
+
+/// Optimized scalar Q8_0 vec_dot (avoids `.iter().zip().map().sum()` overhead).
+fn q8_vec_dot_scalar(n: usize, w: &[BlockQ8_0], x: &[BlockQ8_0]) -> f32 {
+    debug_assert!(n.is_multiple_of(QK8_0));
+    let n_blocks = n / QK8_0;
+    let mut sum = 0.0f32;
+    unsafe {
+        for i in 0..n_blocks {
+            let w_d = block_d_f32(&w[i]);
+            let x_d = block_d_f32(&x[i]);
+            let w_qs = block_qs_ptr(&w[i]);
+            let x_qs = block_qs_ptr(&x[i]);
+            let mut dot = 0i32;
+            for j in 0..QK8_0 {
+                dot += (*w_qs.add(j) as i32) * (*x_qs.add(j) as i32);
+            }
+            sum += (dot as f32) * w_d * x_d;
+        }
+    }
+    sum
+}
+
+/// AVX2 + FMA accelerated Q8_0 vec_dot.
+///
+/// Algorithm (same as `candle_core::quantized::avx::vec_dot_q8_0_q8_0`):
+///   1. `_mm256_sign_epi8(w, w)` → unsigned `|w|` for `_mm256_maddubs_epi16`
+///   2. `_mm256_sign_epi8(x, w)` → `sgn(w)*x`  (signed)
+///   3. `_mm256_maddubs_epi16(|w|, sgn(w)*x)` → 16 × i16 pairwise products
+///   4. `_mm256_madd_epi16`(step3, ones) → 8 × i32  (quadwise sums = 32 i8 → 8 i32)
+///   5. `_mm256_cvtepi32_ps` + `_mm256_fmadd_ps` with f16 scales → accumulate f32
+///   6. Horizontal sum → final dot product
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+unsafe fn q8_vec_dot_avx2(n: usize, w: &[BlockQ8_0], x: &[BlockQ8_0]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert!(n.is_multiple_of(QK8_0));
+    let n_blocks = n / QK8_0;
+    let mut acc = _mm256_setzero_ps();
+    for i in 0..n_blocks {
+        // Scale (f16 → f32, broadcast)
+        let w_d = block_d_f32(&w[i]);
+        let x_d = block_d_f32(&x[i]);
+        let d = _mm256_set1_ps(w_d * x_d);
+
+        // Load 32 × i8 from both blocks
+        let w_qs = _mm256_loadu_si256(block_qs_ptr(&w[i]) as *const __m256i);
+        let x_qs = _mm256_loadu_si256(block_qs_ptr(&x[i]) as *const __m256i);
+
+        // Sign trick: |w| (unsigned) × sgn(w)*x (signed)
+        let aw = _mm256_sign_epi8(w_qs, w_qs);   // abs(w):  0..127  (unsigned)
+        let sx = _mm256_sign_epi8(x_qs, w_qs);   // sgn(w)*x  (signed)
+
+        // Pairwise u8×i8 → i16 (saturated, but i8×i8 < 16384 so safe)
+        let dot16 = _mm256_maddubs_epi16(aw, sx); // 16 × i16 pairwise sums
+
+        // Quadwise i16→i32 sum → 8 × i32
+        let ones = _mm256_set1_epi16(1);
+        let dot32 = _mm256_madd_epi16(dot16, ones); // 8 × i32
+
+        // i32 → f32 → FMA accumulate
+        let dot_f32 = _mm256_cvtepi32_ps(dot32);
+        acc = _mm256_fmadd_ps(d, dot_f32, acc);
+    }
+
+    // Horizontal sum of 8 × f32
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum128 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum128 = _mm_add_ss(sum128, _mm_movehdup_ps(sum128));
+    _mm_cvtss_f32(sum128)
+}
+
+/// One-shot flag to print AVX2 detection state once.
+static AVX2_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Runtime-dispatched Q8_0 vec_dot.
+///
+/// Uses AVX2+FMA on capable x86_64, optimized scalar everywhere else.
+#[inline]
+pub fn q8_vec_dot(n: usize, w: &[BlockQ8_0], x: &[BlockQ8_0]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        if !AVX2_REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!("[q8_vec_dot] AVX2+FMA: {}", if use_avx2 { "ENABLED" } else { "FALLBACK (scalar)" });
+        }
+        if use_avx2 {
+            return unsafe { q8_vec_dot_avx2(n, w, x) };
+        }
+    }
+    q8_vec_dot_scalar(n, w, x)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn q8_vec_dot(n: usize, w: &[BlockQ8_0], x: &[BlockQ8_0]) -> f32 {
+    q8_vec_dot_scalar(n, w, x)
+}
+
 // ── workspace ─────────────────────────────────────────────────────────
 
 /// Reusable scratch buffers for allocation-free GEMV / matmul.
@@ -221,7 +357,7 @@ impl Q8Weights {
             .enumerate()
             .for_each(|(row, d)| {
                 let w_row = self.row_blocks(row);
-                *d = <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref);
+                *d = q8_vec_dot(padded_k, w_row, x_q_ref);
             });
     }
 
@@ -238,7 +374,7 @@ impl Q8Weights {
             .enumerate()
             .for_each(|(row, d)| {
                 let w_row = self.row_blocks(row);
-                *d = <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref);
+                *d = q8_vec_dot(padded_k, w_row, x_q_ref);
             });
     }
 
@@ -289,7 +425,7 @@ impl Q8Weights {
                 let row_in_w = flat_row - row_start;
                 let w = weights[wi];
                 let w_row = w.row_blocks(row_in_w);
-                <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref)
+                q8_vec_dot(padded_k, w_row, x_q_ref)
             })
             .collect();
 
@@ -337,11 +473,66 @@ impl Q8Weights {
                 (0..n)
                     .map(|col_idx| {
                         let w_row = self.row_blocks(col_idx);
-                        <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, &local_x_q)
+                        q8_vec_dot(padded_k, w_row, &local_x_q)
                     })
                     .collect::<Vec<f32>>()
             })
             .collect()
+    }
+
+    /// Batch matmul for M > 1 sequences.
+    ///
+    /// Parallelizes over **weight rows** (output dimension), reading each
+    /// weight row once from DRAM. All M inputs are quantized upfront,
+    /// then each weight row vec_dots against all M quantized inputs.
+    ///
+    /// `x`: `[m, k]` f32 flattened (row-major).
+    /// `m`: number of independent sequences (batch size).
+    /// Returns `[m, n]` f32 flattened.
+    pub fn matmul_batched(&self, x: &[f32], m: usize) -> Vec<f32> {
+        assert_eq!(x.len(), m * self.k,
+            "matmul_batched: x.len {} != m*k={}", x.len(), m * self.k);
+
+        let bpr = self.blocks_per_row;
+        let padded_k = self.padded_k;
+        let k = self.k;
+        let n = self.n;
+
+        // 1. Quantize all M inputs once.
+        let mut x_q = vec![BlockQ8_0::zeros(); m * bpr];
+        for seq in 0..m {
+            let src = &x[seq * k..(seq + 1) * k];
+            let dst = &mut x_q[seq * bpr..(seq + 1) * bpr];
+            let mut padded = Vec::with_capacity(padded_k);
+            padded.extend_from_slice(src);
+            padded.resize(padded_k, 0.0);
+            <BlockQ8_0 as GgmlType>::from_float(&padded, dst);
+        }
+
+        // 2. Compute into [n, m] temp — contiguous writes per weight row.
+        let mut tmp = vec![0.0f32; n * m];
+        tmp.par_chunks_mut(m)
+            .enumerate()
+            .for_each(|(row, out_row)| {
+                let w_blocks = self.row_blocks(row);
+                for seq in 0..m {
+                    let xq_slice = &x_q[seq * bpr..(seq + 1) * bpr];
+                    out_row[seq] = q8_vec_dot(padded_k, w_blocks, xq_slice);
+                }
+            });
+
+        // 3. Transpose [n, m] → [m, n] for standard row-major output.
+        let mut result = vec![0.0f32; m * n];
+        result
+            .par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(seq, out_seq)| {
+                for row in 0..n {
+                    out_seq[row] = tmp[row * m + seq];
+                }
+            });
+
+        result
     }
 }
 
@@ -462,7 +653,7 @@ pub fn q8_linear_multi(
                     .map(|i| (i, 0))
                     .unwrap_or_else(|i| (i - 1, flat_row - offsets[i - 1]));
                 let w_row = weights[wi].row_blocks(row_in_w);
-                <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref)
+                q8_vec_dot(padded_k, w_row, x_q_ref)
             })
             .collect();
 
