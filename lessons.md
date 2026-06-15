@@ -105,3 +105,9 @@
 **Trigger:** Config metadata keys used `qwen3-tts.talker.*` prefix, not `llama.*` — ModelConfig returned defaults (24 layers, wrong vocab) instead of real values.
 **Rule:** Before trusting default metadata keys in GGUF parsing, probe real model metadata with a test that prints all keys, then update lookup to try architecture-specific prefixes first (`qwen3-tts.talker.*` → `qwen3-tts.*` → `llama.*`).
 **Source:** GGUF tensor naming fix
+
+---
+## Lesson #14 — 2026-06-15
+**Trigger:** `Tensor::matmul()` in `candle-core` 0.10.x panicked with "shape mismatch" when given 2D weight and 3D hidden — unlike PyTorch/ggml, candle requires both operands to have the same rank.
+**Rule:** Before writing matmul operations with candle, check the rank of both tensors. If ranks differ (e.g., 2D weight [out, in] @ 3D hidden [B, T, in]), flatten the higher-rank tensor to 2D first: `x_2d = x.reshape((batch*seq_len, in_dim))`, compute `x_2d.matmul(&weight.t())`, then reshape back to original rank with new last dim. Extract this as a `linear_fwd(weight, x)` helper.
+**Source:** pure-rust matmul rank mismatch fix

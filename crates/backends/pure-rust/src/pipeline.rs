@@ -10,7 +10,7 @@ use rand::SeedableRng;
 
 use crate::code_predictor::CodePredictor;
 use crate::sampling;
-use crate::talker::Talker;
+use crate::talker::{precompute_cos_sin, KvCache, Talker};
 use crate::tokenizer::HfTokenizer;
 
 /// Loaded pipeline ready for synthesis.
@@ -73,9 +73,9 @@ impl Pipeline {
         let seq_len = padded.len();
         let input_tensor = Tensor::from_slice(&padded, (1, seq_len), &self.device)?;
 
-        // --- 2. Initial text embeddings ---
-        let mut seq = self.talker.embed_text(&input_tensor)?;
-        // seq: [1, seq_len, d_model]
+        // --- 2. Text embeddings ---
+        let text_embeds = self.talker.embed_text(&input_tensor)?;
+        // text_embeds: [1, seq_len, d_model]
 
         // --- 3. Sampling configuration ---
         let temperature = request.temperature.unwrap_or(1.0);
@@ -89,21 +89,35 @@ impl Pipeline {
         let num_frames = request.max_new_tokens.unwrap_or(1024) as usize;
         let do_sample = request.do_sample.unwrap_or(true);
 
-        // --- 4. Autoregressive frame generation ---
-        let _num_acoustic = self.code_predictor.num_acoustic();
+        // --- 4. KV cache + autoregressive frame generation ---
         let codec_codebooks: usize = 16;
         let mut all_codes: Vec<i32> = Vec::with_capacity(num_frames * codec_codebooks);
 
+        // 4a. Precompute RoPE for the full context length
+        let max_seq = self.talker.config().max_seq_len;
+        let (cos_full, sin_full) =
+            precompute_cos_sin(self.talker.config(), max_seq, &self.device)?;
+
+        // 4b. Create KV cache and prefill text tokens one-by-one
+        let mut kv_cache = KvCache::new(self.talker.config().n_layers);
+        let mut last_hidden: Option<Tensor> = None;
+        for pos in 0..seq_len {
+            let emb = text_embeds.i((.., pos..pos + 1, ..))?;
+            let hidden = self
+                .talker
+                .forward_step(&emb, &mut kv_cache, &cos_full, &sin_full)?;
+            last_hidden = Some(hidden);
+        }
+        // last_hidden: [1, 1, d_model] — output-normed hidden state at the last text position
+        let mut last_hidden = last_hidden
+            .ok_or_else(|| anyhow::anyhow!("empty text sequence after prefill"))?;
+
+        // 4c. Decode loop: generate audio frames
         for frame_idx in 0..num_frames {
-            let current_len = seq.dims()[1];
+            // Squeeze from [1, 1, d_model] to [1, d_model] for code predictor
+            let last_hidden_2d = last_hidden.squeeze(1)?;
 
-            // 4a. Talker forward on current sequence
-            let hidden = self.talker.forward_embeddings(&seq)?;
-            // hidden: [1, current_len, d_model]
-            let last_hidden = hidden.i((0, current_len - 1, ..))?.unsqueeze(0)?;
-            // last_hidden: [1, 1, d_model]
-
-            // 4b. Predict codebook 0 via codec_head
+            // Predict codebook 0 via codec_head
             let cb0_logits = self.talker.predict_codebook0(&last_hidden)?;
             // cb0_logits: [1, 1, vocab_cb0]
             let cb0_token = if do_sample {
@@ -113,15 +127,15 @@ impl Pipeline {
             };
             all_codes.push(cb0_token as i32);
 
-            // 4c. Embed codebook 0 token and append to sequence
+            // Embed codebook 0 token for the next forward step
             let cb0_emb = self.talker.embed_codebook0(cb0_token)?;
             // cb0_emb: [1, 1, d_model]
-            seq = Tensor::cat(&[&seq, &cb0_emb], 1)?;
 
-            // 4d. Predict acoustic codebooks 1..N via code predictor
+            // Predict acoustic codebooks 1..N via code predictor
+            // (code predictor expects [batch, d_model], not [batch, 1, d_model])
             let frame = self
                 .code_predictor
-                .predict_one_frame_sampled(&last_hidden, temperature, top_k, top_p, &mut rng)?;
+                .predict_one_frame_sampled(&last_hidden_2d, temperature, top_k, top_p, &mut rng)?;
             for &token in &frame {
                 all_codes.push(token as i32);
             }
@@ -131,9 +145,10 @@ impl Pipeline {
                 all_codes.push(0);
             }
 
-            // Optional: early stopping on EOS (codebook 0 = 0 is padding/silence)
-            // For now we just generate all requested frames.
-            _ = frame_idx;
+            // Forward step with the new audio embedding — uses KV cache so this is O(1) per layer
+            last_hidden = self
+                .talker
+                .forward_step(&cb0_emb, &mut kv_cache, &cos_full, &sin_full)?;
         }
 
         // Trim to exact multiples

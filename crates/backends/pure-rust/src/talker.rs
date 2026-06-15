@@ -72,6 +72,64 @@ struct DecoderLayer {
     ffn_down: Tensor,
 }
 
+// -----------------------------------------------------------------------
+// KV Cache
+// -----------------------------------------------------------------------
+
+/// Per-layer key/value cache for incremental decoding.
+///
+/// Stores the K and V tensors for each decoder layer as they are computed,
+/// growing one position at a time. Used with `Talker::forward_step`.
+pub struct KvCache {
+    k_caches: Vec<Option<Tensor>>,
+    v_caches: Vec<Option<Tensor>>,
+}
+
+impl KvCache {
+    /// Create a new cache for `n_layers` layers (all empty).
+    pub fn new(n_layers: usize) -> Self {
+        Self {
+            k_caches: vec![None; n_layers],
+            v_caches: vec![None; n_layers],
+        }
+    }
+
+    /// Append K,V for one token at layer `layer`.
+    ///
+    /// K/V shapes: `[batch, n_kv_heads, 1, head_dim]`.
+    pub fn append(&mut self, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        let new_k = match &self.k_caches[layer] {
+            Some(cache) => Tensor::cat(&[cache, k], 2)?,
+            None => k.clone(),
+        };
+        let new_v = match &self.v_caches[layer] {
+            Some(cache) => Tensor::cat(&[cache, v], 2)?,
+            None => v.clone(),
+        };
+        self.k_caches[layer] = Some(new_k);
+        self.v_caches[layer] = Some(new_v);
+        Ok(())
+    }
+
+    /// Number of cached positions.
+    pub fn current_len(&self) -> usize {
+        self.k_caches[0]
+            .as_ref()
+            .map(|t| t.dims()[2])
+            .unwrap_or(0)
+    }
+
+    /// Borrow the K cache at `layer` (returns `Some` after at least one append).
+    pub fn k(&self, layer: usize) -> Option<&Tensor> {
+        self.k_caches[layer].as_ref()
+    }
+
+    /// Borrow the V cache at `layer` (returns `Some` after at least one append).
+    pub fn v(&self, layer: usize) -> Option<&Tensor> {
+        self.v_caches[layer].as_ref()
+    }
+}
+
 /// Load a single tensor from GGUF, dequantized to F32.
 fn load_f32_tensor(content: &Content, file: &mut File, name: &str, device: &Device) -> anyhow::Result<Tensor> {
     let qt = content
@@ -519,6 +577,113 @@ impl Talker {
         Ok(result.contiguous()?)
     }
 
+    /// Process one token through all decoder layers with KV cache (incremental decode).
+    ///
+    /// `x`: `[batch, 1, d_model]` — single token embedding.
+    /// `cache`: mutable per-layer KV cache (will be appended to).
+    /// `cos_full`, `sin_full`: `[1, 1, max_seq, head_dim]` — precomputed RoPE
+    ///   for all positions; the current position is `cache.current_len()`.
+    ///
+    /// Returns output-normed hidden state: `[batch, 1, d_model]`.
+    pub fn forward_step(
+        &self,
+        x: &Tensor,
+        cache: &mut KvCache,
+        cos_full: &Tensor,
+        sin_full: &Tensor,
+    ) -> anyhow::Result<Tensor> {
+        let cfg = &self.config;
+        let (batch, _one, d_model) = x.dims3()?;
+        assert_eq!(d_model, cfg.d_model, "forward_step dim mismatch");
+
+        let mut hidden = x.clone();
+        let pos = cache.current_len();
+        let n_heads = cfg.n_heads;
+        let n_kv = cfg.n_kv_heads;
+        let hd = cfg.head_dim();
+        let head_dim_sum = n_heads * hd;
+        let n_repeat = n_heads / n_kv;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let residual = hidden.clone();
+            hidden = layer.attn_norm.forward(&hidden)?;
+
+            // QKV projections for a single token: [B, d_model] → [B, ...]
+            let h_2d = hidden.reshape((batch, d_model))?;
+            let q = h_2d.matmul(&layer.attn_q.t()?)?; // [B, n_heads*hd]
+            let k = h_2d.matmul(&layer.attn_k.t()?)?; // [B, n_kv*hd]
+            let v = h_2d.matmul(&layer.attn_v.t()?)?; // [B, n_kv*hd]
+
+            // Reshape to multi-head
+            let q = q.reshape((batch, n_heads, 1, hd))?;
+            let k = k.reshape((batch, n_kv, 1, hd))?;
+            let v = v.reshape((batch, n_kv, 1, hd))?;
+
+            // Per-head QK-norm (after reshape, before RoPE)
+            let q = apply_per_head_norm(&q, &layer.attn_q_norm)?;
+            let k = apply_per_head_norm(&k, &layer.attn_k_norm)?;
+
+            // RoPE at the current position
+            let cos = cos_full.narrow(D::Minus2, pos, 1)?;
+            let sin = sin_full.narrow(D::Minus2, pos, 1)?;
+            let q = apply_rope(&q, &cos, &sin)?;
+            let k = apply_rope(&k, &cos, &sin)?;
+
+            // Append new K,V to cache
+            cache.append(i, &k, &v)?;
+
+            // Get full K/V from cache
+            let k_cache = cache
+                .k(i)
+                .ok_or_else(|| anyhow::anyhow!("K cache empty after append"))?;
+            let v_cache = cache
+                .v(i)
+                .ok_or_else(|| anyhow::anyhow!("V cache empty after append"))?;
+
+            // GQA: repeat K,V heads to match n_heads
+            let k_full = if n_repeat > 1 {
+                repeat_kv(k_cache, n_repeat)?
+            } else {
+                k_cache.clone()
+            };
+            let v_full = if n_repeat > 1 {
+                repeat_kv(v_cache, n_repeat)?
+            } else {
+                v_cache.clone()
+            };
+
+            // Scaled dot-product attention (single query, full KV from cache)
+            let scale = (hd as f64).sqrt().recip();
+            let attn = q.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
+            let attn = (attn * scale)?;
+            // No causal mask: the query is at the last position, it attends to
+            // all cached positions (which are all ≤ current position).
+            let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
+            let attn_out = attn.matmul(&v_full)?;
+
+            // Output projection
+            let attn_out = attn_out
+                .permute((0, 2, 1, 3))?
+                .reshape((batch, head_dim_sum))?;
+            let attn_proj = attn_out.matmul(&layer.attn_o.t()?)?;
+            hidden = (residual + attn_proj.reshape((batch, 1, d_model))?)?;
+
+            // SwiGLU FFN
+            let residual = hidden.clone();
+            hidden = layer.ffn_norm.forward(&hidden)?;
+            let h_2d = hidden.reshape((batch, d_model))?;
+            let gate = candle_nn::ops::silu(&h_2d.matmul(&layer.ffn_gate.t()?)?)?;
+            let up = h_2d.matmul(&layer.ffn_up.t()?)?;
+            let hid_2d = (gate * up)?;
+            let hid_out = hid_2d.matmul(&layer.ffn_down.t()?)?;
+            hidden = (residual + hid_out.reshape((batch, 1, d_model))?)?;
+        }
+
+        // Final output norm
+        let hidden = self.output_norm.forward(&hidden)?;
+        Ok(hidden)
+    }
+
     /// Apply the text projection MLP: fc1 → silu → fc2 + bias.
     ///
     /// `x`: `[batch, seq_len, d_model]` — text embeddings.
@@ -585,7 +750,7 @@ fn linear_fwd(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
 // RoPE helpers
 // -----------------------------------------------------------------------
 
-fn precompute_cos_sin(cfg: &ModelConfig, max_s: usize, dev: &Device) -> anyhow::Result<(Tensor, Tensor)> {
+pub(crate) fn precompute_cos_sin(cfg: &ModelConfig, max_s: usize, dev: &Device) -> anyhow::Result<(Tensor, Tensor)> {
     let hd = cfg.head_dim();
     let inv_freq: Vec<f32> = (0..hd).step_by(2)
         .map(|i| (1.0_f64 / cfg.rope_theta.powf(i as f64 / hd as f64)) as f32)

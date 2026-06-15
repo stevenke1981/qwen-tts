@@ -202,7 +202,7 @@ fn test_codec_tensors() {
 /// Verify Talker loads from the real GGUF (dequantizes all weights to F32).
 /// This is the heaviest test — ~8 GB RAM for the 1.7B Q8_0 model.
 #[test]
-#[ignore = "requires ~8 GB RAM and 1-3 minutes"]
+#[ignore = "requires ~8 GB RAM and ~5 seconds"]
 fn test_talker_loads() {
     let device = candle_core::Device::Cpu;
     let talker = Talker::from_gguf(&talker_path(), &device)
@@ -236,7 +236,7 @@ fn test_code_predictor_loads() {
 /// Full pipeline end-to-end: load all models, synthesize a short text,
 /// verify we get valid 24 kHz PCM audio.
 #[test]
-#[ignore = "requires ~10 GB RAM and 2-5 minutes"]
+#[ignore = "requires ~10 GB RAM and ~19 minutes (128 frames, KV cache)"]
 fn test_pipeline_full_synthesize() {
     let pipeline = Pipeline::new(&talker_path(), &codec_path())
         .expect("pipeline should load");
