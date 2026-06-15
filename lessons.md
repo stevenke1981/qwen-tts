@@ -201,3 +201,27 @@
 **Trigger:** KV cache hot path used Tensor::cat (O(n²) cumulative copies). Replaced with pre-allocated Vec<f32> flat buffers + strided attention_f32 to avoid per-step Tensor→f32 cache copies.
 **Rule:** To eliminate O(n²) KV cache append cost: (1) allocate max-sized flat f32 buffers per layer, memcpy new K/V at current position (O(1) per step per head); (2) add `head_stride` param to attention_f32 so it can index into pre-allocated (non-compact) buffers with gaps; (3) persist Q8Workspace as a Talker field to avoid Vec::new per forward_step call. The key saving is avoiding `Tensor::to_vec1` on the growing KV cache (one full-cache copy per layer per step).
 **Source:** feat(talker): pre-allocated KV cache + persistent Q8Workspace
+
+---
+## Lesson #30 — 2026-06-15
+**Trigger:** forward_step had ~10 Tensor round-trips per layer (reshape, permute, narrow, from_slice, to_vec1). The fused f32 path replaced them all with direct f32 ops on pre-allocated buffers.
+**Rule:** When implementing a fused CPU forward path for M=1 inference: (1) store norm weight data as `Vec<f32>` at load time (from `RmsNorm.weight().to_vec1()`) to avoid Tensor indirection on the hot path; (2) pre-allocate scratch buffers in a `FusedScratch` struct — `normed` (d_model, reused as main state), `residual` (d_model), and `ffn_mid` (ffn_dim); (3) call `Q8Weights::gemv` directly on raw `&[f32]` slices instead of going through the Tensor-wrapping `q8_linear`; (4) compute RoPE table as a flat `Vec<f32>` with `[max_seq, head_dim]` layout, indexed by position — avoid Tensor `{cos,sin}` calls by computing f64 angles directly. The remaining allocation on the fused path is the final output Vec (one `rms_norm_f32` call per step) plus each `gemv` result Vec (inevitable O(output_dim) allocation).
+**Source:** feat(talker): add fused M=1 CPU forward path (forward_step_fused)
+
+---
+## Lesson #31 — 2026-06-15
+**Trigger:** `forward_step_fused` used `cfg.max_seq_len` (model config, 32768) as `head_stride` for `attention_f32`, but the KV cache was created with a smaller `max_seq` (2048), causing out-of-bounds access at `k[k_base + t*hd]` where `k_base = kv_h * head_stride * hd` overflowed the cache buffer.
+**Rule:** When passing a pre-allocated flat buffer's stride/layout parameter to a downstream function, derive the stride from the buffer itself (via a getter method), not from a configuration value that could diverge. For `KvCacheFlat`, add a `head_stride()` method that returns `self.max_seq` and use that everywhere instead of a separately-obtained `max_seq_len`.
+**Source:** feat: benchmark fused f32 path
+
+---
+## Lesson #32 — 2026-06-15
+**Trigger:** `PredScratch::q_buf` was sized `pred_hidden` (1024) and reused across `attn_q` (output `attn_dim` = 2048), `attn_o` (output `pred_hidden` = 1024), and `ffn_down` (output `pred_hidden` = 1024). But `gemv_into` requires `dst.len() == self.n` exactly — cannot pass a larger buffer.
+**Rule:** When a scratch buffer must serve multiple `gemv_into` calls with different output dimensions, allocate separate buffers for each distinct size. Do not try to size `max(n1, n2)` unless every caller writes with the same `n`. Prefer `attn_q_buf: Vec<f32>` (sized attn_dim) vs `q_buf: Vec<f32>` (sized pred_hidden) over a single unified buffer.
+**Source:** feat: benchmark fused f32 path
+
+---
+## Lesson #33 — 2026-06-15
+**Trigger:** Multi-level parallel optimization (QKV fusion, head-level par, element-wise par) improved talker by 8.8% (68→63ms/step) but predictor stayed unchanged. The bottleneck was f32 matmul (project_f32, apply_lm_head_f32), not Q8 ops.
+**Rule:** Before adding parallelism, profile to identify the actual bottleneck. Q8 GEMV is memory-bandwidth-bound — adding more CPU cores to a memory-bound op yields diminishing returns. Head-level parallelism helps when head_dim ops are compute-bound (norm, RoPE, attention) but does not help when the bottleneck is reading weight data from DRAM (gemv). Check compute-to-memory ratio before deciding where to add threads.
+**Source:** 2026-06-15-multi-level-parallel-optimization

@@ -89,20 +89,22 @@ pub struct CodePredictor {
     codec_embd: Vec<Tensor>,
     /// Flat per-codebook embeddings — each [vocab_size * talker_hidden] row-major.
     codec_embd_f32: Vec<Vec<f32>>,
+    /// Q8 quantized codec_embd tables — each [vocab_size, talker_hidden] row-major Q8 blocks.
+    codec_embd_q8: Vec<Q8Weights>,
     /// Linear heads, one per acoustic codebook (15 heads for c1..c15).
     /// lm_head[g] maps pred_hidden → vocab_size logits for codebook g+1.
     /// Shape: [vocab_size, pred_hidden] = [2048, 1024].
     #[allow(dead_code)]
     lm_heads: Vec<Tensor>,
-    /// Flat per-head weights — each [vocab_size * pred_hidden] row-major.
-    lm_heads_f32: Vec<Vec<f32>>,
+    /// Q8 quantized lm_heads — each [vocab_size, pred_hidden] row-major Q8 blocks.
+    lm_heads_q8: Vec<Q8Weights>,
     /// MTP projection: talker_hidden → pred_hidden.
     /// Shape: [pred_hidden, talker_hidden] = [1024, 2048].
     #[allow(dead_code)]
     mtp_proj_w: Option<Tensor>,
     mtp_proj_b: Option<Tensor>,
-    /// Flat MTP projection weight — [pred_hidden * talker_hidden] row-major.
-    mtp_proj_w_f32: Vec<f32>,
+    /// Q8 quantized MTP projection weight — [pred_hidden, talker_hidden] row-major.
+    mtp_proj_q8: Option<Q8Weights>,
     /// Flat MTP projection bias — [pred_hidden] or empty.
     mtp_proj_b_f32: Vec<f32>,
     /// Output norm weight + eps (applied after last transformer layer).
@@ -323,6 +325,11 @@ impl CodePredictor {
         let mtp_proj_w_f32 = mtp_proj_w.as_ref()
             .map(|t| t.flatten_all().unwrap().to_vec1().unwrap())
             .unwrap_or_default();
+        let mtp_proj_q8 = if !mtp_proj_w_f32.is_empty() {
+            Some(Q8Weights::from_f32_data(&mtp_proj_w_f32, pred_hidden, talker_hidden))
+        } else {
+            None
+        };
         let mtp_proj_b =
             if content.tensor_infos.contains_key("code_pred.mtp_proj.bias") {
                 Some(load_f32("code_pred.mtp_proj.bias", &mut *file)?)
@@ -346,6 +353,7 @@ impl CodePredictor {
         let num_embd = num_acoustic.saturating_sub(1); // 14
         let mut codec_embd = Vec::with_capacity(num_embd);
         let mut codec_embd_f32 = Vec::with_capacity(num_embd);
+        let mut codec_embd_q8 = Vec::with_capacity(num_embd);
         for g in 0..num_embd {
             let name = format!("code_pred.codec_embd.{g}.weight");
             if content.tensor_infos.contains_key(&name) {
@@ -357,7 +365,8 @@ impl CodePredictor {
                 } else {
                     emb_t.flatten_all().unwrap().to_vec1().unwrap()
                 };
-                codec_embd_f32.push(flat);
+                codec_embd_f32.push(flat.clone());
+                codec_embd_q8.push(Q8Weights::from_f32_data(&flat, vocab_size, talker_hidden));
                 codec_embd.push(emb_t);
             } else {
                 anyhow::bail!("missing {name} — expected {num_embd} embedding tables");
@@ -366,7 +375,7 @@ impl CodePredictor {
 
         // ── linear heads ─────────────────────────────────────────────────
         let mut lm_heads = Vec::with_capacity(num_acoustic);
-        let mut lm_heads_f32 = Vec::with_capacity(num_acoustic);
+        let mut lm_heads_q8 = Vec::with_capacity(num_acoustic);
         for g in 0..num_acoustic {
             let name = format!("code_pred.lm_head.{g}.weight");
             if !content.tensor_infos.contains_key(&name) {
@@ -375,7 +384,8 @@ impl CodePredictor {
                 );
             }
             let head_t = load_f32(&name, &mut *file)?;
-            lm_heads_f32.push(head_t.flatten_all()?.to_vec1()?);
+            let flat = head_t.flatten_all()?.to_vec1()?;
+            lm_heads_q8.push(Q8Weights::from_f32_data(&flat, vocab_size, pred_hidden));
             lm_heads.push(head_t);
         }
 
@@ -455,11 +465,12 @@ impl CodePredictor {
             layers,
             codec_embd,
             codec_embd_f32,
+            codec_embd_q8,
             lm_heads,
-            lm_heads_f32,
+            lm_heads_q8,
             mtp_proj_w,
             mtp_proj_b,
-            mtp_proj_w_f32,
+            mtp_proj_q8,
             mtp_proj_b_f32,
             output_norm_w,
             output_norm_eps: output_norm_eps_val,
@@ -502,47 +513,49 @@ impl CodePredictor {
 
     // ── f32 projection/lm_head/embed (allocation-free, no Tensor) ──────
 
-    /// Project `[talker_hidden]` → `[pred_hidden]` via mtp_proj (raw f32 matmul).
-    fn project_f32(&self, x: &[f32]) -> Vec<f32> {
+    /// Project `[talker_hidden]` → `[pred_hidden]` via mtp_proj (Q8 gemv).
+    fn project_f32(&mut self, x: &[f32]) -> Vec<f32> {
         let n_out = self.pred_hidden;
-        let n_in = self.talker_hidden;
-        let w = &self.mtp_proj_w_f32;
-        let mut y = if self.mtp_proj_b_f32.len() == n_out {
-            self.mtp_proj_b_f32.clone()
-        } else {
-            vec![0.0f32; n_out]
-        };
-        for i in 0..n_out {
-            let row_start = i * n_in;
-            for j in 0..n_in {
-                y[i] += w[row_start + j] * x[j];
+        let mut dst = vec![0.0f32; n_out];
+        if let Some(ref proj_q8) = self.mtp_proj_q8 {
+            proj_q8.gemv_into(x, &mut self.q8_ws, &mut dst);
+        }
+        // Add bias
+        if self.mtp_proj_b_f32.len() == n_out {
+            for (d, b) in dst.iter_mut().zip(self.mtp_proj_b_f32.iter()) {
+                *d += b;
             }
         }
-        y
+        dst
     }
 
-    /// Apply lm_head `g` to `[pred_hidden]` → `[vocab_size]` logits (raw f32 matmul).
-    fn apply_lm_head_f32(&self, g: usize, h: &[f32]) -> Vec<f32> {
-        let w = &self.lm_heads_f32[g];
-        let vocab = self.vocab_size;
-        let pred_h = self.pred_hidden;
-        let mut logits = vec![0.0f32; vocab];
-        for i in 0..vocab {
-            let row_start = i * pred_h;
-            for j in 0..pred_h {
-                logits[i] += w[row_start + j] * h[j];
-            }
-        }
+    /// Apply lm_head `g` to `[pred_hidden]` → `[vocab_size]` logits (Q8 gemv).
+    fn apply_lm_head_f32(&mut self, g: usize, h: &[f32]) -> Vec<f32> {
+        let mut logits = vec![0.0f32; self.vocab_size];
+        self.lm_heads_q8[g].gemv_into(h, &mut self.q8_ws, &mut logits);
         logits
     }
 
-    /// Look up token from `codec_embd[g]` and project → `[pred_hidden]`.
-    fn embed_codec_f32(&self, g: usize, token_id: u32) -> Vec<f32> {
-        let table = &self.codec_embd_f32[g];
-        let n_in = self.talker_hidden;
-        let offset = (token_id as usize) * n_in;
-        let row = &table[offset..offset + n_in];
-        self.project_f32(row)
+    /// Look up token from `codec_embd_q8[g]` and project → `[pred_hidden]`.
+    ///
+    /// Uses Q8 row lookup + `gemv_into_quantized` to avoid f32 dequantize
+    /// of the codec_embd row and the subsequent f32 matmul — one fused step.
+    fn embed_codec_f32(&mut self, g: usize, token_id: u32) -> Vec<f32> {
+        let row_blocks = self.codec_embd_q8[g].row_blocks(token_id as usize);
+        // Inject pre-quantized input (skips f32→Q8 quantize step)
+        self.q8_ws.set_quantized_input(row_blocks);
+        let n_out = self.pred_hidden;
+        let mut dst = vec![0.0f32; n_out];
+        if let Some(ref proj_q8) = self.mtp_proj_q8 {
+            proj_q8.gemv_into_quantized(&self.q8_ws, &mut dst);
+        }
+        // Add bias
+        if self.mtp_proj_b_f32.len() == n_out {
+            for (d, b) in dst.iter_mut().zip(self.mtp_proj_b_f32.iter()) {
+                *d += b;
+            }
+        }
+        dst
     }
 
     /// Fused f32 forward for one position — zero Tensor round-trips on the hot path.

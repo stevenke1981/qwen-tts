@@ -109,6 +109,25 @@ impl Q8Weights {
     pub fn from_raw(n: usize, k: usize, bpr: usize, padded_k: usize, data: Vec<BlockQ8_0>) -> Self {
         Self { n, k, blocks_per_row: bpr, padded_k, data }
     }
+
+    /// Construct Q8_0 weights by quantizing f32 data.
+    ///
+    /// `data`: `[n × k]` f32 in row-major layout.
+    /// `n`: number of output features (rows).
+    /// `k`: number of input features (columns).
+    pub fn from_f32_data(data: &[f32], n: usize, k: usize) -> Self {
+        let bpr = k.div_ceil(QK8_0);
+        let padded_k = bpr * QK8_0;
+        let total_blocks = n * bpr;
+        let mut q8 = vec![BlockQ8_0::zeros(); total_blocks];
+        for row in 0..n {
+            let mut row_data = data[row * k..(row + 1) * k].to_vec();
+            row_data.resize(padded_k, 0.0);
+            let dst = &mut q8[row * bpr..(row + 1) * bpr];
+            <BlockQ8_0 as GgmlType>::from_float(&row_data, dst);
+        }
+        Self { n, k, blocks_per_row: bpr, padded_k, data: q8 }
+    }
 }
 
 // ── workspace ─────────────────────────────────────────────────────────
@@ -138,6 +157,15 @@ impl Q8Workspace {
         if self.x_q.len() < bpr {
             self.x_q.resize(bpr, BlockQ8_0::zeros());
         }
+    }
+
+    /// Copy externally-quantized Q8 blocks into the workspace.
+    ///
+    /// After calling this, use [`Q8Weights::gemv_into_quantized`] to compute
+    /// the GEMV without re-quantizing.
+    pub fn set_quantized_input(&mut self, blocks: &[BlockQ8_0]) {
+        self.ensure_xq(blocks.len());
+        self.x_q[..blocks.len()].clone_from_slice(blocks);
     }
 
     /// Quantize `x` (length `k`) into the workspace's `x_q` buffer.
