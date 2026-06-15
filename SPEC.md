@@ -1,148 +1,98 @@
-# SPEC.md — Qwen TTS
+# SPEC.md - Qwen TTS
 
-## Goal
+## Product Goal
 
-Build a Rust local text-to-speech app using Qwen3-TTS GGUF models.
+Build a local Qwen3-TTS application whose production inference path is written
+in Rust and consumes Qwen3-TTS GGUF models directly.
 
-The architecture must support:
+The product must provide:
 
-- GGUF model inspection.
-- Default GGUF model download into `./models`.
-- Text-to-WAV generation through qwentts.cpp.
-- A clean Rust runtime abstraction.
-- A native egui GUI for setup and synthesis.
-- Future native CPU/CUDA/ROCm/Metal/WGPU/SYCL backend implementations.
-- Future streaming playback.
+- Native Rust CLI and egui GUI.
+- GGUF model inspection, download, and configuration.
+- Pure Rust prompt construction, Talker, Code Predictor, codec decode, sampling,
+  WAV output, and optional streaming.
+- Language, speaker, instruct, and reference-audio modes.
+- CPU performance comparable to the existing qwentts.cpp FFI reference.
+- Optional Rust-managed accelerator backends after CPU parity is established.
 
-## Non-goals for MVP
+## Reference And Release Policy
 
-- Full native Qwen3-TTS graph execution in pure Rust.
-- Training or fine-tuning.
-- Real-time voice cloning UI.
+- qwentts.cpp/FFI is a temporary development oracle for behavior, stage dumps,
+  audio quality, and benchmark comparison.
+- The strict release path must not load `qwen.dll`, GGML DLLs, or
+  `qwen-tts-sys`.
+- After parity and performance acceptance, C++ vendor/FFI code is removed from
+  the product workspace or retained only in an excluded comparison tool.
 
-## Crate responsibilities
+## Performance Targets
+
+Reference workload: 128 generated codec frames on the designated Windows CPU.
+
+- Warm synthesis target: <=5.0 s.
+- Warm synthesis stretch target: <=3.0 s.
+- Cold start target: <=7.0 s, including model load.
+- Time reports must include prompt, Talker, Code Predictor, codec, and WAV output.
+
+## Crate Responsibilities
 
 ### `crates/core`
 
-No GPU dependencies. Owns:
-
-- Model path structs.
-- GGUF header probe.
-- TTS graph description.
-- Audio buffer/spec types.
-- Common op enums.
+- Model paths, GGUF metadata, audio/WAV types, and backend-neutral contracts.
 
 ### `crates/runtime`
 
-Owns:
+- `RuntimeBackend`, scheduler, request/response types, configuration, logging,
+  model management, and output naming.
+- No inference implementation details.
 
-- `RuntimeBackend` trait.
-- `DeviceKind` enum.
-- `Scheduler`.
-- `SynthesisRequest` / `SynthesisResponse`.
-- `ExternalQwenTtsBackend`, which calls the qwentts.cpp CLI.
-- Default GGUF model catalog/status/download helpers.
+### `crates/backends/pure-rust`
 
-### `crates/app`
+- Prompt builder and tokenizer integration.
+- Q8_0 Talker and Code Predictor inference.
+- KV caches, sampling, special-token rules, and request-mode handling.
+- Rust CPU execution and optional Rust-managed accelerator features.
 
-Native egui desktop app:
+### `crates/codec`
 
-- Model folder status.
-- Default GGUF download button.
-- Text, language, speaker, device, runtime binary, and output path controls.
-- Background download and synthesis workers.
+- GGUF codec weights, RVQ decode, transformer, upsample, DAC, and chunked audio
+  decode.
 
-### `crates/backends/cpu`
+### `crates/cli` And `crates/app`
 
-Future native CPU backend. Suggested implementation path:
+- User interfaces only. The strict release defaults to `pure-rust` after its
+  acceptance gates pass.
 
-- `rayon` for parallel CPU scheduling.
-- `ndarray` or custom packed tensor views.
-- GGML-compatible quantized matmul kernels.
+### Reference-only crates
 
-### `crates/backends/cuda`
+- `crates/qwentts-sys`, `crates/backends/cpu`, and subprocess/FFI runtime paths
+  are temporary parity tools, not the final product architecture.
 
-Future native CUDA backend. Suggested implementation path:
-
-- `cudarc` or `cust` for CUDA driver/runtime integration.
-- Custom kernels for quantized matmul and codec decode hot paths.
-- Optional FFI bridge to qwentts.cpp first.
-
-### `crates/backends/rocm`
-
-Future native AMD GPU backend.
-
-- HIP bindings are likely required.
-- Keep this isolated because ROCm install/toolchain requirements differ from CUDA.
-
-### `crates/backends/metal`
-
-Future Apple Silicon backend.
-
-- `metal` crate or MLX-style integration.
-- Prioritize M-series devices because local TTS usage is common on Mac laptops.
-
-### `crates/backends/wgpu`
-
-Future cross-platform GPU fallback.
-
-- Useful for Vulkan/Metal/DX12 portability.
-- Start with compute experiments, not full graph execution.
-
-### `crates/backends/sycl`
-
-Future Intel / oneAPI / AdaptiveCpp backend.
-
-- Lower priority unless Intel GPU support becomes a hard requirement.
-
-### `crates/cli`
-
-Binary entrypoint:
-
-- `inspect`
-- `graph`
-- `models status`
-- `models download`
-- `setup-script`
-- `synth`
-
-## Data flow
+## Pure Rust Data Flow
 
 ```text
-text
-  ↓
-CLI parses request
-  ↓
-runtime scheduler selects backend
-  ↓
-ExternalQwenTtsBackend invokes qwen-tts
-  ↓
-talker GGUF → acoustic codes
-  ↓
-codec GGUF → 24 kHz mono WAV
-  ↓
-output.wav
+request
+  -> tokenizer + prompt builder
+  -> Talker prefill + KV cache
+  -> Talker codebook-0 sampling
+  -> Code Predictor codebooks 1-15
+  -> sum 16 codebook embeddings + text/pad overlay
+  -> repeat until EOS / frame limit
+  -> Rust codec chunk decode
+  -> 24 kHz mono PCM/WAV or streaming chunks
 ```
 
-## Error handling
+## Correctness Requirements
 
-- Missing executable returns `BackendError::Unavailable`.
-- Empty text returns `BackendError::InvalidRequest`.
-- Failed qwen-tts process returns `BackendError::CommandFailed` with stderr.
-- GGUF header errors return `GgufProbeError`.
+- No request field is silently ignored.
+- Argmax mode is used for deterministic stage parity.
+- Sampled mode is compared with structural/audio metrics when RNG algorithms
+  differ.
+- Every optimization must preserve finite outputs, token constraints, duration,
+  and documented numeric tolerances.
+- Unsupported model modes return explicit errors.
 
-## Future FFI design
+## Non-goals
 
-Add a new crate:
-
-```text
-crates/qwentts-sys/
-crates/qwentts-safe/
-```
-
-Suggested split:
-
-- `qwentts-sys`: bindgen-generated unsafe C ABI.
-- `qwentts-safe`: safe Rust wrapper with ownership, context lifetime, and error mapping.
-
-Then `runtime` can swap `ExternalQwenTtsBackend` for `QwenTtsFfiBackend` without changing CLI commands.
+- Training or fine-tuning.
+- Implementing every accelerator before CPU parity.
+- Bit-exact sampled audio when the reference and Rust RNG algorithms differ.

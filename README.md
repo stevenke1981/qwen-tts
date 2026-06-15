@@ -10,7 +10,7 @@ Four backends are available:
 | `ffi` | In-process FFI | ✅ (since v0.1) | Direct calls into qwentts.cpp shared library |
 | `qwentts` | Subprocess | | External `qwen-tts` CLI executable |
 | `native-cpu` | In-process FFI | | Wraps qwentts.cpp via `qwentts-sys` with WAV write in Rust |
-| `pure-rust` | Pure Rust (candle) | 🚧 WIP | Zero C++ dependency — candle 0.10.x, GGUF dequant→F32 |
+| `pure-rust` | Rust inference (candle + custom Q8) | WIP | No qwen.dll inference; strict native-dependency cleanup is still pending |
 
 ## Layout
 
@@ -23,7 +23,7 @@ qwen_tts/
 │   ├── runtime/       — Backend trait, scheduler, config, model download
 │   ├── backends/
 │   │   ├── cpu/       — Native CPU backend (FFI to qwentts.cpp)
-│   │   ├── pure-rust/ — Pure Rust backend (candle 0.10.x, no C++) 🚧
+│   │   ├── pure-rust/ — Rust Talker, Code Predictor, Q8 kernels, and codec integration
 │   │   ├── cuda/      — (skeleton)
 │   │   ├── rocm/      — (skeleton)
 │   │   ├── metal/     — (skeleton)
@@ -210,22 +210,18 @@ QWEN_TTS_BIN=/path/to/qwen-tts cargo run -p qwen-tts-cli -- synth --backend qwen
 - [x] Tensor naming + metadata correction for real qwen3-tts GGUF
 - [x] GGUF probe utilities for tensor/metadata discovery
 
-### 🚧 In Progress — Pure Rust Backend
-```
-Status: 83% (10/12 tasks)
+### In Progress - Pure Rust Backend
 
-Core modules      ■■■■■■■■■■  all implemented
-Unit tests        ■■■■■■■■■■  19/19 pass
-E2E structure     ■■■■■■■■■■  3/3 pass
-Heavy e2e (8GB+)  □□□□□□□□□□  #[ignore] — needs real GGUF load
-Codebook 0 pred   □□□□□□□□□□  placeholder (talker.codec_head.weight)
-MRoPE support     □□□□□□□□□□  talker uses standard RoPE, model needs MRoPE
-```
+- [x] Autoregressive Talker with KV cache and codebook-0 prediction
+- [x] Full Code Predictor transformer and acoustic codebook generation
+- [x] Custom Q8_0 GEMV and initial fused CPU operations
+- [x] Rust codec decoder integration
+- [ ] Port FFI-equivalent prompt construction and generation metadata
+- [ ] Sum all 16 codebook embeddings plus trailing text/TTS-pad overlay
+- [ ] Match token suppression, EOS, repetition penalty, and request modes
+- [ ] Reduce measured 128-frame CPU estimate from 25.733 s to <=5.0 s
+- [ ] Remove FFI and native tokenizer dependencies from the strict release graph
 
-### 📋 Next Steps
-- [ ] Run heavy E2E tests (`test_talker_loads`, `test_code_predictor_loads`, `test_pipeline_full_synthesize`) — requires ~8-10 GB RAM
-- [ ] Replace codebook-0 placeholder with actual `talker.codec_head.weight` prediction
-- [ ] Implement MRoPE (Multi-Resolution RoPE) for talker — see `qwen3-tts.talker.rope.mrope_section`
-- [ ] Implement autoregressive frame generation (recurrent hidden state)
-- [ ] Cross-validate: pure-rust output == FFI backend output (same seed, bit-exact)
-- [ ] Native CUDA / Metal / WGPU / ROCm / SYCL backends
+The detailed current status, benchmark, priorities, and acceptance gates are in
+[`TASKS.md`](TASKS.md). The FFI backend remains a development comparison oracle
+until the pure Rust parity and performance gates pass.
