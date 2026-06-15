@@ -624,7 +624,6 @@ impl Talker {
         let n_kv = cfg.n_kv_heads;
         let hd = cfg.head_dim();
         let head_dim_sum = n_heads * hd;
-        let n_repeat = n_heads / n_kv;
         let mut ws = Q8Workspace::new();
 
         for (i, layer) in self.layers.iter().enumerate() {

@@ -31,7 +31,7 @@
 use std::fs::File;
 
 use candle_core::quantized::gguf_file::Content;
-use candle_core::{Device, Module, Tensor, D};
+use candle_core::{Device, Tensor, D};
 use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
@@ -39,7 +39,7 @@ use crate::sampling;
 use crate::custom_ops::{attention_gqa_tensor, rms_norm_tensor};
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 use crate::talker::{
-    apply_per_head_norm, apply_rope, embed_token, linear_fwd, repeat_kv, DecoderLayer,
+    apply_per_head_norm, apply_rope, embed_token, linear_fwd, DecoderLayer,
 };
 
 /// Type alias: a frame of acoustic code token IDs (one per codebook level).
@@ -337,7 +337,6 @@ impl CodePredictor {
         let mut x = pred_input.clone();
         let (batch, _one, _d_model) = x.dims3()?;
         let head_dim_sum = self.n_q_heads * self.head_dim;
-        let n_repeat = self.n_q_heads / self.n_kv_heads;
 
         let cos_slice = self.cos.narrow(D::Minus2, pos, 1)?; // [1, 1, 1, head_dim]
         let sin_slice = self.sin.narrow(D::Minus2, pos, 1)?;

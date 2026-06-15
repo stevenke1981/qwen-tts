@@ -171,3 +171,9 @@
 **Trigger:** `ast_grep_replace` tool reported "APPLIED 28 replacements" but the file content on disk was never actually changed.
 **Rule:** When `ast_grep_replace` does not persist changes to disk, fall back to using the `edit` tool with `replaceAll=true` for bulk string replacements. Verify file content after every replace operation by reading a line.
 **Source:** q8_linear ws-parameter migration
+
+---
+## Lesson #25 — 2026-06-15
+**Trigger:** Custom attention_tensor at small cache sizes (kv_len<5) was slower than candle's native matmul due to to_vec1 copy overhead dominating the tiny computation.
+**Rule:** When replacing tensor ops with custom f32 ops, benchmark at representative sizes (not just microbenchmark). For tiny tensors (<10KB), tensor dispatch overhead is negligible and vanilla candle ops may be faster. For larger tensors (>100KB) or operations that scale with data size (attention grows with kv_len), custom f32 ops win due to fusion eliminating intermediate allocations.
+**Source:** qgemv GQA custom attention
