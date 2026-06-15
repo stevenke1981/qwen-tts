@@ -487,6 +487,105 @@ impl CodePredictor {
         dst
     }
 
+    // ── batched project / lm_head helpers ─────────────────────────────
+
+    /// Project `[m, talker_hidden]` → `[m, pred_hidden]` via mtp_proj (Q8 matmul_batched).
+    fn project_f32_batched(&mut self, x: &[f32], m: usize) -> Vec<f32> {
+        match &self.mtp_proj_q8 {
+            Some(w) => w.matmul_batched(x, m),
+            None => {
+                // No projection → just take first pred_hidden elements
+                let mut out = vec![0.0f32; m * self.pred_hidden];
+                for f in 0..m {
+                    let src = &x[f * self.talker_hidden..f * self.talker_hidden + self.pred_hidden];
+                    let dst = &mut out[f * self.pred_hidden..(f + 1) * self.pred_hidden];
+                    dst.copy_from_slice(src);
+                }
+                out
+            }
+        }
+    }
+
+    /// Apply lm_head `g` to `[m, pred_hidden]` → `[m, vocab_size]` logits (Q8 matmul_batched).
+    fn apply_lm_head_batched(&self, g: usize, h: &[f32], m: usize) -> Vec<f32> {
+        self.lm_heads_q8[g].matmul_batched(h, m)
+    }
+
+    // ── batched prediction (main API for N frames) ──────────────────────
+
+    /// Predict N audio code frames in a single batched forward pass.
+    ///
+    /// `talker_hidden_all`: `[n_frames, talker_hidden]` flattened.
+    /// `c0_embed_all`: `[n_frames, talker_hidden]` flattened.
+    ///
+    /// Returns `n_frames` code frames, each of `num_acoustic` token IDs.
+    pub fn predict_n_frames_batched(
+        &mut self,
+        talker_hidden_all: &[f32],
+        c0_embed_all: &[f32],
+        n_frames: usize,
+        temperature: f32,
+        top_k: Option<usize>,
+        top_p: Option<f32>,
+        rng: &mut impl rand::Rng,
+    ) -> Vec<CodeFrame> {
+        // Reset batched KV caches
+        for kc in &mut self.k_cache_batched {
+            for v in kc.iter_mut() {
+                v.clear();
+            }
+        }
+        for vc in &mut self.v_cache_batched {
+            for v in vc.iter_mut() {
+                v.clear();
+            }
+        }
+
+        let pred_h = self.pred_hidden;
+        let n_acoustic = self.num_acoustic;
+        let mut all_codes: Vec<Vec<u32>> = vec![Vec::with_capacity(n_acoustic); n_frames];
+
+        // Position 0: project and forward all frames
+        let proj_0 = self.project_f32_batched(talker_hidden_all, n_frames);
+        let _h0 = self.forward_at_pos_batched(0, &proj_0, n_frames);
+
+        // Position 1: project c0_embed_all, forward, lm_head[0], sample per frame
+        let proj_1 = self.project_f32_batched(c0_embed_all, n_frames);
+        let h1 = self.forward_at_pos_batched(1, &proj_1, n_frames);
+        let logits_0 = self.apply_lm_head_batched(0, &h1, n_frames);
+        for f in 0..n_frames {
+            let logits_f = &logits_0[f * self.vocab_size..(f + 1) * self.vocab_size];
+            let (code, _) = sampling::sample_token(
+                logits_f, temperature, top_k, top_p, rng, None, 1.0,
+            );
+            all_codes[f].push(code);
+        }
+
+        // Positions 2..(num_acoustic+1): embed per-frame code → project → forward → lm_head → sample
+        for g in 1..n_acoustic {
+            let mut proj = vec![0.0f32; n_frames * pred_h];
+            for f in 0..n_frames {
+                let prev_token = all_codes[f][g - 1];
+                let emb = self.embed_codec_f32(g - 1, prev_token);
+                let p_start = f * pred_h;
+                let proj_single = self.project_f32(&emb);
+                proj[p_start..p_start + pred_h].copy_from_slice(&proj_single);
+            }
+            let pos = g + 1; // positions 2..15
+            let h_v = self.forward_at_pos_batched(pos, &proj, n_frames);
+            let logits = self.apply_lm_head_batched(g, &h_v, n_frames);
+            for f in 0..n_frames {
+                let logits_f = &logits[f * self.vocab_size..(f + 1) * self.vocab_size];
+                let (code, _) = sampling::sample_token(
+                    logits_f, temperature, top_k, top_p, rng, None, 1.0,
+                );
+                all_codes[f].push(code);
+            }
+        }
+
+        all_codes.iter().map(|c| c.clone()).collect()
+    }
+
     /// Fused f32 forward for one position — zero Tensor round-trips on the hot path.
     ///
     /// All intermediate operations use raw f32 slices — no Tensor dispatch
