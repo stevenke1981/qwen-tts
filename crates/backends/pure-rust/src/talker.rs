@@ -57,7 +57,7 @@ pub struct Talker {
     device: Device,
 }
 
-struct DecoderLayer {
+pub(crate) struct DecoderLayer {
     attn_norm: RmsNorm,
     attn_q: Tensor,
     attn_k: Tensor,
@@ -732,7 +732,7 @@ impl Talker {
 /// `x`: any-rank tensor with last dim = `in_features`.
 ///
 /// Flattens all batch dims to 2D, applies `x @ W^T`, reshapes back.
-fn linear_fwd(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
+pub(crate) fn linear_fwd(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
     let x_dims = x.dims();
     let rank = x_dims.len();
     let bsz: usize = x_dims[..rank - 1].iter().product();
@@ -782,7 +782,7 @@ fn interleave(x: &Tensor, n: usize) -> Result<Tensor> {
     x.reshape(out_shape.as_slice())
 }
 
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+pub(crate) fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     // x: [batch, n_heads, seq_len, head_dim]
     let hd = x.dims()[3];
     let half = hd / 2;
@@ -792,7 +792,7 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(cos)? + rotated.broadcast_mul(sin)
 }
 
-fn repeat_kv(x: &Tensor, r: usize) -> Result<Tensor> {
+pub(crate) fn repeat_kv(x: &Tensor, r: usize) -> Result<Tensor> {
     if r == 1 { return Ok(x.clone()); }
     let s = x.dims();
     let x = x.unsqueeze(2)?;
@@ -800,7 +800,7 @@ fn repeat_kv(x: &Tensor, r: usize) -> Result<Tensor> {
     expanded.reshape(&[s[0], s[1] * r, s[2], s[3]])
 }
 
-fn build_causal_mask(n: usize, dev: &Device) -> Result<Tensor> {
+pub(crate) fn build_causal_mask(n: usize, dev: &Device) -> Result<Tensor> {
     let mut data = vec![0.0f32; n * n];
     for i in 0..n {
         for j in (i + 1)..n {
@@ -816,7 +816,7 @@ fn build_causal_mask(n: usize, dev: &Device) -> Result<Tensor> {
 /// `norm`: RmsNorm with weight `[head_dim]`
 ///
 /// Returns: `[batch, n_heads, seq_len, head_dim]`
-fn apply_per_head_norm(x: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
+pub(crate) fn apply_per_head_norm(x: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
     let shape = x.dims();
     let n_heads = shape[1];
     let seq_len = shape[2];
@@ -825,6 +825,22 @@ fn apply_per_head_norm(x: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
     let x_flat = x.reshape((shape[0] * n_heads * seq_len, head_dim))?;
     let x_normed = norm.forward(&x_flat)?;
     x_normed.reshape(shape)
+}
+
+/// General-purpose embedding lookup via index_select.
+///
+/// `weight`: `[vocab_size, d_model]` or `[d_model, vocab_size]` (transposed).
+/// Returns `[1, 1, d_model]`.
+pub(crate) fn embed_token(weight: &Tensor, token: u32, d_model: usize, device: &Device) -> Result<Tensor> {
+    // Normalize layout to [vocab_size, d_model]
+    let emb_w = if weight.dims()[0] == d_model {
+        weight.t()?
+    } else {
+        weight.clone()
+    };
+    let ids = Tensor::from_slice(&[token], (1,), device)?;
+    let result = emb_w.index_select(&ids, 0)?;
+    result.reshape((1, 1, d_model))
 }
 
 #[cfg(test)]
