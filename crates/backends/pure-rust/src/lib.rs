@@ -8,6 +8,7 @@ pub mod pipeline;
 pub mod qgemv;
 pub mod sampling;
 pub mod talker;
+pub mod timing;
 pub mod tokenizer;
 
 use std::io::BufWriter;
