@@ -137,14 +137,31 @@ struct PredScratch {
     h: Vec<f32>,
     /// FFN intermediate: SiLU(gate) * up (ffn_dim).
     ffn_mid: Vec<f32>,
+
+    // ── Pre-allocated GEMV output buffers (allocation-free hot path) ──
+    /// Q/attn_o/ffn_down projection output [pred_hidden].
+    q_buf: Vec<f32>,
+    /// K projection output [kv_dim].
+    k_buf: Vec<f32>,
+    /// V projection output [kv_dim].
+    v_buf: Vec<f32>,
+    /// FFN gate projection output [ffn_dim].
+    gate_buf: Vec<f32>,
+    /// FFN up projection output [ffn_dim].
+    up_buf: Vec<f32>,
 }
 
 impl PredScratch {
-    fn new(pred_hidden: usize, ffn_dim: usize) -> Self {
+    fn new(pred_hidden: usize, ffn_dim: usize, kv_dim: usize) -> Self {
         Self {
             residual: vec![0.0f32; pred_hidden],
             h: vec![0.0f32; pred_hidden],
             ffn_mid: vec![0.0f32; ffn_dim],
+            q_buf: vec![0.0f32; pred_hidden],
+            k_buf: vec![0.0f32; kv_dim],
+            v_buf: vec![0.0f32; kv_dim],
+            gate_buf: vec![0.0f32; ffn_dim],
+            up_buf: vec![0.0f32; ffn_dim],
         }
     }
 }
@@ -381,7 +398,11 @@ impl CodePredictor {
         let v_cache_data = vec![Vec::new(); n_layers];
 
         // Pre-allocated scratch buffers + Q8 workspace for fused path.
-        let pred_scratch = PredScratch::new(pred_hidden, ffn_dim);
+        let kv_dim = layers
+            .first()
+            .map(|l| l.attn_k.out_features())
+            .unwrap_or(pred_hidden);
+        let pred_scratch = PredScratch::new(pred_hidden, ffn_dim, kv_dim);
         let q8_ws = Q8Workspace::new();
 
         Ok(Self {
@@ -470,14 +491,14 @@ impl CodePredictor {
             scr.residual.copy_from_slice(&scr.h);
             rms_norm_f32_inplace(&mut scr.h, &layer.attn_norm_w, eps);
 
-            // ── QKV gemv ─────────────────────────────────────────────────
-            let q = layer.attn_q.gemv(&scr.h, &mut self.q8_ws);
-            let k = layer.attn_k.gemv(&scr.h, &mut self.q8_ws);
-            let v = layer.attn_v.gemv(&scr.h, &mut self.q8_ws);
+            // ── QKV gemv (allocation-free gemv_into) ──────────────────────
+            layer.attn_q.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.q_buf);
+            layer.attn_k.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.k_buf);
+            layer.attn_v.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.v_buf);
 
             // ── Per-head QK-norm ─────────────────────────────────────────
-            let q = per_head_rms_norm_f32(&q, &layer.attn_q_norm_w, n_qh, hd, eps);
-            let k = per_head_rms_norm_f32(&k, &layer.attn_k_norm_w, n_kvh, hd, eps);
+            let q = per_head_rms_norm_f32(&scr.q_buf, &layer.attn_q_norm_w, n_qh, hd, eps);
+            let k = per_head_rms_norm_f32(&scr.k_buf, &layer.attn_k_norm_w, n_kvh, hd, eps);
 
             // ── RoPE ─────────────────────────────────────────────────────
             let q = rope_f32(&q, cos, sin, n_qh, hd);
@@ -485,7 +506,7 @@ impl CodePredictor {
 
             // ── KV cache append ──────────────────────────────────────────
             self.k_cache_data[i].extend_from_slice(&k);
-            self.v_cache_data[i].extend_from_slice(&v); // V not normed/ROPEd
+            self.v_cache_data[i].extend_from_slice(&scr.v_buf); // V not normed/ROPEd
 
             // ── GQA attention ────────────────────────────────────────────
             let kv_len = self.k_cache_data[i].len() / kv_dim;
@@ -494,12 +515,12 @@ impl CodePredictor {
                 n_qh, n_kvh, kv_len, hd, kv_len,
             );
 
-            // ── Output projection gemv ───────────────────────────────────
-            let attn_proj = layer.attn_o.gemv(&attn, &mut self.q8_ws); // [pred_hidden]
+            // ── Output projection gemv into q_buf (reuse) ────────────────
+            layer.attn_o.gemv_into(&attn, &mut self.q8_ws, &mut scr.q_buf);
 
             // ── Residual add ─────────────────────────────────────────────
             for j in 0..pred_h {
-                scr.h[j] = scr.residual[j] + attn_proj[j];
+                scr.h[j] = scr.residual[j] + scr.q_buf[j];
             }
 
             // ── FFN residual save ────────────────────────────────────────
@@ -508,25 +529,25 @@ impl CodePredictor {
             // ── FFN norm (in-place) ──────────────────────────────────────
             rms_norm_f32_inplace(&mut scr.h, &layer.ffn_norm_w, eps);
 
-            // ── FFN gate + up gemv ───────────────────────────────────────
-            let gate = layer.ffn_gate.gemv(&scr.h, &mut self.q8_ws);
-            let up = layer.ffn_up.gemv(&scr.h, &mut self.q8_ws);
+            // ── FFN gate + up gemv (allocation-free) ─────────────────────
+            layer.ffn_gate.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.gate_buf);
+            layer.ffn_up.gemv_into(&scr.h, &mut self.q8_ws, &mut scr.up_buf);
 
             // ── SiLU(gate) * up → scr.ffn_mid ────────────────────────────
-            let ffn_dim = gate.len();
+            let ffn_dim = scr.gate_buf.len();
             let fm = &mut scr.ffn_mid[..ffn_dim];
             for j in 0..ffn_dim {
-                let g = gate[j];
+                let g = scr.gate_buf[j];
                 let sig = 1.0 / (1.0 + (-g as f64).exp()) as f32;
-                fm[j] = g * sig * up[j];
+                fm[j] = g * sig * scr.up_buf[j];
             }
 
-            // ── Down projection gemv ─────────────────────────────────────
-            let ffn_out = layer.ffn_down.gemv(fm, &mut self.q8_ws); // [pred_hidden]
+            // ── Down projection gemv into q_buf (reuse) ──────────────────
+            layer.ffn_down.gemv_into(fm, &mut self.q8_ws, &mut scr.q_buf);
 
             // ── Residual add ─────────────────────────────────────────────
             for j in 0..pred_h {
-                scr.h[j] = scr.residual[j] + ffn_out[j];
+                scr.h[j] = scr.residual[j] + scr.q_buf[j];
             }
         }
 

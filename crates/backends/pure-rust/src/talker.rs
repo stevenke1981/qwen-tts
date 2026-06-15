@@ -81,6 +81,18 @@ pub(crate) struct FusedScratch {
     pub(crate) normed: Vec<f32>,
     /// FFN intermediate: SiLU(gate) * up (ffn_dim).
     pub(crate) ffn_mid: Vec<f32>,
+
+    // ── Pre-allocated GEMV output buffers (allocation-free hot path) ──
+    /// Q projection output [attn_dim] → reused for attn_o, ffn_down.
+    pub(crate) q_buf: Vec<f32>,
+    /// K projection output [kv_dim].
+    pub(crate) k_buf: Vec<f32>,
+    /// V projection output [kv_dim].
+    pub(crate) v_buf: Vec<f32>,
+    /// FFN gate projection output [ffn_dim].
+    pub(crate) gate_buf: Vec<f32>,
+    /// FFN up projection output [ffn_dim].
+    pub(crate) up_buf: Vec<f32>,
 }
 
 pub(crate) struct DecoderLayer {
@@ -199,11 +211,18 @@ impl FusedScratch {
     ///
     /// `d_model`: hidden dimension.
     /// `ffn_dim`: intermediate FFN dimension (for SiLU(gate) * up).
-    pub fn new(d_model: usize, ffn_dim: usize) -> Self {
+    /// `attn_dim`: Q projection output size (= n_heads × head_dim).
+    /// `kv_dim`: K/V projection output size (= n_kv_heads × head_dim).
+    pub fn new(d_model: usize, ffn_dim: usize, attn_dim: usize, kv_dim: usize) -> Self {
         Self {
             residual: vec![0.0f32; d_model],
             normed: vec![0.0f32; d_model],
             ffn_mid: vec![0.0f32; ffn_dim],
+            q_buf: vec![0.0f32; attn_dim],
+            k_buf: vec![0.0f32; kv_dim],
+            v_buf: vec![0.0f32; kv_dim],
+            gate_buf: vec![0.0f32; ffn_dim],
+            up_buf: vec![0.0f32; ffn_dim],
         }
     }
 }
@@ -341,7 +360,9 @@ impl Talker {
 
         // Size scratch buffers for the fused forward path.
         let ffn_dim = layers[0].ffn_gate.out_features();
-        let scratch = FusedScratch::new(cfg.d_model, ffn_dim);
+        let attn_dim = layers[0].attn_q.out_features();
+        let kv_dim = layers[0].attn_k.out_features();
+        let scratch = FusedScratch::new(cfg.d_model, ffn_dim, attn_dim, kv_dim);
 
         Ok(Self {
             config: cfg,
@@ -831,21 +852,21 @@ impl Talker {
             //  or the initial copy; compute norm in-place.)
             rms_norm_f32_inplace(h, &layer.attn_norm_w, eps);
 
-            // ── QKV projections ──────────────────────────────────────────
-            let q = layer.attn_q.gemv(h, &mut self.q8_ws); // [n_heads * hd]
-            let k = layer.attn_k.gemv(h, &mut self.q8_ws); // [n_kv * hd]
-            let v = layer.attn_v.gemv(h, &mut self.q8_ws); // [n_kv * hd]
+            // ── QKV projections (allocation-free gemv_into) ───────────────
+            layer.attn_q.gemv_into(h, &mut self.q8_ws, &mut scratch.q_buf);
+            layer.attn_k.gemv_into(h, &mut self.q8_ws, &mut scratch.k_buf);
+            layer.attn_v.gemv_into(h, &mut self.q8_ws, &mut scratch.v_buf);
 
             // ── Per-head QK-norm ─────────────────────────────────────────
-            let q = per_head_rms_norm_f32(&q, &layer.attn_q_norm_w, n_heads, hd, qk_eps);
-            let k = per_head_rms_norm_f32(&k, &layer.attn_k_norm_w, n_kv, hd, qk_eps);
+            let q = per_head_rms_norm_f32(&scratch.q_buf, &layer.attn_q_norm_w, n_heads, hd, qk_eps);
+            let k = per_head_rms_norm_f32(&scratch.k_buf, &layer.attn_k_norm_w, n_kv, hd, qk_eps);
 
             // ── RoPE ─────────────────────────────────────────────────────
             let q = rope_f32(&q, cos, sin, n_heads, hd);
             let k = rope_f32(&k, cos, sin, n_kv, hd);
 
             // ── KV cache append ──────────────────────────────────────────
-            cache.append(i, &k, &v);
+            cache.append(i, &k, &scratch.v_buf);
 
             // ── Attention ────────────────────────────────────────────────
             let attn_out_raw = attention_f32(
@@ -859,12 +880,12 @@ impl Talker {
                 max_seq, // head_stride
             );
 
-            // ── Output projection ────────────────────────────────────────
-            let attn_proj = layer.attn_o.gemv(&attn_out_raw, &mut self.q8_ws); // [d_model]
+            // ── Output projection into q_buf (reuse — attn_dim == d_model) ─
+            layer.attn_o.gemv_into(&attn_out_raw, &mut self.q8_ws, &mut scratch.q_buf);
 
-            // ── Residual: h = residual + attn_proj ───────────────────────
+            // ── Residual: h = residual + q_buf ───────────────────────────
             for j in 0..d_model {
-                h[j] = scratch.residual[j] + attn_proj[j];
+                h[j] = scratch.residual[j] + scratch.q_buf[j];
             }
 
             // ── Save residual again for FFN ──────────────────────────────
@@ -873,26 +894,26 @@ impl Talker {
             // ── Pre-FFN RMS norm: h → scratch.normed (in-place) ─────────
             rms_norm_f32_inplace(h, &layer.ffn_norm_w, eps);
 
-            // ── FFN gate + up (separate gemv — double quantize for now) ──
-            let gate = layer.ffn_gate.gemv(h, &mut self.q8_ws); // [ffn_dim]
-            let up = layer.ffn_up.gemv(h, &mut self.q8_ws);    // [ffn_dim]
+            // ── FFN gate + up (allocation-free gemv_into) ────────────────
+            layer.ffn_gate.gemv_into(h, &mut self.q8_ws, &mut scratch.gate_buf);
+            layer.ffn_up.gemv_into(h, &mut self.q8_ws, &mut scratch.up_buf);
 
             // ── SiLU(gate) * up → scratch.ffn_mid ────────────────────────
-            let ffn_dim = gate.len();
+            let ffn_dim = scratch.gate_buf.len();
             let scratch_ffn = &mut scratch.ffn_mid[..ffn_dim];
             for j in 0..ffn_dim {
-                let g = gate[j];
+                let g = scratch.gate_buf[j];
                 // sigmoid(x) = 1 / (1 + exp(-x))
                 let sig = 1.0 / (1.0 + (-g as f64).exp()) as f32;
-                scratch_ffn[j] = g * sig * up[j];
+                scratch_ffn[j] = g * sig * scratch.up_buf[j];
             }
 
-            // ── Down projection ──────────────────────────────────────────
-            let ffn_out = layer.ffn_down.gemv(scratch_ffn, &mut self.q8_ws); // [d_model]
+            // ── Down projection into q_buf (reuse — d_model) ─────────────
+            layer.ffn_down.gemv_into(scratch_ffn, &mut self.q8_ws, &mut scratch.q_buf);
 
-            // ── Residual: h = residual + ffn_out ─────────────────────────
+            // ── Residual: h = residual + q_buf ───────────────────────────
             for j in 0..d_model {
-                h[j] = scratch.residual[j] + ffn_out[j];
+                h[j] = scratch.residual[j] + scratch.q_buf[j];
             }
         }
 

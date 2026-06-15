@@ -151,7 +151,19 @@ impl Q8Weights {
     /// Single-threaded loop; no Rayon, no task dispatch overhead.
     /// Automatically uses AVX2 `vec_dot` when compiled with `target-cpu=native`.
     pub fn gemv(&self, x: &[f32], ws: &mut Q8Workspace) -> Vec<f32> {
-        assert_eq!(x.len(), self.k, "gemv: input length {} != k={}", x.len(), self.k);
+        let mut dst = vec![0.0f32; self.n];
+        self.gemv_into(x, ws, &mut dst);
+        dst
+    }
+
+    /// GEMV (M = 1) into a pre-allocated destination — allocation-free.
+    ///
+    /// `x`: `[k]` f32 — input activations.
+    /// `ws`: scratch buffers (reused to avoid allocations).
+    /// `dst`: `[n]` f32 — pre-allocated output buffer. Overwritten on return.
+    pub fn gemv_into(&self, x: &[f32], ws: &mut Q8Workspace, dst: &mut [f32]) {
+        assert_eq!(x.len(), self.k, "gemv_into: input length {} != k={}", x.len(), self.k);
+        assert_eq!(dst.len(), self.n, "gemv_into: dst length {} != n={}", dst.len(), self.n);
 
         ws.ensure_xq(self.blocks_per_row);
 
@@ -161,16 +173,15 @@ impl Q8Weights {
         ws.padded.resize(self.padded_k, 0.0);
         <BlockQ8_0 as GgmlType>::from_float(&ws.padded, &mut ws.x_q[..self.blocks_per_row]);
 
-        // 2. Parallel vec_dot across output rows.
+        // 2. Parallel vec_dot across output rows, writing directly into dst.
         let x_q_ref: &[BlockQ8_0] = &ws.x_q[..self.blocks_per_row];
         let padded_k = self.padded_k;
-        (0..self.n)
-            .into_par_iter()
-            .map(|row| {
+        dst.par_iter_mut()
+            .enumerate()
+            .for_each(|(row, d)| {
                 let w_row = self.row_blocks(row);
-                <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref)
-            })
-            .collect()
+                *d = <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref);
+            });
     }
 
     /// Batch matmul (M ≥ 1): `Y = X @ W^T`.
