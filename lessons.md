@@ -111,3 +111,9 @@
 **Trigger:** `Tensor::matmul()` in `candle-core` 0.10.x panicked with "shape mismatch" when given 2D weight and 3D hidden — unlike PyTorch/ggml, candle requires both operands to have the same rank.
 **Rule:** Before writing matmul operations with candle, check the rank of both tensors. If ranks differ (e.g., 2D weight [out, in] @ 3D hidden [B, T, in]), flatten the higher-rank tensor to 2D first: `x_2d = x.reshape((batch*seq_len, in_dim))`, compute `x_2d.matmul(&weight.t())`, then reshape back to original rank with new last dim. Extract this as a `linear_fwd(weight, x)` helper.
 **Source:** pure-rust matmul rank mismatch fix
+
+---
+## Lesson #15 — 2026-06-15
+**Trigger:** After rewriting the pipeline to use KV cache, the code predictor failed with `shape mismatch in matmul, lhs: [1024, 2048], rhs: [1, 2048, 1]` — `forward_step` returned 3D `[batch, 1, d_model]` but code predictor's `predict_one_frame_sampled` expected 2D `[batch, d_model]`. The original pipeline's `i((0, seq_len-1, ..))` reduced rank from 3D to 1D, then `.unsqueeze(0)` made it 2D; the new pipeline's `forward_step` returned 3D directly.
+**Rule:** When refactoring a pipeline function that changes intermediate tensor shapes, verify ALL downstream consumers accept the new shape. Use `squeeze()` / `unsqueeze()` explicitly at the call site to match the callee's expected rank rather than changing the callee's interface.
+**Source:** KV cache pipeline rewrite
