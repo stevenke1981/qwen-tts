@@ -36,10 +36,12 @@ use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
 use crate::sampling;
-use crate::custom_ops::{attention_gqa_tensor, rms_norm_tensor};
+use crate::custom_ops::{
+    attention_f32, per_head_rms_norm_f32, rms_norm_f32, rope_f32, silu_f32,
+};
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 use crate::talker::{
-    apply_per_head_norm, apply_rope, embed_token, linear_fwd, DecoderLayer,
+    embed_token, linear_fwd, DecoderLayer,
 };
 
 /// Type alias: a frame of acoustic code token IDs (one per codebook level).
@@ -68,6 +70,8 @@ pub struct CodePredictor {
     n_layers: usize,
     /// Maximum sequence length per frame (num_acoustic + 1 = 16).
     max_seq_len: usize,
+    /// FFN intermediate dimension (e.g., 3072 for 1.7B model).
+    ffn_dim: usize,
 
     // ── weights ───────────────────────────────────────────────────────────
     /// Transformer decoder layers (linear weights as Q8_0 quantized).
@@ -95,9 +99,11 @@ pub struct CodePredictor {
     sin: Tensor,
 
     // ── mutable per-frame state ───────────────────────────────────────────
-    /// Per-layer KV cache (re-initialised on each `predict_one_frame_*` call).
-    /// Each element is `Some((K, V))` after the first forward at that layer.
-    kv_cache: Vec<Option<(Tensor, Tensor)>>,
+    /// Flat f32 KV cache: per-layer vectors of flattened [n_kv_heads, kv_len, head_dim].
+    /// Avoids Tensor::cat overhead and keeps data as f32 slices for direct use
+    /// by attention_f32 (no to_vec1 copy needed).
+    k_cache_data: Vec<Vec<f32>>,
+    v_cache_data: Vec<Vec<f32>>,
 
     /// Device handle.
     device: Device,
@@ -279,7 +285,15 @@ impl CodePredictor {
         let cos = cos_v.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin_v.unsqueeze(0)?.unsqueeze(0)?;
 
-        let kv_cache = vec![None; n_layers];
+        // FFN intermediate dimension from first layer's ffn_gate (output rows).
+        let ffn_dim = layers
+            .first()
+            .map(|l| l.ffn_gate.out_features())
+            .unwrap_or(pred_hidden * 3);
+
+        // Pre-allocate flat f32 KV caches (per-layer, empty initially).
+        let k_cache_data = vec![Vec::new(); n_layers];
+        let v_cache_data = vec![Vec::new(); n_layers];
 
         Ok(Self {
             num_acoustic,
@@ -291,6 +305,7 @@ impl CodePredictor {
             vocab_size,
             n_layers,
             max_seq_len,
+            ffn_dim,
             layers,
             codec_embd,
             lm_heads,
@@ -300,7 +315,8 @@ impl CodePredictor {
             output_norm_eps: output_norm_eps_val,
             cos,
             sin,
-            kv_cache,
+            k_cache_data,
+            v_cache_data,
             device: device.clone(),
         })
     }
@@ -331,82 +347,107 @@ impl CodePredictor {
 
     /// Forward one position through all transformer layers, updating the KV cache.
     ///
+    /// All intermediate operations use raw f32 slices — no Tensor dispatch
+    /// for norm, RoPE, or attention. Only the I/O boundaries (input Tensor,
+    /// q8_linear projections, output Tensor) create tensors.
+    ///
     /// `pos`: absolute position in the sequence (0-based within this frame).
     /// `pred_input`: `[1, 1, pred_hidden]` — already projected.
     fn forward_at_pos(&mut self, pos: usize, pred_input: &Tensor) -> anyhow::Result<Tensor> {
         let mut x = pred_input.clone();
         let (batch, _one, _d_model) = x.dims3()?;
-        let head_dim_sum = self.n_q_heads * self.head_dim;
 
-        let cos_slice = self.cos.narrow(D::Minus2, pos, 1)?; // [1, 1, 1, head_dim]
-        let sin_slice = self.sin.narrow(D::Minus2, pos, 1)?;
+        // Derive head dimensions from the actual Q8 weight shapes (more
+        // reliable than metadata, which may differ per model variant).
+        let attn_dim = self.layers[0].attn_q.out_features(); // n_q_heads * head_dim
+        let kv_dim = self.layers[0].attn_k.out_features();   // n_kv_heads * head_dim
+        let n_qh = self.n_q_heads;
+        let n_kvh = self.n_kv_heads;
+        let hd = attn_dim / n_qh;
+        debug_assert_eq!(hd * n_kvh, kv_dim, "predictor KV dim mismatch");
+
+        // RoPE cos/sin at this position — extract once for all layers
+        let cos_t = self.cos.narrow(D::Minus2, pos, 1)?; // [1, 1, 1, hd]
+        let sin_t = self.sin.narrow(D::Minus2, pos, 1)?;
+        let cos_f32: Vec<f32> = cos_t.flatten_all()?.to_vec1()?;
+        let sin_f32: Vec<f32> = sin_t.flatten_all()?.to_vec1()?;
+
         let mut ws = Q8Workspace::new();
+        let eps = 1e-6_f64; // norm eps (same as talker default)
 
         for i in 0..self.n_layers {
             let layer = &self.layers[i];
             let residual = x.clone();
-            x = rms_norm_tensor(&x, layer.attn_norm.weight(), layer.attn_norm.eps())?;
 
-            // QKV projections (fused quantize)
-            let h_2d = x.reshape((batch, self.pred_hidden))?;
+            // ── Attn norm (custom f32) ───────────────────────────────────
+            let x_flat = x.flatten_all()?.to_vec1::<f32>()?;
+            let w_an = layer.attn_norm.weight().flatten_all()?.to_vec1::<f32>()?;
+            let x_normed = rms_norm_f32(&x_flat, &w_an, eps);
+            let x_t = Tensor::from_slice(&x_normed, (batch, 1, self.pred_hidden), &self.device)?;
+
+            // ── QKV projections (fused quantize) ──────────────────────────
+            let h_2d = x_t.reshape((batch, self.pred_hidden))?;
             let qkv = q8_linear_multi(
                 &[&layer.attn_q, &layer.attn_k, &layer.attn_v],
                 &h_2d, &mut ws,
             )?;
-            let q = &qkv[0]; let k = &qkv[1]; let v = &qkv[2];
 
-            // Reshape to multi-head: [B, n_heads, 1, head_dim]
-            let q = q.reshape((batch, self.n_q_heads, 1, self.head_dim))?;
-            let k = k.reshape((batch, self.n_kv_heads, 1, self.head_dim))?;
-            let v = v.reshape((batch, self.n_kv_heads, 1, self.head_dim))?;
+            // Extract f32 data — we'll operate directly on these slices
+            let q_f32: Vec<f32> = qkv[0].flatten_all()?.to_vec1()?; // [attn_dim]
+            let k_f32: Vec<f32> = qkv[1].flatten_all()?.to_vec1()?; // [kv_dim]
+            let v_f32: Vec<f32> = qkv[2].flatten_all()?.to_vec1()?; // [kv_dim]
 
-            // QK-norm (after reshape, before RoPE)
-            let q = apply_per_head_norm(&q, &layer.attn_q_norm)?;
-            let k = apply_per_head_norm(&k, &layer.attn_k_norm)?;
+            // ── Per-head QK-norm (f32 slice) ──────────────────────────────
+            let w_qn = layer.attn_q_norm.weight().flatten_all()?.to_vec1::<f32>()?;
+            let w_kn = layer.attn_k_norm.weight().flatten_all()?.to_vec1::<f32>()?;
+            let q_normed = per_head_rms_norm_f32(&q_f32, &w_qn, n_qh, hd, eps);
+            let k_normed = per_head_rms_norm_f32(&k_f32, &w_kn, n_kvh, hd, eps);
 
-            // 1D NEOX RoPE
-            let q = apply_rope(&q, &cos_slice, &sin_slice)?;
-            let k = apply_rope(&k, &cos_slice, &sin_slice)?;
+            // ── 1D NEOX RoPE (f32 slice) ─────────────────────────────────
+            let q_rope = rope_f32(&q_normed, &cos_f32, &sin_f32, n_qh, hd);
+            let k_rope = rope_f32(&k_normed, &cos_f32, &sin_f32, n_kvh, hd);
 
-            // KV cache update: append new K,V to cached
-            let (k_cache, v_cache) = match &self.kv_cache[i] {
-                Some((ck, cv)) => {
-                    let new_k = Tensor::cat(&[ck, &k], 2)?;
-                    let new_v = Tensor::cat(&[cv, &v], 2)?;
-                    self.kv_cache[i] = Some((new_k.clone(), new_v.clone()));
-                    (new_k, new_v)
-                }
-                None => {
-                    self.kv_cache[i] = Some((k.clone(), v.clone()));
-                    (k, v)
-                }
-            };
+            // ── KV cache append (flat Vec, no Tensor::cat) ───────────────
+            self.k_cache_data[i].extend_from_slice(&k_rope);
+            self.v_cache_data[i].extend_from_slice(&v_f32); // V is not normed/ROPEd
 
-            // GQA-aware attention (f32 slice, no repeat_kv needed)
-            let attn_out = attention_gqa_tensor(&q, &k_cache, &v_cache)?;
+            // ── GQA attention (f32 slice, no Tensor wrapper) ──────────────
+            let kv_len = self.k_cache_data[i].len() / kv_dim;
+            let attn_out_f32 = attention_f32(
+                &q_rope, &self.k_cache_data[i], &self.v_cache_data[i],
+                n_qh, n_kvh, kv_len, hd,
+            );
+            let attn_out = Tensor::from_slice(&attn_out_f32, (batch, 1, attn_dim), &self.device)?;
 
-            // Output projection
-            let attn_out = attn_out
-                .permute((0, 2, 1, 3))?
-                .reshape((batch, head_dim_sum))?;
+            // ── Output projection ────────────────────────────────────────
             let attn_proj = q8_linear(&layer.attn_o, &attn_out, &mut ws)?;
             x = (residual + attn_proj.reshape((batch, 1, self.pred_hidden))?)?;
 
-            // SwiGLU FFN (fused gate+up quantize)
+            // ── SwiGLU FFN (fused gate+up quantize) ─────────────────────
             let residual = x.clone();
-            x = rms_norm_tensor(&x, layer.ffn_norm.weight(), layer.ffn_norm.eps())?;
-            let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
-            let gate = candle_nn::ops::silu(&gu[0])?;
-            let up = gu[1].clone();
-            let hid = (gate * up)?;
-            let hid_out = q8_linear(&layer.ffn_down, &hid, &mut ws)?;
+            let x2_flat = x.flatten_all()?.to_vec1::<f32>()?;
+            let w_fn = layer.ffn_norm.weight().flatten_all()?.to_vec1::<f32>()?;
+            let x2_normed = rms_norm_f32(&x2_flat, &w_fn, eps);
+            let x2_t = Tensor::from_slice(&x2_normed, (batch, 1, self.pred_hidden), &self.device)?;
+            let h2_2d = x2_t.reshape((batch, self.pred_hidden))?;
+
+            let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h2_2d, &mut ws)?;
+            let gate_f32: Vec<f32> = gu[0].flatten_all()?.to_vec1()?;
+            let up_f32: Vec<f32> = gu[1].flatten_all()?.to_vec1()?;
+            let gate_act = silu_f32(&gate_f32);
+            let hid_f32: Vec<f32> = gate_act.iter().zip(&up_f32).map(|(g, u)| g * u).collect();
+            let hid_t = Tensor::from_slice(&hid_f32, (batch, 1, self.ffn_dim), &self.device)?;
+
+            let hid_out = q8_linear(&layer.ffn_down, &hid_t, &mut ws)?;
             x = (residual + hid_out.reshape((batch, 1, self.pred_hidden))?)?;
         }
 
         // Final output norm
         if let Some(ref w) = self.output_norm_w {
-            x = rms_norm_tensor(&x, w, self.output_norm_eps)?;
+            let x_flat = x.flatten_all()?.to_vec1::<f32>()?;
+            let w_o = w.flatten_all()?.to_vec1::<f32>()?;
+            let y = rms_norm_f32(&x_flat, &w_o, self.output_norm_eps);
+            x = Tensor::from_slice(&y, (batch, 1, self.pred_hidden), &self.device)?;
         }
 
         Ok(x)
@@ -440,8 +481,9 @@ impl CodePredictor {
         top_p: Option<f32>,
         rng: &mut impl rand::Rng,
     ) -> anyhow::Result<CodeFrame> {
-        // Reset KV cache (fresh per frame)
-        self.kv_cache = vec![None; self.n_layers];
+        // Reset KV cache (fresh per frame) — just clear the Vecs, no alloc.
+        for kc in &mut self.k_cache_data { kc.clear(); }
+        for vc in &mut self.v_cache_data { vc.clear(); }
 
         // ── Prefill position 0 ───────────────────────────────────────────
         // Input: talker hidden state → project → forward (no lm_head here)

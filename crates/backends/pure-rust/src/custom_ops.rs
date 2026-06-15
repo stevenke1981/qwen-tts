@@ -37,6 +37,85 @@ pub fn rms_norm_tensor(x: &Tensor, weight: &Tensor, eps: f64) -> candle_core::Re
     Tensor::from_slice(&y, x.dims(), x.device())
 }
 
+// ── Per-Head RMS Norm ──────────────────────────────────────────────────
+
+/// RMS Normalization applied per-head to a multi-head attention tensor.
+///
+/// `x`: `[n_heads * head_dim]` — flattened multi-head query or key.
+/// `weight`: `[head_dim]` — norm weight (shared across heads).
+/// `eps`: f64 — small constant.
+/// Returns `[n_heads * head_dim]` f32.
+pub fn per_head_rms_norm_f32(x: &[f32], weight: &[f32], n_heads: usize, head_dim: usize, eps: f64) -> Vec<f32> {
+    let mut out = Vec::with_capacity(x.len());
+    for h in 0..n_heads {
+        let start = h * head_dim;
+        let slice = &x[start..start + head_dim];
+        let mean_sq = slice.iter().map(|&v| v * v).sum::<f32>() / head_dim as f32;
+        let inv_rms = (1.0 / ((mean_sq as f64 + eps).sqrt())) as f32;
+        for d in 0..head_dim {
+            out.push(slice[d] * inv_rms * weight[d]);
+        }
+    }
+    out
+}
+
+/// Tensor wrapper: applies per-head RMS norm.
+///
+/// `x`: `[B, n_heads, 1, head_dim]`
+/// `weight`: `[head_dim]` norm weight.
+pub fn per_head_rms_norm_tensor(x: &Tensor, weight: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
+    let shape = x.dims();
+    let n_heads = shape[1];
+    let head_dim = shape[3];
+    let x_slice = x.flatten_all()?.to_vec1::<f32>()?;
+    let w_slice = weight.flatten_all()?.to_vec1::<f32>()?;
+    let y = per_head_rms_norm_f32(&x_slice, &w_slice, n_heads, head_dim, eps);
+    Tensor::from_slice(&y, shape, x.device())
+}
+
+// ── 1D NEOX RoPE ───────────────────────────────────────────────────────
+
+/// Apply 1D NEOX rotary position encoding on a flat f32 slice.
+///
+/// `x`: `[n_heads * head_dim]` — flattened query/key after reshape.
+/// `cos`: `[head_dim]` — cosine table for the current position.
+/// `sin`: `[head_dim]` — sine table for the current position.
+/// Returns `[n_heads * head_dim]` f32.
+pub fn rope_f32(x: &[f32], cos: &[f32], sin: &[f32], n_heads: usize, head_dim: usize) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = Vec::with_capacity(x.len());
+    for h in 0..n_heads {
+        let off = h * head_dim;
+        for d in 0..half {
+            let x1 = x[off + d];
+            let x2 = x[off + d + half];
+            out.push(x1 * cos[d] - x2 * sin[d]);
+        }
+        for d in 0..half {
+            let x1 = x[off + d];
+            let x2 = x[off + d + half];
+            out.push(x2 * cos[d] + x1 * sin[d]);
+        }
+    }
+    out
+}
+
+/// Tensor wrapper: applies 1D NEOX RoPE.
+///
+/// `x`: `[B, n_heads, 1, head_dim]`
+/// `cos`: `[1, 1, 1, head_dim]`
+/// `sin`: `[1, 1, 1, head_dim]`
+pub fn rope_tensor(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    let shape = x.dims();
+    let n_heads = shape[1];
+    let head_dim = shape[3];
+    let x_slice = x.flatten_all()?.to_vec1::<f32>()?;
+    let cos_slice = cos.flatten_all()?.to_vec1::<f32>()?;
+    let sin_slice = sin.flatten_all()?.to_vec1::<f32>()?;
+    let y = rope_f32(&x_slice, &cos_slice, &sin_slice, n_heads, head_dim);
+    Tensor::from_slice(&y, shape, x.device())
+}
+
 // ── SiLU (Sigmoid Linear Unit) ─────────────────────────────────────────
 
 /// SiLU activation on a flat f32 slice.
