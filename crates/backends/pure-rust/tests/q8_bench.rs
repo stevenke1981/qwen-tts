@@ -16,6 +16,7 @@ use candle_core::{Device, Tensor};
 
 use qwen_tts_backend_pure_rust::code_predictor::CodePredictor;
 use qwen_tts_backend_pure_rust::talker::{KvCache, Talker};
+use qwen_tts_backend_pure_rust::timing::TimingRecorder;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -202,6 +203,9 @@ fn bench_load_time() {
 fn bench_128_frames() {
     let device = Device::Cpu;
 
+    // Create timing recorder
+    let mut timing = TimingRecorder::new();
+
     // Load talker
     let path = talker_path();
     let t0 = Instant::now();
@@ -215,6 +219,11 @@ fn bench_128_frames() {
     let mut predictor =
         CodePredictor::from_gguf(&content, &mut file, &device).expect("load predictor");
     let load_predictor_s = t1.elapsed().as_secs_f64();
+
+    timing.record(
+        "model_load".into(), "load".into(),
+        load_talker_s + load_predictor_s, 0,
+    );
 
     println!(
         "=== 128-frame benchmark (Q8_0 GEMV) ==="
@@ -245,19 +254,22 @@ fn bench_128_frames() {
 
     // ---- Talker prefill (128 tokens, streaming) ----
     let mut talker_cache = KvCache::new(n_layers);
-    let mut talker_step_times: Vec<f64> = Vec::with_capacity(128);
 
-    for _step in 0..128 {
+    for step in 0..128 {
         let start = Instant::now();
         let _h = talker
             .forward_step(&input, &mut talker_cache, &cos, &sin)
             .expect("talker forward_step");
-        talker_step_times.push(start.elapsed().as_secs_f64());
+        timing.record(
+            "talker_step".into(), "step".into(),
+            start.elapsed().as_secs_f64(), step,
+        );
     }
 
     // Stats
-    let n_steps = talker_step_times.len() as f64;
-    let talker_total: f64 = talker_step_times.iter().sum();
+    let talker_total = timing.category_total("step");
+    let talker_step_events: Vec<_> = timing.events.iter().filter(|e| e.category == "step").collect();
+    let n_steps = talker_step_events.len() as f64;
     let talker_mean = talker_total / n_steps;
     println!("--- Talker 128-step ---");
     println!(
@@ -266,13 +278,13 @@ fn bench_128_frames() {
         talker_mean,
         1.0 / talker_mean,
     );
-    let first = talker_step_times[0];
-    let rest: Vec<f64> = talker_step_times[1..].to_vec();
-    let rest_mean = rest.iter().sum::<f64>() / rest.len() as f64;
-    println!(
-        "  first step (cold cache): {:.4}s  subsequent mean: {:.4}s",
-        first, rest_mean,
-    );
+    if let Some(first) = talker_step_events.first() {
+        println!(
+            "  first step (cold cache): {:.4}s  subsequent mean: {:.4}s",
+            first.duration_s,
+            (talker_total - first.duration_s) / (n_steps - 1.0),
+        );
+    }
 
     // ---- Code predictor: 128 frames ----
     // Use the last talker hidden state as input
@@ -281,12 +293,9 @@ fn bench_128_frames() {
     let c0_embed = Tensor::ones((1, 1, d_model), candle_core::DType::F32, &device)
         .expect("c0 embd");
 
-    let mut frame_times: Vec<f64> = Vec::with_capacity(128);
     let mut total_tokens = 0usize;
 
-    for _frame in 0..128 {
-        // We need mut for predictor's KV cache reset
-        // The predict_one_frame_sampled already resets cache internally.
+    for frame in 0..128 {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
@@ -302,12 +311,15 @@ fn bench_128_frames() {
                 &mut rng,
             )
             .expect("predict frame");
-        frame_times.push(start.elapsed().as_secs_f64());
+        timing.record(
+            "predictor_frame".into(), "frame".into(),
+            start.elapsed().as_secs_f64(), frame,
+        );
         total_tokens += 16; // 2 prefill + 14 decode
     }
 
-    let n_frames = frame_times.len() as f64;
-    let frame_total: f64 = frame_times.iter().sum();
+    let frame_total = timing.category_total("frame");
+    let n_frames = 128.0;
     let frame_mean = frame_total / n_frames;
     println!();
     println!("--- Code Predictor 128-frame ---");
@@ -324,9 +336,9 @@ fn bench_128_frames() {
     );
 
     // ---- Total synthesis estimate ----
-    let all_talker: f64 = talker_step_times.iter().sum();
-    let all_frames: f64 = frame_times.iter().sum();
-    let total = load_talker_s + load_predictor_s + all_talker + all_frames;
+    let all_talker = timing.category_total("step");
+    let all_frames = timing.category_total("frame");
+    let total = timing.category_total("load") + all_talker + all_frames;
     println!();
     println!("=== Total 128-frame synthesis estimate ===");
     println!(
@@ -339,7 +351,7 @@ fn bench_128_frames() {
     );
     println!(
         "  {:6.3}s  + load time",
-        load_talker_s + load_predictor_s
+        timing.category_total("load"),
     );
     println!(
         "  {:6.3}s  TOTAL (dominates: talker)",
@@ -349,6 +361,32 @@ fn bench_128_frames() {
         "  vs C++ FFI target: ~2-5s  (gap: {:.0}x)",
         total / 3.0
     );
+
+    // ---- Export timing results ----
+    let bench_dir = project_root()
+        .join("target")
+        .join("bench-results");
+    let _ = std::fs::create_dir_all(&bench_dir);
+    let json_path = bench_dir.join("bench_128_frames.json");
+    let csv_path = bench_dir.join("bench_128_frames.csv");
+    std::fs::write(&json_path, &timing.to_json())
+        .expect("write JSON results");
+    std::fs::write(&csv_path, &timing.to_csv())
+        .expect("write CSV results");
+    println!();
+    println!("Timing results written to:");
+    println!("  {}", json_path.display());
+    println!("  {}", csv_path.display());
+
+    // Print summary
+    let summary = timing.summary();
+    println!();
+    println!("=== Timing Summary ===");
+    for cat in ["load", "step", "frame", "decode"] {
+        if let Some(total) = summary.get(cat) {
+            println!("  {:<12} {:>8.3}s", cat, total);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
