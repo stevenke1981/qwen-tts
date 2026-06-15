@@ -9,6 +9,7 @@ license.workspace = true
 anyhow = "1"
 candle-core = "0.10"
 candle-nn = "0.10"
+rayon = "1.10"
 tokenizers = "0.21"
 rand = "0.8"
 log = "0.4"

@@ -1,11 +1,5 @@
-//! Custom single-threaded Q8_0 quantized matmul.
-//!
-//! candle's built-in `k_quants::matmul` uses Rayon `into_par_iter()` with chunk
-//! sizes 128-512, which adds debilitating overhead for M=1 autoregressive GEMV.
-//! This module provides a single-threaded alternative that is faster for the
-//! tiny matmuls (M ≤ 128, N ≈ 2048, K ≈ 2048) common in incremental decoding.
-//!
-//! Block size: Q8_0 = 32 values per block, 34 bytes per block.
+//! Custom Q8_0 quantized matmul with single-threaded quantization and
+//! optional multi-threaded vec_dot via Rayon.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -13,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use candle_core::quantized::gguf_file::Content;
 use candle_core::quantized::k_quants::{BlockQ8_0, GgmlType, QK8_0};
 use candle_core::Tensor;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Q8Weights — Q8_0 quantized weight matrix
@@ -126,7 +121,6 @@ impl Q8Weights {
 pub struct Q8Workspace {
     padded: Vec<f32>,
     x_q: Vec<BlockQ8_0>,
-    y: Vec<f32>,
 }
 
 impl Q8Workspace {
@@ -136,7 +130,6 @@ impl Q8Workspace {
         Self {
             padded: Vec::new(),
             x_q: Vec::new(),
-            y: Vec::new(),
         }
     }
 
@@ -162,20 +155,22 @@ impl Q8Weights {
 
         ws.ensure_xq(self.blocks_per_row);
 
-        // 1. Pad input and quantize into workspace buffers.
+        // 1. Pad input and quantize (single-threaded — fast, <10µs).
         ws.padded.clear();
         ws.padded.extend_from_slice(x);
         ws.padded.resize(self.padded_k, 0.0);
         <BlockQ8_0 as GgmlType>::from_float(&ws.padded, &mut ws.x_q[..self.blocks_per_row]);
 
-        // 2. Single-threaded GEMV.
-        ws.y.clear();
-        for row in 0..self.n {
-            let w_row = self.row_blocks(row);
-            ws.y.push(<BlockQ8_0 as GgmlType>::vec_dot(self.padded_k, w_row, &ws.x_q[..self.blocks_per_row]));
-        }
-
-        std::mem::take(&mut ws.y)
+        // 2. Parallel vec_dot across output rows.
+        let x_q_ref: &[BlockQ8_0] = &ws.x_q[..self.blocks_per_row];
+        let padded_k = self.padded_k;
+        (0..self.n)
+            .into_par_iter()
+            .map(|row| {
+                let w_row = self.row_blocks(row);
+                <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref)
+            })
+            .collect()
     }
 
     /// Batch matmul (M ≥ 1): `Y = X @ W^T`.
@@ -185,30 +180,41 @@ impl Q8Weights {
     /// `ws`: scratch buffers (reused to avoid allocations).
     /// Returns `[m, n]` f32 — flattened output.
     ///
-    /// Each input row is quantized independently, then dotted with every
-    /// weight row. Single-threaded but with sequential memory access.
-    pub fn matmul(&self, x: &[f32], m: usize, ws: &mut Q8Workspace) -> Vec<f32> {
+    /// Batch matmul: `Y = X @ W^T`.
+    ///
+    /// Parallelizes across input rows. Each thread quantizes its own input
+    /// row independently, then computes vec_dot against all weight rows.
+    ///
+    /// `x`: `[m, k]` f32 flattened (row-major). `m`: number of rows.
+    /// Returns `[m, n]` f32 flattened.
+    pub fn matmul(&self, x: &[f32], m: usize, _ws: &mut Q8Workspace) -> Vec<f32> {
         assert_eq!(x.len(), m * self.k, "matmul: x.len {} != m*k={}", x.len(), m * self.k);
 
-        ws.ensure_xq(self.blocks_per_row);
+        let k = self.k;
+        let padded_k = self.padded_k;
+        let bpr = self.blocks_per_row;
+        let n = self.n;
 
-        ws.y.clear();
-        for row_idx in 0..m {
-            let x_row = &x[row_idx * self.k..(row_idx + 1) * self.k];
+        (0..m)
+            .into_par_iter()
+            .flat_map(|row_idx| {
+                let x_row = &x[row_idx * k..(row_idx + 1) * k];
 
-            // Pad and quantize
-            ws.padded.clear();
-            ws.padded.extend_from_slice(x_row);
-            ws.padded.resize(self.padded_k, 0.0);
-            <BlockQ8_0 as GgmlType>::from_float(&ws.padded, &mut ws.x_q[..self.blocks_per_row]);
+                // Per-row quantize (small local alloc — unavoidable with parallel rows)
+                let mut local_padded = Vec::with_capacity(padded_k);
+                local_padded.extend_from_slice(x_row);
+                local_padded.resize(padded_k, 0.0);
+                let mut local_x_q = vec![BlockQ8_0::zeros(); bpr];
+                <BlockQ8_0 as GgmlType>::from_float(&local_padded, &mut local_x_q);
 
-            for col_idx in 0..self.n {
-                let w_row = self.row_blocks(col_idx);
-                ws.y.push(<BlockQ8_0 as GgmlType>::vec_dot(self.padded_k, w_row, &ws.x_q[..self.blocks_per_row]));
-            }
-        }
-
-        std::mem::take(&mut ws.y)
+                (0..n)
+                    .map(|col_idx| {
+                        let w_row = self.row_blocks(col_idx);
+                        <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, &local_x_q)
+                    })
+                    .collect::<Vec<f32>>()
+            })
+            .collect()
     }
 }
 
