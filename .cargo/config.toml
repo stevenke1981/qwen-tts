@@ -1,0 +1,4 @@
+[build]
+# Enable AVX2+FMA for candle's Q8_0 vec_dot (otherwise it falls back to
+# a ~5× slower scalar loop). Required for performant Q8_0 GEMV.
+rustflags = ["-C", "target-cpu=native"]

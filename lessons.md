@@ -159,3 +159,9 @@
 **Trigger:** Release mode benchmark showed 21× speedup over debug mode (513s → 24s for 4-frame E2E test), confirming debug mode F32 matmul as the real bottleneck.
 **Rule:** Before spending time on algorithmic optimizations (KV cache pre-alloc, F16, etc.), always benchmark in release mode first. The debug/release gap for candle F32 matmuls can be ~100× due to naive scalar loops vs SIMD auto-vectorization.
 **Source:** Release mode benchmark
+
+---
+## Lesson #23 — 2026-06-15
+**Trigger:** Implemented custom Q8_0 GEMV and discovered that `BlockQ8_0` fields (`d`, `qs`) are `pub(crate)` in candle-core 0.10.2, making them inaccessible from external crates.
+**Rule:** When using quantized block types from candle-core, create and fill them via the public `GgmlType` trait methods (`zeros()` for allocation, `from_float()` for quantization) rather than trying to access fields directly or use raw byte manipulation. The `vec_dot()` method also requires the element count `n` to be a multiple of `QK8_0` (32); always pad input to `ceil(k/32)*32` before quantizing.
+**Source:** qgemv implementation

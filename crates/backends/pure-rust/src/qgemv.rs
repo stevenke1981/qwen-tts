@@ -109,71 +109,106 @@ impl Q8Weights {
         &self.data[start..start + self.blocks_per_row]
     }
 
-    // ── internal helpers ─────────────────────────────────────────────────
+    /// Construct from pre-built Q8_0 data (for benchmarking).
+    #[doc(hidden)]
+    pub fn from_raw(n: usize, k: usize, bpr: usize, padded_k: usize, data: Vec<BlockQ8_0>) -> Self {
+        Self { n, k, blocks_per_row: bpr, padded_k, data }
+    }
+}
 
-    /// Quantize input to Q8_0, padding the last partial block with zeros.
-    ///
-    /// `x` must have length `self.k`. Returns a Q8_0 buffer of `blocks_per_row`
-    /// blocks, padded to `padded_k` floats before quantization.
-    fn quantize_input(&self, x: &[f32]) -> Vec<BlockQ8_0> {
-        let mut padded = x.to_vec();
-        padded.resize(self.padded_k, 0.0);
-        let mut x_q = vec![BlockQ8_0::zeros(); self.blocks_per_row];
-        <BlockQ8_0 as GgmlType>::from_float(&padded, &mut x_q);
-        x_q
+// ── workspace ─────────────────────────────────────────────────────────
+
+/// Reusable scratch buffers for allocation-free GEMV / matmul.
+///
+/// Create one of these per thread / per forward pass and pass to
+/// [`Q8Weights::gemv`] / [`Q8Weights::matmul`] to avoid repeated
+/// heap allocations on the hot path.
+pub struct Q8Workspace {
+    padded: Vec<f32>,
+    x_q: Vec<BlockQ8_0>,
+    y: Vec<f32>,
+}
+
+impl Q8Workspace {
+    /// Create an empty workspace. Buffers grow on first use and are then
+    /// reused via `clear`, avoiding further allocations.
+    pub fn new() -> Self {
+        Self {
+            padded: Vec::new(),
+            x_q: Vec::new(),
+            y: Vec::new(),
+        }
     }
 
-    // ── single-threaded matmul ────────────────────────────────────────────
+    /// Ensure `x_q` has at least `bpr` blocks (zero-filled).
+    fn ensure_xq(&mut self, bpr: usize) {
+        if self.x_q.len() < bpr {
+            self.x_q.resize(bpr, BlockQ8_0::zeros());
+        }
+    }
+}
 
+impl Q8Weights {
     /// GEMV (M = 1): `y = W @ x`.
     ///
     /// `x`: `[k]` f32 — input activations.
+    /// `ws`: scratch buffers (reused to avoid allocations).
     /// Returns `[n]` f32 — output.
     ///
-    /// Uses a single-threaded loop; no Rayon, no task dispatch overhead.
+    /// Single-threaded loop; no Rayon, no task dispatch overhead.
     /// Automatically uses AVX2 `vec_dot` when compiled with `target-cpu=native`.
-    pub fn gemv(&self, x: &[f32]) -> Vec<f32> {
+    pub fn gemv(&self, x: &[f32], ws: &mut Q8Workspace) -> Vec<f32> {
         assert_eq!(x.len(), self.k, "gemv: input length {} != k={}", x.len(), self.k);
 
-        // 1. Quantize input to Q8_0 once (stays hot in L1 cache).
-        let x_q = self.quantize_input(x);
+        ws.ensure_xq(self.blocks_per_row);
+
+        // 1. Pad input and quantize into workspace buffers.
+        ws.padded.clear();
+        ws.padded.extend_from_slice(x);
+        ws.padded.resize(self.padded_k, 0.0);
+        <BlockQ8_0 as GgmlType>::from_float(&ws.padded, &mut ws.x_q[..self.blocks_per_row]);
 
         // 2. Single-threaded GEMV.
-        // NOTE: vec_dot requires n to be a multiple of QK8_0 so we pass
-        // padded_k. The extra terms at positions >= k contribute 0 because
-        // both weight (padded during GGUF conversion) and input (padded
-        // above) are zero in the padding region.
-        let mut y = Vec::with_capacity(self.n);
+        ws.y.clear();
         for row in 0..self.n {
             let w_row = self.row_blocks(row);
-            y.push(<BlockQ8_0 as GgmlType>::vec_dot(self.padded_k, w_row, &x_q));
+            ws.y.push(<BlockQ8_0 as GgmlType>::vec_dot(self.padded_k, w_row, &ws.x_q[..self.blocks_per_row]));
         }
-        y
+
+        std::mem::take(&mut ws.y)
     }
 
     /// Batch matmul (M ≥ 1): `Y = X @ W^T`.
     ///
     /// `x`: `[m, k]` f32 — flattened input activations (row-major).
     /// `m`: number of rows.
+    /// `ws`: scratch buffers (reused to avoid allocations).
     /// Returns `[m, n]` f32 — flattened output.
     ///
     /// Each input row is quantized independently, then dotted with every
     /// weight row. Single-threaded but with sequential memory access.
-    pub fn matmul(&self, x: &[f32], m: usize) -> Vec<f32> {
+    pub fn matmul(&self, x: &[f32], m: usize, ws: &mut Q8Workspace) -> Vec<f32> {
         assert_eq!(x.len(), m * self.k, "matmul: x.len {} != m*k={}", x.len(), m * self.k);
 
-        let mut y = Vec::with_capacity(m * self.n);
+        ws.ensure_xq(self.blocks_per_row);
 
+        ws.y.clear();
         for row_idx in 0..m {
             let x_row = &x[row_idx * self.k..(row_idx + 1) * self.k];
-            let x_q = self.quantize_input(x_row);
+
+            // Pad and quantize
+            ws.padded.clear();
+            ws.padded.extend_from_slice(x_row);
+            ws.padded.resize(self.padded_k, 0.0);
+            <BlockQ8_0 as GgmlType>::from_float(&ws.padded, &mut ws.x_q[..self.blocks_per_row]);
 
             for col_idx in 0..self.n {
                 let w_row = self.row_blocks(col_idx);
-                y.push(<BlockQ8_0 as GgmlType>::vec_dot(self.padded_k, w_row, &x_q));
+                ws.y.push(<BlockQ8_0 as GgmlType>::vec_dot(self.padded_k, w_row, &ws.x_q[..self.blocks_per_row]));
             }
         }
-        y
+
+        std::mem::take(&mut ws.y)
     }
 }
 
@@ -186,8 +221,9 @@ impl Q8Weights {
 /// Handles arbitrary-rank input tensors: flattens all but the last dim,
 /// computes `x @ W^T`, and reshapes the result.
 ///
+/// `ws`: scratch workspace reused across calls to avoid allocations.
 /// Uses the single-threaded `gemv` (M=1) or `matmul` (M>1) internally.
-pub fn q8_linear(weights: &Q8Weights, x: &Tensor) -> anyhow::Result<Tensor> {
+pub fn q8_linear(weights: &Q8Weights, x: &Tensor, ws: &mut Q8Workspace) -> anyhow::Result<Tensor> {
     let x_dims = x.dims();
     let rank = x_dims.len();
     anyhow::ensure!(rank >= 1, "q8_linear: input must be at least 1D");
@@ -204,11 +240,11 @@ pub fn q8_linear(weights: &Q8Weights, x: &Tensor) -> anyhow::Result<Tensor> {
     let x_2d = x.reshape((bsz, in_features))?;
     let x_slice = x_2d.flatten_all()?.to_vec1::<f32>()?;
 
-    // Compute.
+    // Compute (reuses ws to avoid allocation on the hot path).
     let y_vec = if bsz == 1 {
-        weights.gemv(&x_slice)
+        weights.gemv(&x_slice, ws)
     } else {
-        weights.matmul(&x_slice, bsz)
+        weights.matmul(&x_slice, bsz, ws)
     };
 
     // Reshape back. Use from_slice (accepts &[usize] via Into<Shape>)
@@ -270,7 +306,8 @@ mod tests {
 
         // Input = [1.0; 64]
         let x = vec![1.0f32; k];
-        let y = w.gemv(&x);
+        let mut ws = Q8Workspace::new();
+        let y = w.gemv(&x, &mut ws);
 
         assert_eq!(y.len(), n);
         // Row 0: all weight 1.0 × input 1.0 = 64.0
@@ -311,9 +348,10 @@ mod tests {
 
         // Input.
         let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
+        let mut ws = Q8Workspace::new();
 
-        let y_gemv = w.gemv(&x);
-        let y_matmul = w.matmul(&x, 1);
+        let y_gemv = w.gemv(&x, &mut ws);
+        let y_matmul = w.matmul(&x, 1, &mut ws);
 
         assert_eq!(y_gemv.len(), n);
         assert_eq!(y_matmul.len(), n);
@@ -329,11 +367,11 @@ mod tests {
         // Also test M=3 batch matmul matches repeated GEMV.
         let m = 3usize;
         let x_batch: Vec<f32> = (0..m * k).map(|i| ((i * 3) % 50) as f32).collect();
-        let y_batch = w.matmul(&x_batch, m);
+        let y_batch = w.matmul(&x_batch, m, &mut ws);
 
         for batch_row in 0..m {
             let x_row = &x_batch[batch_row * k..(batch_row + 1) * k];
-            let y_single = w.gemv(x_row);
+            let y_single = w.gemv(x_row, &mut ws);
             let y_slice = &y_batch[batch_row * n..(batch_row + 1) * n];
             for j in 0..n {
                 assert!(
@@ -384,7 +422,8 @@ mod tests {
         let y_f32_vec: Vec<f32> = y_f32.flatten_all().unwrap().to_vec1().unwrap();
 
         // Q8 q8_linear.
-        let y_q8 = q8_linear(&w_q8, &x).unwrap();
+        let mut ws = Q8Workspace::new();
+        let y_q8 = q8_linear(&w_q8, &x, &mut ws).unwrap();
         let y_q8_vec: Vec<f32> = y_q8.flatten_all().unwrap().to_vec1().unwrap();
 
         // Should match within 5% tolerance (Q8_0 quantization error).
@@ -420,7 +459,8 @@ mod tests {
         }
         let w = Q8Weights { n, k, blocks_per_row: bpr, padded_k, data };
         let x = vec![0.5f32; k];
-        let y = w.gemv(&x);
+        let mut ws = Q8Workspace::new();
+        let y = w.gemv(&x, &mut ws);
         assert_eq!(y.len(), n);
         for &v in &y {
             assert!(v.is_finite(), "non-finite value in output: {v}");
@@ -446,15 +486,14 @@ mod tests {
         }
         let w = Q8Weights { n, k, blocks_per_row: bpr, padded_k, data };
         let x: Vec<f32> = (0..k).map(|i| ((i * 3) % 50) as f32).collect();
-        let y = w.gemv(&x);
+        let mut ws = Q8Workspace::new();
+        let y = w.gemv(&x, &mut ws);
         assert_eq!(y.len(), n);
         for &v in &y {
             assert!(v.is_finite(), "non-finite value in output: {v}");
         }
     }
 
-    /// Verify that GEMV with partial-block k produces roughly the same
-    /// result as the equivalent F32 dot product.
     #[test]
     fn test_gemv_partial_block_accuracy() {
         let (n, k) = (4usize, 43usize); // non-multiple of 32
@@ -483,7 +522,8 @@ mod tests {
             })
             .collect();
 
-        let y = w.gemv(&x);
+        let mut ws = Q8Workspace::new();
+        let y = w.gemv(&x, &mut ws);
         for j in 0..n {
             let diff = (y[j] - expected[j]).abs();
             let rel = diff / expected[j].abs().max(1e-6);

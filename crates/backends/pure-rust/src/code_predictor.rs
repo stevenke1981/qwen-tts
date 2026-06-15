@@ -36,7 +36,7 @@ use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
 use crate::sampling;
-use crate::qgemv::{q8_linear, Q8Weights};
+use crate::qgemv::{q8_linear, Q8Weights, Q8Workspace};
 use crate::talker::{
     apply_per_head_norm, apply_rope, embed_token, linear_fwd, repeat_kv, DecoderLayer,
 };
@@ -340,6 +340,7 @@ impl CodePredictor {
 
         let cos_slice = self.cos.narrow(D::Minus2, pos, 1)?; // [1, 1, 1, head_dim]
         let sin_slice = self.sin.narrow(D::Minus2, pos, 1)?;
+        let mut ws = Q8Workspace::new();
 
         for i in 0..self.n_layers {
             let layer = &self.layers[i];
@@ -348,9 +349,9 @@ impl CodePredictor {
 
             // QKV projections using Q8_0 quantized matmul
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let q = q8_linear(&layer.attn_q, &h_2d)?; // [B, n_q_hd * hd]
-            let k = q8_linear(&layer.attn_k, &h_2d)?; // [B, n_kv_hd * hd]
-            let v = q8_linear(&layer.attn_v, &h_2d)?; // [B, n_kv_hd * hd]
+            let q = q8_linear(&layer.attn_q, &h_2d, &mut ws)?; // [B, n_q_hd * hd]
+            let k = q8_linear(&layer.attn_k, &h_2d, &mut ws)?; // [B, n_kv_hd * hd]
+            let v = q8_linear(&layer.attn_v, &h_2d, &mut ws)?; // [B, n_kv_hd * hd]
 
             // Reshape to multi-head: [B, n_heads, 1, head_dim]
             let q = q.reshape((batch, self.n_q_heads, 1, self.head_dim))?;
@@ -402,17 +403,17 @@ impl CodePredictor {
             let attn_out = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch, head_dim_sum))?;
-            let attn_proj = q8_linear(&layer.attn_o, &attn_out)?;
+            let attn_proj = q8_linear(&layer.attn_o, &attn_out, &mut ws)?;
             x = (residual + attn_proj.reshape((batch, 1, self.pred_hidden))?)?;
 
             // SwiGLU FFN
             let residual = x.clone();
             x = layer.ffn_norm.forward(&x)?;
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d)?)?;
-            let up = q8_linear(&layer.ffn_up, &h_2d)?;
+            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d, &mut ws)?)?;
+            let up = q8_linear(&layer.ffn_up, &h_2d, &mut ws)?;
             let hid = (gate * up)?;
-            let hid_out = q8_linear(&layer.ffn_down, &hid)?;
+            let hid_out = q8_linear(&layer.ffn_down, &hid, &mut ws)?;
             x = (residual + hid_out.reshape((batch, 1, self.pred_hidden))?)?;
         }
 
