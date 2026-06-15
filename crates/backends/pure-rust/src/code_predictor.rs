@@ -599,76 +599,202 @@ impl CodePredictor {
             None => scr.h.clone(),
         }
     }
+} // ← closes impl CodePredictor
 
-    // ── batched helpers (M>1, parallel over sequences) ──────────────
+// ── batched helpers (free functions, no &self borrow) ─────────────
 
-    /// Apply RMS norm to each row of a batched [m, dim] matrix in-place.
-    fn rms_norm_batched_par(&self, h: &mut [f32], w: &[f32], m: usize, dim: usize) {
-        assert_eq!(h.len(), m * dim);
-        h.par_chunks_mut(dim)
-            .for_each(|row| rms_norm_f32_inplace(row, w, 1e-6_f64));
-    }
+/// Apply RMS norm to each row of a batched [m, dim] matrix in-place.
+fn rms_norm_batched_par(h: &mut [f32], w: &[f32], m: usize, dim: usize) {
+    assert_eq!(h.len(), m * dim);
+    h.par_chunks_mut(dim)
+        .for_each(|row| rms_norm_f32_inplace(row, w, 1e-6_f64));
+}
 
-    /// Apply per-head QK-norm to each sequence independently.
-    fn qk_norm_batched_par(
-        &self, x: &[f32], w: &[f32], m: usize, n_heads: usize, hd: usize,
-    ) -> Vec<f32> {
-        assert_eq!(x.len(), m * n_heads * hd);
-        (0..m).into_par_iter()
-            .flat_map(|seq| {
-                let x_s = &x[seq * n_heads * hd..(seq + 1) * n_heads * hd];
-                per_head_rms_norm_f32_par(x_s, w, n_heads, hd, 1e-6_f64)
-            })
-            .collect()
-    }
+/// Apply per-head QK-norm to each sequence independently.
+fn qk_norm_batched_par(
+    x: &[f32], w: &[f32], m: usize, n_heads: usize, hd: usize,
+) -> Vec<f32> {
+    assert_eq!(x.len(), m * n_heads * hd);
+    (0..m).into_par_iter()
+        .flat_map(|seq| {
+            let x_s = &x[seq * n_heads * hd..(seq + 1) * n_heads * hd];
+            per_head_rms_norm_f32_par(x_s, w, n_heads, hd, 1e-6_f64)
+        })
+        .collect()
+}
 
-    /// Apply RoPE to each sequence independently.
-    fn rope_batched_par(
-        &self, x: &[f32], cos: &[f32], sin: &[f32],
-        m: usize, n_heads: usize, hd: usize,
-    ) -> Vec<f32> {
-        assert_eq!(x.len(), m * n_heads * hd);
-        (0..m).into_par_iter()
-            .flat_map(|seq| {
-                let x_s = &x[seq * n_heads * hd..(seq + 1) * n_heads * hd];
-                rope_f32_par(x_s, cos, sin, n_heads, hd)
-            })
-            .collect()
-    }
+/// Apply RoPE to each sequence independently.
+fn rope_batched_par(
+    x: &[f32], cos: &[f32], sin: &[f32],
+    m: usize, n_heads: usize, hd: usize,
+) -> Vec<f32> {
+    assert_eq!(x.len(), m * n_heads * hd);
+    (0..m).into_par_iter()
+        .flat_map(|seq| {
+            let x_s = &x[seq * n_heads * hd..(seq + 1) * n_heads * hd];
+            rope_f32_par(x_s, cos, sin, n_heads, hd)
+        })
+        .collect()
+}
 
-    /// Apply SiLU to each row of a batched [m, dim] matrix.
-    fn silu_batched_par(&self, x: &[f32], m: usize, dim: usize) -> Vec<f32> {
-        assert_eq!(x.len(), m * dim);
-        (0..m).into_par_iter()
-            .flat_map(|seq| {
-                let x_s = &x[seq * dim..(seq + 1) * dim];
-                silu_f32_par(x_s)
-            })
-            .collect()
-    }
+/// Apply SiLU to each row of a batched [m, dim] matrix.
+fn silu_batched_par(x: &[f32], m: usize, dim: usize) -> Vec<f32> {
+    assert_eq!(x.len(), m * dim);
+    (0..m).into_par_iter()
+        .flat_map(|seq| {
+            let x_s = &x[seq * dim..(seq + 1) * dim];
+            silu_f32_par(x_s)
+        })
+        .collect()
+}
 
-    /// Attention for M independent sequences.
-    /// q: [m, n_q_heads, hd]
-    /// Returns: [m, n_q_heads * hd]
-    fn batch_attention_f32_par(
-        &self,
-        q: &[f32],
-        k_caches: &[&[f32]],
-        v_caches: &[&[f32]],
-        n_q_heads: usize,
-        n_kv_heads: usize,
-        hd: usize,
-        m: usize,
-    ) -> Vec<f32> {
-        (0..m).into_par_iter()
-            .flat_map(|seq| {
-                let q_s = &q[seq * n_q_heads * hd..(seq + 1) * n_q_heads * hd];
-                let k_s = k_caches[seq];
-                let v_s = v_caches[seq];
-                let kv_len = k_s.len() / (n_kv_heads * hd);
-                attention_f32_par(q_s, k_s, v_s, n_q_heads, n_kv_heads, kv_len, hd, kv_len)
-            })
-            .collect()
+/// Attention for M independent sequences.
+/// q: [m, n_q_heads, hd]
+/// Returns: [m, n_q_heads * hd]
+fn batch_attention_f32_par(
+    q: &[f32],
+    k_caches: &[&[f32]],
+    v_caches: &[&[f32]],
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    hd: usize,
+    m: usize,
+) -> Vec<f32> {
+    (0..m).into_par_iter()
+        .flat_map(|seq| {
+            let q_s = &q[seq * n_q_heads * hd..(seq + 1) * n_q_heads * hd];
+            let k_s = k_caches[seq];
+            let v_s = v_caches[seq];
+            let kv_len = k_s.len() / (n_kv_heads * hd);
+            attention_f32_par(q_s, k_s, v_s, n_q_heads, n_kv_heads, kv_len, hd, kv_len)
+        })
+        .collect()
+}
+
+impl CodePredictor {
+    /// Forward pass at position `pos` for M independent sequences.
+    ///
+    /// `pred_input`: `[m, pred_hidden]` flattened.
+    /// `m`: number of sequences (batch size ≤ batch_scratch.m_max).
+    /// Returns `[m, pred_hidden]` — output-normed hidden states.
+    fn forward_at_pos_batched(&mut self, pos: usize, pred_input: &[f32], m: usize) -> Vec<f32> {
+        let n_qh = self.n_q_heads;
+        let n_kvh = self.n_kv_heads;
+        let hd = self.head_dim;
+        let pred_h = self.pred_hidden;
+        let kv_dim = self.layers[0].attn_k.out_features();
+        let ffn_dim = self.layers[0].ffn_gate.out_features();
+        let eps = 1e-6_f64;
+
+        let cos = &self.cos_f32[pos * hd..(pos + 1) * hd];
+        let sin = &self.sin_f32[pos * hd..(pos + 1) * hd];
+
+        let scr = &mut self.batch_scratch;
+        assert!(m <= scr.m_max, "batch size {m} > m_max {}", scr.m_max);
+        scr.h[..m * pred_h].copy_from_slice(pred_input);
+
+        for i in 0..self.n_layers {
+            let layer = &self.layers[i];
+
+            // 1. Residual + attn norm (in-place on each row)
+            scr.residual[..m * pred_h].copy_from_slice(&scr.h[..m * pred_h]);
+            rms_norm_batched_par(&mut scr.h[..m * pred_h], &layer.attn_norm_w, m, pred_h);
+
+            // 2. QKV: three separate matmul_batched calls
+            let q_out = layer.attn_q.matmul_batched(&scr.h[..m * pred_h], m);
+            let k_out = layer.attn_k.matmul_batched(&scr.h[..m * pred_h], m);
+            let v_out = layer.attn_v.matmul_batched(&scr.h[..m * pred_h], m);
+
+            // 3. Per-head QK-norm
+            let q_normed = qk_norm_batched_par(&q_out, &layer.attn_q_norm_w, m, n_qh, hd);
+            let k_normed = qk_norm_batched_par(&k_out, &layer.attn_k_norm_w, m, n_kvh, hd);
+
+            // 4. RoPE
+            let q_rope = rope_batched_par(&q_normed, cos, sin, m, n_qh, hd);
+            let k_rope = rope_batched_par(&k_normed, cos, sin, m, n_kvh, hd);
+
+            // 5. KV cache append per sequence
+            for seq in 0..m {
+                let k_start = seq * n_kvh * hd;
+                let v_start = seq * n_kvh * hd;
+                self.k_cache_batched[i][seq]
+                    .extend_from_slice(&k_rope[k_start..k_start + n_kvh * hd]);
+                self.v_cache_batched[i][seq]
+                    .extend_from_slice(&v_out[v_start..v_start + n_kvh * hd]);
+            }
+
+            // 6. Attention per sequence (parallel)
+            let k_slices: Vec<&[f32]> =
+                self.k_cache_batched[i].iter().map(|v| v.as_slice()).collect();
+            let v_slices: Vec<&[f32]> =
+                self.k_cache_batched[i].iter().map(|v| v.as_slice()).collect();
+            let attn_out = batch_attention_f32_par(
+                &q_rope, &k_slices, &v_slices, n_qh, n_kvh, hd, m,
+            );
+
+            // 7. O projection
+            let o_out = layer.attn_o.matmul_batched(&attn_out, m);
+
+            // 8. Residual add: h = residual + o_out (parallel over m)
+            scr.h[..m * pred_h]
+                .par_chunks_mut(pred_h)
+                .zip(scr.residual[..m * pred_h].par_chunks(pred_h))
+                .zip(o_out.par_chunks(pred_h))
+                .for_each(|((h_row, r_row), o_row)| {
+                    for j in 0..pred_h {
+                        h_row[j] = r_row[j] + o_row[j];
+                    }
+                });
+
+            // 9. FFN residual save
+            scr.residual[..m * pred_h].copy_from_slice(&scr.h[..m * pred_h]);
+
+            // 10. FFN norm (in-place)
+            rms_norm_batched_par(&mut scr.h[..m * pred_h], &layer.ffn_norm_w, m, pred_h);
+
+            // 11. FFN gate + up (separate matmul_batched calls)
+            let gate_out = layer.ffn_gate.matmul_batched(&scr.h[..m * pred_h], m);
+            let up_out = layer.ffn_up.matmul_batched(&scr.h[..m * pred_h], m);
+
+            // 12. SiLU(gate) * up → ffn_mid (parallel over m)
+            let gate_act = silu_batched_par(&gate_out, m, ffn_dim);
+            scr.ffn_mid[..m * ffn_dim]
+                .par_chunks_mut(ffn_dim)
+                .zip(gate_act.par_chunks(ffn_dim))
+                .zip(up_out.par_chunks(ffn_dim))
+                .for_each(|((fm_row, g_row), u_row)| {
+                    for j in 0..ffn_dim {
+                        fm_row[j] = g_row[j] * u_row[j];
+                    }
+                });
+
+            // 13. Down projection
+            let down_out = layer.ffn_down.matmul_batched(&scr.ffn_mid[..m * ffn_dim], m);
+
+            // 14. Residual add: h = residual + down_out
+            scr.h[..m * pred_h]
+                .par_chunks_mut(pred_h)
+                .zip(scr.residual[..m * pred_h].par_chunks(pred_h))
+                .zip(down_out.par_chunks(pred_h))
+                .for_each(|((h_row, r_row), d_row)| {
+                    for j in 0..pred_h {
+                        h_row[j] = r_row[j] + d_row[j];
+                    }
+                });
+        }
+
+        // Final output norm (parallel over m)
+        match &self.output_norm_w_f32 {
+            Some(w) => {
+                let mut out = scr.h[..m * pred_h].to_vec();
+                out.par_chunks_mut(pred_h).for_each(|row| {
+                    let normed = rms_norm_f32(row, w, self.output_norm_eps);
+                    row.copy_from_slice(&normed);
+                });
+                out
+            }
+            None => scr.h[..m * pred_h].to_vec(),
+        }
     }
 
     // ── public API ─────────────────────────────────────────────────────
