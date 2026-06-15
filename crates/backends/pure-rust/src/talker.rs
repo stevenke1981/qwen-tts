@@ -14,6 +14,7 @@ use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
 use crate::code_predictor::CodePredictor;
+use crate::custom_ops::rms_norm_tensor;
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 
 const FN_TOKEN_EMBD: &str = "talker.text_embd.weight";
@@ -303,7 +304,7 @@ impl Talker {
         
         for layer in &self.layers {
             let residual = hidden.clone();
-            hidden = layer.attn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.attn_norm.weight(), layer.attn_norm.eps())?;
 
             // Flatten batch*seq_len for 2D matmul
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
@@ -348,7 +349,7 @@ impl Talker {
 
             // SwiGLU FFN (fused gate+up quantize)
             let residual = hidden.clone();
-            hidden = layer.ffn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.ffn_norm.weight(), layer.ffn_norm.eps())?;
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
             let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
             let gate = candle_nn::ops::silu(&gu[0])?;
@@ -359,7 +360,7 @@ impl Talker {
         }
 
         // Final norm + output projection
-        hidden = self.output_norm.forward(&hidden)?;
+        hidden = rms_norm_tensor(&hidden, self.output_norm.weight(), self.output_norm.eps())?;
         let logits = match &self.output {
             Some(qm) => linear_fwd(qm, &hidden)?,
             None => linear_fwd(&self.token_embd, &hidden)?,
@@ -406,7 +407,7 @@ impl Talker {
         
         for layer in &self.layers {
             let residual = hidden.clone();
-            hidden = layer.attn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.attn_norm.weight(), layer.attn_norm.eps())?;
 
             // Flatten batch*seq_len for 2D matmul
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
@@ -453,7 +454,7 @@ impl Talker {
 
             // SwiGLU FFN (fused gate+up quantize)
             let residual = hidden.clone();
-            hidden = layer.ffn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.ffn_norm.weight(), layer.ffn_norm.eps())?;
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
             let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
             let gate = candle_nn::ops::silu(&gu[0])?;
@@ -464,7 +465,7 @@ impl Talker {
         }
 
         // Final norm
-        let hidden_normed = self.output_norm.forward(&hidden)?;
+        let hidden_normed = rms_norm_tensor(&hidden, self.output_norm.weight(), self.output_norm.eps())?;
 
         // LM head (output projection) — reuse token_embd if no separate output weight
         let logits = match &self.output {
@@ -501,7 +502,7 @@ impl Talker {
         
         for layer in &self.layers {
             let residual = hidden.clone();
-            hidden = layer.attn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.attn_norm.weight(), layer.attn_norm.eps())?;
 
             // Flatten batch*seq_len for 2D matmul
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
@@ -548,7 +549,7 @@ impl Talker {
 
             // SwiGLU FFN (fused gate+up quantize)
             let residual = hidden.clone();
-            hidden = layer.ffn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.ffn_norm.weight(), layer.ffn_norm.eps())?;
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
             let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
             let gate = candle_nn::ops::silu(&gu[0])?;
@@ -559,7 +560,7 @@ impl Talker {
         }
 
         // Final norm + output projection
-        hidden = self.output_norm.forward(&hidden)?;
+        hidden = rms_norm_tensor(&hidden, self.output_norm.weight(), self.output_norm.eps())?;
         Ok(hidden)
     }
 
@@ -628,7 +629,7 @@ impl Talker {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = hidden.clone();
-            hidden = layer.attn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.attn_norm.weight(), layer.attn_norm.eps())?;
 
             // QKV projections (fused quantize): [B, d_model] → [B, ...]
             let h_2d = hidden.reshape((batch, d_model))?;
@@ -694,7 +695,7 @@ impl Talker {
 
             // SwiGLU FFN (fused gate+up quantize)
             let residual = hidden.clone();
-            hidden = layer.ffn_norm.forward(&hidden)?;
+            hidden = rms_norm_tensor(&hidden, layer.ffn_norm.weight(), layer.ffn_norm.eps())?;
             let h_2d = hidden.reshape((batch, d_model))?;
             let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
             let gate = candle_nn::ops::silu(&gu[0])?;
@@ -705,7 +706,7 @@ impl Talker {
         }
 
         // Final output norm
-        let hidden = self.output_norm.forward(&hidden)?;
+        let hidden = rms_norm_tensor(&hidden, self.output_norm.weight(), self.output_norm.eps())?;
         Ok(hidden)
     }
 

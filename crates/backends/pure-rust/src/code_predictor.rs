@@ -36,6 +36,7 @@ use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
 use crate::sampling;
+use crate::custom_ops::rms_norm_tensor;
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 use crate::talker::{
     apply_per_head_norm, apply_rope, embed_token, linear_fwd, repeat_kv, DecoderLayer,
@@ -345,7 +346,7 @@ impl CodePredictor {
         for i in 0..self.n_layers {
             let layer = &self.layers[i];
             let residual = x.clone();
-            x = layer.attn_norm.forward(&x)?;
+            x = rms_norm_tensor(&x, layer.attn_norm.weight(), layer.attn_norm.eps())?;
 
             // QKV projections (fused quantize)
             let h_2d = x.reshape((batch, self.pred_hidden))?;
@@ -410,7 +411,7 @@ impl CodePredictor {
 
             // SwiGLU FFN (fused gate+up quantize)
             let residual = x.clone();
-            x = layer.ffn_norm.forward(&x)?;
+            x = rms_norm_tensor(&x, layer.ffn_norm.weight(), layer.ffn_norm.eps())?;
             let h_2d = x.reshape((batch, self.pred_hidden))?;
             let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
             let gate = candle_nn::ops::silu(&gu[0])?;
@@ -422,8 +423,7 @@ impl CodePredictor {
 
         // Final output norm
         if let Some(ref w) = self.output_norm_w {
-            let norm = RmsNorm::new(w.clone(), self.output_norm_eps);
-            x = norm.forward(&x)?;
+            x = rms_norm_tensor(&x, w, self.output_norm_eps)?;
         }
 
         Ok(x)
