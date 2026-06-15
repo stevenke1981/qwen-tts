@@ -491,19 +491,30 @@ impl CodePredictor {
 
     /// Project `[m, talker_hidden]` → `[m, pred_hidden]` via mtp_proj (Q8 matmul_batched).
     fn project_f32_batched(&mut self, x: &[f32], m: usize) -> Vec<f32> {
-        match &self.mtp_proj_q8 {
+        let n_out = self.pred_hidden;
+        let mut out = match &self.mtp_proj_q8 {
             Some(w) => w.matmul_batched(x, m),
             None => {
                 // No projection → just take first pred_hidden elements
-                let mut out = vec![0.0f32; m * self.pred_hidden];
+                let mut v = vec![0.0f32; m * n_out];
                 for f in 0..m {
-                    let src = &x[f * self.talker_hidden..f * self.talker_hidden + self.pred_hidden];
-                    let dst = &mut out[f * self.pred_hidden..(f + 1) * self.pred_hidden];
+                    let src = &x[f * self.talker_hidden..f * self.talker_hidden + n_out];
+                    let dst = &mut v[f * n_out..(f + 1) * n_out];
                     dst.copy_from_slice(src);
                 }
-                out
+                v
+            }
+        };
+        // Add bias if present
+        if self.mtp_proj_b_f32.len() == n_out {
+            for f in 0..m {
+                let slice = &mut out[f * n_out..(f + 1) * n_out];
+                for (d, b) in slice.iter_mut().zip(self.mtp_proj_b_f32.iter()) {
+                    *d += b;
+                }
             }
         }
+        out
     }
 
     /// Apply lm_head `g` to `[m, pred_hidden]` → `[m, vocab_size]` logits (Q8 matmul_batched).
@@ -561,15 +572,15 @@ impl CodePredictor {
             all_codes[f].push(code);
         }
 
-        // Positions 2..(num_acoustic+1): embed per-frame code → project → forward → lm_head → sample
+        // Positions 2..(num_acoustic+1): embed per-frame code (already projected) → forward → lm_head → sample
         for g in 1..n_acoustic {
             let mut proj = vec![0.0f32; n_frames * pred_h];
             for f in 0..n_frames {
                 let prev_token = all_codes[f][g - 1];
+                // embed_codec_f32 already does projection + bias internally
                 let emb = self.embed_codec_f32(g - 1, prev_token);
                 let p_start = f * pred_h;
-                let proj_single = self.project_f32(&emb);
-                proj[p_start..p_start + pred_h].copy_from_slice(&proj_single);
+                proj[p_start..p_start + pred_h].copy_from_slice(&emb);
             }
             let pos = g + 1; // positions 2..15
             let h_v = self.forward_at_pos_batched(pos, &proj, n_frames);
