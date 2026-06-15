@@ -692,7 +692,7 @@ impl Talker {
         Ok(logits)
     }
 
-    /// Embed a codebook 0 token ID into `[batch, 1, d_model]`.
+    /// Embed a codebook 0 token ID into `[d_model]` (f32, no Tensor).
     pub fn embed_codebook0(&self, token_id: u32) -> anyhow::Result<Tensor> {
         let emb = self.codec_embd.as_ref()
             .ok_or_else(|| anyhow::anyhow!("codec_embd not loaded"))?;
@@ -712,6 +712,22 @@ impl Talker {
         // Reshape back to [1, 1, d_model]
         let result = result_flat.reshape((1, 1, d_model))?;
         Ok(result.contiguous()?)
+    }
+
+    /// Embed a codebook 0 token ID into `[d_model]` (f32, no Tensor).
+    ///
+    /// This flattens the codec_embd to row-major on every call. For a
+    /// zero-alloc version, cache the flattened table.
+    pub fn embed_codebook0_f32(&self, token_id: u32) -> anyhow::Result<Vec<f32>> {
+        let emb = self.codec_embd.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("codec_embd not loaded"))?;
+        let d_model = self.config.d_model;
+        let flat = if emb.dims()[0] == d_model && emb.dims().len() >= 2 && emb.dims()[1] != d_model {
+            emb.t()?.contiguous()?.flatten_all()?.to_vec1()?
+        } else {
+            emb.flatten_all()?.to_vec1()?
+        };
+        Ok(embed_row_f32(&flat, token_id, d_model))
     }
 
     /// Process one token through all decoder layers with flat KV cache (incremental decode).
@@ -1142,6 +1158,14 @@ pub(crate) fn embed_token(weight: &Tensor, token: u32, d_model: usize, device: &
     let ids = Tensor::from_slice(&[token], (1,), device)?;
     let result = emb_w.index_select(&ids, 0)?;
     result.reshape((1, 1, d_model))
+}
+
+/// Extract a single row from a flat row-major weight matrix `[rows * cols]`.
+///
+/// Returns `cols`-length Vec.
+pub(crate) fn embed_row_f32(weight: &[f32], token: u32, cols: usize) -> Vec<f32> {
+    let offset = (token as usize) * cols;
+    weight[offset..offset + cols].to_vec()
 }
 
 #[cfg(test)]

@@ -83,15 +83,26 @@ pub struct CodePredictor {
     /// Per-codebook embedding tables for acoustic codebooks 1..14.
     /// codec_embd[g-1] embeds the predicted code of book g → talker_hidden.
     /// Shape: [vocab_size, talker_hidden] = [2048, talker_hidden].
+    #[allow(dead_code)]
     codec_embd: Vec<Tensor>,
+    /// Flat per-codebook embeddings — each [vocab_size * talker_hidden] row-major.
+    codec_embd_f32: Vec<Vec<f32>>,
     /// Linear heads, one per acoustic codebook (15 heads for c1..c15).
     /// lm_head[g] maps pred_hidden → vocab_size logits for codebook g+1.
     /// Shape: [vocab_size, pred_hidden] = [2048, 1024].
+    #[allow(dead_code)]
     lm_heads: Vec<Tensor>,
+    /// Flat per-head weights — each [vocab_size * pred_hidden] row-major.
+    lm_heads_f32: Vec<Vec<f32>>,
     /// MTP projection: talker_hidden → pred_hidden.
     /// Shape: [pred_hidden, talker_hidden] = [1024, 2048].
+    #[allow(dead_code)]
     mtp_proj_w: Option<Tensor>,
     mtp_proj_b: Option<Tensor>,
+    /// Flat MTP projection weight — [pred_hidden * talker_hidden] row-major.
+    mtp_proj_w_f32: Vec<f32>,
+    /// Flat MTP projection bias — [pred_hidden] or empty.
+    mtp_proj_b_f32: Vec<f32>,
     /// Output norm weight + eps (applied after last transformer layer).
     #[allow(dead_code)]
     output_norm_w: Option<Tensor>,
@@ -304,12 +315,18 @@ impl CodePredictor {
             } else {
                 None
             };
+        let mtp_proj_w_f32 = mtp_proj_w.as_ref()
+            .map(|t| t.flatten_all().unwrap().to_vec1().unwrap())
+            .unwrap_or_default();
         let mtp_proj_b =
             if content.tensor_infos.contains_key("code_pred.mtp_proj.bias") {
                 Some(load_f32("code_pred.mtp_proj.bias", &mut *file)?)
             } else {
                 None
             };
+        let mtp_proj_b_f32 = mtp_proj_b.as_ref()
+            .map(|t| t.to_vec1().unwrap())
+            .unwrap_or_default();
 
         // ── output norm ──────────────────────────────────────────────────
         let (output_norm_w, output_norm_eps_val) =
@@ -323,10 +340,20 @@ impl CodePredictor {
         // Load up to (num_acoustic - 1) tables for codes 1..14.
         let num_embd = num_acoustic.saturating_sub(1); // 14
         let mut codec_embd = Vec::with_capacity(num_embd);
+        let mut codec_embd_f32 = Vec::with_capacity(num_embd);
         for g in 0..num_embd {
             let name = format!("code_pred.codec_embd.{g}.weight");
             if content.tensor_infos.contains_key(&name) {
-                codec_embd.push(load_f32(&name, &mut *file)?);
+                let emb_t = load_f32(&name, &mut *file)?;
+                // Handle transposed layout: GGUF may store as [d_model, vocab_size]
+                let flat = if emb_t.dims()[0] == talker_hidden && emb_t.dims().len() >= 2 && emb_t.dims()[1] != talker_hidden {
+                    // Transposed [talker_hidden, vocab_size] → row-major [vocab_size, talker_hidden]
+                    emb_t.t().unwrap().contiguous().unwrap().flatten_all().unwrap().to_vec1().unwrap()
+                } else {
+                    emb_t.flatten_all().unwrap().to_vec1().unwrap()
+                };
+                codec_embd_f32.push(flat);
+                codec_embd.push(emb_t);
             } else {
                 anyhow::bail!("missing {name} — expected {num_embd} embedding tables");
             }
@@ -334,6 +361,7 @@ impl CodePredictor {
 
         // ── linear heads ─────────────────────────────────────────────────
         let mut lm_heads = Vec::with_capacity(num_acoustic);
+        let mut lm_heads_f32 = Vec::with_capacity(num_acoustic);
         for g in 0..num_acoustic {
             let name = format!("code_pred.lm_head.{g}.weight");
             if !content.tensor_infos.contains_key(&name) {
@@ -341,7 +369,9 @@ impl CodePredictor {
                     "missing {name} — expected {num_acoustic} lm heads"
                 );
             }
-            lm_heads.push(load_f32(&name, &mut *file)?);
+            let head_t = load_f32(&name, &mut *file)?;
+            lm_heads_f32.push(head_t.flatten_all()?.to_vec1()?);
+            lm_heads.push(head_t);
         }
 
         // ── precompute RoPE cos/sin ──────────────────────────────────────
@@ -418,9 +448,13 @@ impl CodePredictor {
             ffn_dim,
             layers,
             codec_embd,
+            codec_embd_f32,
             lm_heads,
+            lm_heads_f32,
             mtp_proj_w,
             mtp_proj_b,
+            mtp_proj_w_f32,
+            mtp_proj_b_f32,
             output_norm_w,
             output_norm_eps: output_norm_eps_val,
             cos,
@@ -458,6 +492,51 @@ impl CodePredictor {
         let head = &self.lm_heads[g]; // QMatMul [vocab_size, pred_hidden]
         let logits_t = linear_fwd(head, h)?; // [1, 1, vocab_size]
         Ok(logits_t.flatten_all()?.to_vec1()?)
+    }
+
+    // ── f32 projection/lm_head/embed (allocation-free, no Tensor) ──────
+
+    /// Project `[talker_hidden]` → `[pred_hidden]` via mtp_proj (raw f32 matmul).
+    fn project_f32(&self, x: &[f32]) -> Vec<f32> {
+        let n_out = self.pred_hidden;
+        let n_in = self.talker_hidden;
+        let w = &self.mtp_proj_w_f32;
+        let mut y = if self.mtp_proj_b_f32.len() == n_out {
+            self.mtp_proj_b_f32.clone()
+        } else {
+            vec![0.0f32; n_out]
+        };
+        for i in 0..n_out {
+            let row_start = i * n_in;
+            for j in 0..n_in {
+                y[i] += w[row_start + j] * x[j];
+            }
+        }
+        y
+    }
+
+    /// Apply lm_head `g` to `[pred_hidden]` → `[vocab_size]` logits (raw f32 matmul).
+    fn apply_lm_head_f32(&self, g: usize, h: &[f32]) -> Vec<f32> {
+        let w = &self.lm_heads_f32[g];
+        let vocab = self.vocab_size;
+        let pred_h = self.pred_hidden;
+        let mut logits = vec![0.0f32; vocab];
+        for i in 0..vocab {
+            let row_start = i * pred_h;
+            for j in 0..pred_h {
+                logits[i] += w[row_start + j] * h[j];
+            }
+        }
+        logits
+    }
+
+    /// Look up token from `codec_embd[g]` and project → `[pred_hidden]`.
+    fn embed_codec_f32(&self, g: usize, token_id: u32) -> Vec<f32> {
+        let table = &self.codec_embd_f32[g];
+        let n_in = self.talker_hidden;
+        let offset = (token_id as usize) * n_in;
+        let row = &table[offset..offset + n_in];
+        self.project_f32(row)
     }
 
     /// Fused f32 forward for one position — zero Tensor round-trips on the hot path.
@@ -569,8 +648,8 @@ impl CodePredictor {
     ///     forward at position g+1, apply `lm_head[g]` → sample c_{g+1}
     ///
     /// # Arguments
-    /// * `talker_hidden` — last talker hidden state `[1, 1, talker_hidden]`
-    /// * `c0_embed` — talker's embedding of codebook 0 token `[1, 1, talker_hidden]`
+    /// * `talker_hidden` — last talker hidden state `[talker_hidden]` (f32, no Tensor)
+    /// * `c0_embed` — talker's embedding of codebook 0 token `[talker_hidden]` (f32)
     /// * `temperature` — sampling temperature (0.0 = argmax)
     /// * `top_k` — optional top-k filter
     /// * `top_p` — optional top-p (nucleus) filter
@@ -579,30 +658,27 @@ impl CodePredictor {
     /// Returns a `CodeFrame` of `num_acoustic` code token IDs (c1..cN).
     pub fn predict_one_frame_sampled(
         &mut self,
-        talker_hidden: &Tensor,
-        c0_embed: &Tensor,
+        talker_hidden: &[f32],
+        c0_embed: &[f32],
         temperature: f32,
         top_k: Option<usize>,
         top_p: Option<f32>,
         rng: &mut impl rand::Rng,
-    ) -> anyhow::Result<CodeFrame> {
+    ) -> CodeFrame {
         // Reset KV cache (fresh per frame) — just clear the Vecs, no alloc.
         for kc in &mut self.k_cache_data { kc.clear(); }
         for vc in &mut self.v_cache_data { vc.clear(); }
 
         // ── Prefill position 0 ───────────────────────────────────────────
         // Input: talker hidden state → project → forward (no lm_head here)
-        let proj_0 = self.project(talker_hidden)?; // [1, 1, pred_hidden]
-        let proj_0_f: Vec<f32> = proj_0.flatten_all()?.to_vec1()?;
-        self.forward_at_pos_fused(0, &proj_0_f);
+        let proj_0 = self.project_f32(talker_hidden);
+        self.forward_at_pos_fused(0, &proj_0);
 
         // ── Prefill position 1 ───────────────────────────────────────────
         // Input: c0_embed → project → forward → lm_head[0] → sample c1
-        let proj_1 = self.project(c0_embed)?; // [1, 1, pred_hidden]
-        let proj_1_f: Vec<f32> = proj_1.flatten_all()?.to_vec1()?;
-        let h1_v = self.forward_at_pos_fused(1, &proj_1_f);
-        let h1 = Tensor::from_slice(&h1_v, (1, 1, self.pred_hidden), &self.device)?;
-        let logits_0 = self.apply_lm_head(0, &h1)?;
+        let proj_1 = self.project_f32(c0_embed);
+        let h1_v = self.forward_at_pos_fused(1, &proj_1);
+        let logits_0 = self.apply_lm_head_f32(0, &h1_v);
         let (c1, _prob) =
             sampling::sample_token(&logits_0, temperature, top_k, top_p, rng, None, 1.0);
         let mut codes: Vec<u32> = vec![c1];
@@ -614,26 +690,18 @@ impl CodePredictor {
         //   project → forward → lm_head[g] → sample → push
         for g in 1..self.num_acoustic {
             let prev_token = codes[g - 1];
-            // Embed the predicted code using the predictor's embedding table
-            let emb = embed_token(
-                &self.codec_embd[g - 1],
-                prev_token,
-                self.talker_hidden,
-                &self.device,
-            )?; // [1, 1, talker_hidden]
-            let proj = self.project(&emb)?; // [1, 1, pred_hidden]
+            // Embed + project in one step (all f32, no Tensor)
+            let proj = self.embed_codec_f32(g - 1, prev_token);
             let pos = g + 1; // positions 2..15
-            let proj_f: Vec<f32> = proj.flatten_all()?.to_vec1()?;
-            let h_v = self.forward_at_pos_fused(pos, &proj_f);
-            let h = Tensor::from_slice(&h_v, (1, 1, self.pred_hidden), &self.device)?;
-            let logits = self.apply_lm_head(g, &h)?;
+            let h_v = self.forward_at_pos_fused(pos, &proj);
+            let logits = self.apply_lm_head_f32(g, &h_v);
             let (code, _prob) =
                 sampling::sample_token(&logits, temperature, top_k, top_p, rng, None, 1.0);
             codes.push(code);
         }
 
         debug_assert_eq!(codes.len(), self.num_acoustic);
-        Ok(codes)
+        codes
     }
 
     /// Predict a single audio code frame with argmax (fully deterministic).
@@ -641,9 +709,9 @@ impl CodePredictor {
     /// Convenience wrapper: calls `predict_one_frame_sampled` with `temperature=0.0`.
     pub fn predict_one_frame_argmax(
         &mut self,
-        talker_hidden: &Tensor,
-        c0_embed: &Tensor,
-    ) -> anyhow::Result<CodeFrame> {
+        talker_hidden: &[f32],
+        c0_embed: &[f32],
+    ) -> CodeFrame {
         let mut rng = rand::rngs::StdRng::seed_from_u64(0);
         self.predict_one_frame_sampled(talker_hidden, c0_embed, 0.0, None, None, &mut rng)
     }

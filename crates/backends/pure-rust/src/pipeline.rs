@@ -159,7 +159,7 @@ impl Pipeline {
 
         let cfg = self.talker.config();
         let mut kv_cache = KvCacheFlat::new(cfg.n_layers, cfg.n_kv_heads, cfg.head_dim(), cfg.max_seq_len);
-        let mut last_hidden: Option<Tensor> = None;
+        let mut last_hidden: Option<Vec<f32>> = None;
         for pos in 0..t_ctx {
             let _step_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("talker_step".into(), "step".into(), pos)
@@ -171,11 +171,10 @@ impl Pipeline {
             let hidden_vec = self
                 .talker
                 .forward_step_fused(&emb_flat, &mut kv_cache, pos, cos_pos, sin_pos);
-            let hidden_state = Tensor::from_slice(&hidden_vec, (1, 1, hidden), &self.device)?;
-            last_hidden = Some(hidden_state);
+            last_hidden = Some(hidden_vec);
             drop(_step_timer);
         }
-        // last_hidden: [1, 1, d_model] — output-normed hidden state at the last text position
+        // last_hidden — output-normed hidden state at the last text position
         let mut last_hidden = last_hidden
             .ok_or_else(|| anyhow::anyhow!("empty sequence after prompt prefill"))?;
 
@@ -185,7 +184,9 @@ impl Pipeline {
             let _cb0_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("cb0_sample".into(), "step".into(), frame_idx)
             });
-            let cb0_logits_t = self.talker.predict_codebook0(&last_hidden)?;
+            // predict_codebook0 still takes Tensor — wrap temporarily
+            let last_hidden_t = Tensor::from_slice(&last_hidden, (1, 1, hidden), &self.device)?;
+            let cb0_logits_t = self.talker.predict_codebook0(&last_hidden_t)?;
             // Convert from [1, 1, V] candle tensor to flat f32 slice for
             // suppress + rep_penalty + sampling chain.
             let cb0_logits_flat: Vec<f32> = cb0_logits_t.flatten_all()?.to_vec1()?;
@@ -218,20 +219,20 @@ impl Pipeline {
             talker_history.push(cb0_token);
 
             // Embed codebook 0 token for predictor prefill
-            let cb0_emb = self.talker.embed_codebook0(cb0_token)?;
+            let cb0_emb = self.talker.embed_codebook0_f32(cb0_token)?;
 
             // ── Step B: predict acoustic codebooks 1..N ──────────────────
             let _pred_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("predictor_frame".into(), "frame".into(), frame_idx)
             });
-            let frame = if do_sample {
+            let frame: Vec<u32> = if do_sample {
                 self
                     .code_predictor
-                    .predict_one_frame_sampled(&last_hidden, &cb0_emb, temperature, top_k, top_p, &mut rng)?
+                    .predict_one_frame_sampled(&last_hidden, &cb0_emb, temperature, top_k, top_p, &mut rng)
             } else {
                 self
                     .code_predictor
-                    .predict_one_frame_argmax(&last_hidden, &cb0_emb)?
+                    .predict_one_frame_argmax(&last_hidden, &cb0_emb)
             };
             drop(_pred_timer);
 
@@ -283,7 +284,6 @@ impl Pipeline {
             let hidden_vec = self
                 .talker
                 .forward_step_fused(&next_emb_vec, &mut kv_cache, pos, cos_pos, sin_pos);
-            last_hidden = Tensor::from_slice(&hidden_vec, (1, 1, hidden), &self.device)?;
 
             // Debug dump: hidden state after step 1 (matches C++
             // `talker-hidden-step1`). The first frame (idx 0) produces the
@@ -291,6 +291,8 @@ impl Pipeline {
             if frame_idx == 0 {
                 dumper.dump_1d("talker-hidden-step1", &hidden_vec);
             }
+
+            last_hidden = hidden_vec;
         }
 
         // Trim to exact multiples
