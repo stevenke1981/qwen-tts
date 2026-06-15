@@ -832,10 +832,12 @@ pub(crate) fn apply_per_head_norm(x: &Tensor, norm: &RmsNorm) -> Result<Tensor> 
 /// `weight`: `[vocab_size, d_model]` or `[d_model, vocab_size]` (transposed).
 /// Returns `[1, 1, d_model]`.
 pub(crate) fn embed_token(weight: &Tensor, token: u32, d_model: usize, device: &Device) -> Result<Tensor> {
-    // Normalize layout to [vocab_size, d_model]
-    let emb_w = if weight.dims()[0] == d_model {
-        weight.t()?
+    // Normalize layout to [vocab_size, d_model] and ensure contiguous
+    // (candle's index_select requires contiguous tensors).
+    let emb_w = if weight.dims()[0] == d_model && weight.dims()[1] != d_model {
+        weight.t()?.contiguous()?
     } else {
+        // Already [vocab_size, d_model]; make contiguous if needed
         weight.clone()
     };
     let ids = Tensor::from_slice(&[token], (1,), device)?;

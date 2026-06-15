@@ -308,3 +308,58 @@ fn test_pipeline_full_synthesize() {
         expected_file_size,
     );
 }
+
+/// Minimal pipeline verification: 4 frames only, confirms forward pass works.
+#[test]
+#[ignore = "requires ~8 GB RAM and ~40 seconds"]
+fn test_pipeline_minimal_synthesize() {
+    let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &Device::Cpu)
+        .expect("pipeline should load");
+
+    let request = SynthesisRequest {
+        text: "Hi.".into(),
+        language: "en".into(),
+        speaker: None,
+        instruct: None,
+        ref_audio_path: None,
+        ref_text: None,
+        seed: Some(42),
+        max_new_tokens: Some(4),
+        temperature: Some(1.0),
+        top_k: Some(40),
+        top_p: Some(0.9),
+        repetition_penalty: None,
+        do_sample: None,
+        out_path: Path::new("/tmp/pure-rust-e2e-mini.wav").to_path_buf(),
+        device: qwen_tts_runtime::DeviceKind::Cpu,
+        models: qwen_tts_core::TtsModelSet::new(&talker_path(), &codec_path()),
+    };
+
+    let audio = pipeline.synthesize(&request)
+        .expect("minimal synthesize should succeed");
+    assert!(!audio.is_empty(), "audio must not be empty");
+    // With 4 frames at 12 Hz * 24000 / 12Hz frame rate we expect audio
+    // 4 frames * 24000/12 samples = 8000 samples minimum roughly
+    let min_samples = 1000; // very conservative
+    assert!(
+        audio.len() >= min_samples,
+        "audio too short: {} samples < {}",
+        audio.len(),
+        min_samples,
+    );
+
+    // Not all zeros
+    let nonzero = audio.iter().filter(|&&s| s != 0).count();
+    assert!(
+        nonzero > audio.len() / 4, // at least 25% non-zero for 4 frames
+        "too many silent samples — {}/{} nonzero",
+        nonzero,
+        audio.len(),
+    );
+
+    log::info!(
+        "Minimal E2E OK: {} samples from 4 frames, {} nonzero",
+        audio.len(),
+        nonzero,
+    );
+}
