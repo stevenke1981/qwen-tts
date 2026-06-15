@@ -279,49 +279,43 @@ fn bench_fused_128_frames() {
         );
     }
 
-    // ---- Code predictor: 128 frames (f32 all the way) ----
-    let talker_hidden: Vec<f32> = vec![0.5; d_model];
-    let c0_embed: Vec<f32> = vec![0.5; d_model];
-    let mut total_tokens = 0usize;
+    // ---- Code predictor: 128 frames in ONE batched call ----
+    use rand::SeedableRng;
+    let talker_hidden_all: Vec<f32> = vec![0.5; 128 * d_model];
+    let c0_embed_all: Vec<f32> = vec![0.5; 128 * d_model];
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
-    for frame in 0..128 {
-        use rand::SeedableRng;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let start = Instant::now();
+    let all_codes = predictor.predict_n_frames_batched(
+        &talker_hidden_all, &c0_embed_all, 128,
+        1.0, Some(40), Some(0.9), &mut rng,
+    );
+    timing.record(
+        "predictor_batched".into(), "predictor_batched".into(),
+        start.elapsed().as_secs_f64(), 0,
+    );
 
-        let start = Instant::now();
-        let codes = predictor.predict_one_frame_sampled(
-            &talker_hidden, &c0_embed,
-            1.0, Some(40), Some(0.9), &mut rng,
-        );
-        timing.record(
-            "predictor_frame_fused".into(), "frame_fused".into(),
-            start.elapsed().as_secs_f64(), frame,
-        );
-        total_tokens += codes.len();
-    }
-
-    let frame_total = timing.category_total("frame_fused");
-    let n_frames = 128.0;
-    let frame_mean = frame_total / n_frames;
+    let frame_s = start.elapsed().as_secs_f64();
+    let total_tokens: usize = all_codes.iter().map(|c| c.len()).sum();
     println!();
-    println!("--- Code Predictor 128-frame (fused f32) ---");
+    println!("--- Code Predictor 128-frame (BATCHED) ---");
     println!(
         "  total: {:.3}s  mean: {:.4}s/frame  frame/s: {:.1}",
-        frame_total, frame_mean, 1.0 / frame_mean,
+        frame_s, frame_s / 128.0, 128.0 / frame_s,
     );
     println!(
         "  decoder tokens: {}  token/s (decoder): {:.0}",
-        total_tokens, total_tokens as f64 / frame_total,
+        total_tokens, total_tokens as f64 / frame_s,
     );
 
     // ---- Total synthesis estimate ----
     let all_talker = timing.category_total("step_fused");
-    let all_frames = timing.category_total("frame_fused");
+    let all_frames = frame_s; // batched, single measurement
     let total = timing.category_total("load") + all_talker + all_frames;
     println!();
-    println!("=== Total 128-frame synthesis estimate (fused f32) ===");
+    println!("=== Total 128-frame synthesis estimate (BATCHED) ===");
     println!("  {:6.3}s  talker forward (128 steps, fused f32)", all_talker);
-    println!("  {:6.3}s  code predictor (128 frames, fused f32)", all_frames);
+    println!("  {:6.3}s  code predictor (128 frames, batched Q8)", all_frames);
     println!("  {:6.3}s  + load time", timing.category_total("load"));
     println!("  {:6.3}s  TOTAL", total);
     println!("  vs C++ FFI target: ~2-5s  (gap: {:.0}x)", total / 3.0);
