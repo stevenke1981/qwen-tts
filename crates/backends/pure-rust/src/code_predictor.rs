@@ -31,6 +31,7 @@
 use std::fs::File;
 
 use candle_core::quantized::gguf_file::Content;
+use candle_core::quantized::k_quants::{BlockQ8_0, GgmlType, QK8_0};
 use candle_core::{Device, Tensor};
 use candle_nn::RmsNorm;
 use rand::SeedableRng;
@@ -44,7 +45,7 @@ use crate::custom_ops::{
 };
 use crate::qgemv::{Q8Weights, Q8Workspace};
 use crate::talker::{
-    embed_token, linear_fwd, DecoderLayer, Talker,
+    DecoderLayer, Talker,
 };
 
 /// Type alias: a frame of acoustic code token IDs (one per codebook level).
@@ -82,41 +83,16 @@ pub struct CodePredictor {
     // ── weights ───────────────────────────────────────────────────────────
     /// Transformer decoder layers (linear weights as Q8_0 quantized).
     layers: Vec<DecoderLayer>,
-    /// Per-codebook embedding tables for acoustic codebooks 1..14.
-    /// codec_embd[g-1] embeds the predicted code of book g → talker_hidden.
-    /// Shape: [vocab_size, talker_hidden] = [2048, talker_hidden].
-    #[allow(dead_code)]
-    codec_embd: Vec<Tensor>,
-    /// Flat per-codebook embeddings — each [vocab_size * talker_hidden] row-major.
-    codec_embd_f32: Vec<Vec<f32>>,
-    /// Q8 quantized codec_embd tables — each [vocab_size, talker_hidden] row-major Q8 blocks.
+    /// Q8 quantized codec_embd tables — each [vocab_size, talker_hidden] row-major.
     codec_embd_q8: Vec<Q8Weights>,
-    /// Linear heads, one per acoustic codebook (15 heads for c1..c15).
-    /// lm_head[g] maps pred_hidden → vocab_size logits for codebook g+1.
-    /// Shape: [vocab_size, pred_hidden] = [2048, 1024].
-    #[allow(dead_code)]
-    lm_heads: Vec<Tensor>,
-    /// Q8 quantized lm_heads — each [vocab_size, pred_hidden] row-major Q8 blocks.
+    /// Q8 quantized lm_heads — each [vocab_size, pred_hidden] row-major.
     lm_heads_q8: Vec<Q8Weights>,
-    /// MTP projection: talker_hidden → pred_hidden.
-    /// Shape: [pred_hidden, talker_hidden] = [1024, 2048].
-    #[allow(dead_code)]
-    mtp_proj_w: Option<Tensor>,
-    mtp_proj_b: Option<Tensor>,
-    /// Q8 quantized MTP projection weight — [pred_hidden, talker_hidden] row-major.
+    /// Q8 quantized MTP projection weight — [pred_hidden, talker_hidden].
     mtp_proj_q8: Option<Q8Weights>,
     /// Flat MTP projection bias — [pred_hidden] or empty.
     mtp_proj_b_f32: Vec<f32>,
-    /// Output norm weight + eps (applied after last transformer layer).
-    #[allow(dead_code)]
-    output_norm_w: Option<Tensor>,
+    /// Output norm eps (applied after last transformer layer).
     output_norm_eps: f64,
-
-    // ── precomputed RoPE (Tensor version, kept for API compat) ──────────
-    #[allow(dead_code)]
-    cos: Tensor,
-    #[allow(dead_code)]
-    sin: Tensor,
 
     // ── flat RoPE for fused path ──────────────────────────────────────────
     /// Flat cos table: [max_seq_len * head_dim].
@@ -140,8 +116,10 @@ pub struct CodePredictor {
     /// Pre-allocated scratch buffers for fused forward path.
     pred_scratch: PredScratch,
 
-    /// Device handle.
-    device: Device,
+    // ── batched KV cache (for predict_n_frames_batched) ──────────────
+    k_cache_batched: Vec<Vec<Vec<f32>>>, // [n_layers][m_max] Vec<f32>
+    v_cache_batched: Vec<Vec<Vec<f32>>>,
+    batch_scratch: BatchScratch,
 }
 
 /// Pre-allocated scratch buffers for CodePredictor's fused forward path.
@@ -180,6 +158,37 @@ impl PredScratch {
             v_buf: vec![0.0f32; kv_dim],
             gate_buf: vec![0.0f32; ffn_dim],
             up_buf: vec![0.0f32; ffn_dim],
+        }
+    }
+}
+
+/// Pre-allocated scratch buffers for batched (M>1) forward passes.
+struct BatchScratch {
+    m_max: usize,
+    h: Vec<f32>,             // [m_max, pred_hidden]
+    residual: Vec<f32>,      // [m_max, pred_hidden]
+    q_buf: Vec<f32>,         // [m_max, pred_hidden] (O/down output reused here)
+    attn_q_buf: Vec<f32>,    // [m_max, attn_dim]
+    k_buf: Vec<f32>,         // [m_max, kv_dim]
+    v_buf: Vec<f32>,         // [m_max, kv_dim]
+    gate_buf: Vec<f32>,      // [m_max, ffn_dim]
+    up_buf: Vec<f32>,        // [m_max, ffn_dim]
+    ffn_mid: Vec<f32>,       // [m_max, ffn_dim]
+}
+
+impl BatchScratch {
+    fn new(m_max: usize, pred_hidden: usize, attn_dim: usize, kv_dim: usize, ffn_dim: usize) -> Self {
+        Self {
+            m_max,
+            h: vec![0.0; m_max * pred_hidden],
+            residual: vec![0.0; m_max * pred_hidden],
+            q_buf: vec![0.0; m_max * pred_hidden],
+            attn_q_buf: vec![0.0; m_max * attn_dim],
+            k_buf: vec![0.0; m_max * kv_dim],
+            v_buf: vec![0.0; m_max * kv_dim],
+            gate_buf: vec![0.0; m_max * ffn_dim],
+            up_buf: vec![0.0; m_max * ffn_dim],
+            ffn_mid: vec![0.0; m_max * ffn_dim],
         }
     }
 }
@@ -315,100 +324,47 @@ impl CodePredictor {
             });
         }
 
-        // ── MTP projection ───────────────────────────────────────────────
-        let mtp_proj_w =
-            if content.tensor_infos.contains_key("code_pred.mtp_proj.weight") {
-                Some(load_f32("code_pred.mtp_proj.weight", &mut *file)?)
-            } else {
-                None
-            };
-        let mtp_proj_w_f32 = mtp_proj_w.as_ref()
-            .map(|t| t.flatten_all().unwrap().to_vec1().unwrap())
-            .unwrap_or_default();
-        let mtp_proj_q8 = if !mtp_proj_w_f32.is_empty() {
-            Some(Q8Weights::from_f32_data(&mtp_proj_w_f32, pred_hidden, talker_hidden))
+        // ── MTP projection (loaded directly as Q8_0 from GGUF) ───────────
+        let mtp_proj_q8 = content.tensor_infos.contains_key("code_pred.mtp_proj.weight")
+            .then(|| Q8Weights::from_gguf(content, file, "code_pred.mtp_proj.weight").ok())
+            .flatten();
+        let mtp_proj_b_f32 = if content.tensor_infos.contains_key("code_pred.mtp_proj.bias") {
+            load_f32("code_pred.mtp_proj.bias", &mut *file)?.to_vec1()?
+        } else {
+            Vec::new()
+        };
+
+        // ── output norm (f32 weight for rms_norm_f32) ────────────────────
+        let output_norm_eps_val = norm_eps;
+        let output_norm_w_f32 = if content.tensor_infos.contains_key("code_pred.output_norm.weight") {
+            Some(load_f32("code_pred.output_norm.weight", &mut *file)?.flatten_all()?.to_vec1()?)
         } else {
             None
         };
-        let mtp_proj_b =
-            if content.tensor_infos.contains_key("code_pred.mtp_proj.bias") {
-                Some(load_f32("code_pred.mtp_proj.bias", &mut *file)?)
-            } else {
-                None
-            };
-        let mtp_proj_b_f32 = mtp_proj_b.as_ref()
-            .map(|t| t.to_vec1().unwrap())
-            .unwrap_or_default();
 
-        // ── output norm ──────────────────────────────────────────────────
-        let (output_norm_w, output_norm_eps_val) =
-            if content.tensor_infos.contains_key("code_pred.output_norm.weight") {
-                (Some(load_f32("code_pred.output_norm.weight", &mut *file)?), norm_eps)
-            } else {
-                (None, norm_eps)
-            };
-
-        // ── per-codebook embedding tables ────────────────────────────────
-        // Load up to (num_acoustic - 1) tables for codes 1..14.
+        // ── codec_embd tables (Q8 direct from GGUF, no transpose needed) ─
         let num_embd = num_acoustic.saturating_sub(1); // 14
-        let mut codec_embd = Vec::with_capacity(num_embd);
-        let mut codec_embd_f32 = Vec::with_capacity(num_embd);
         let mut codec_embd_q8 = Vec::with_capacity(num_embd);
         for g in 0..num_embd {
             let name = format!("code_pred.codec_embd.{g}.weight");
             if content.tensor_infos.contains_key(&name) {
-                let emb_t = load_f32(&name, &mut *file)?;
-                // Handle transposed layout: GGUF may store as [d_model, vocab_size]
-                let flat = if emb_t.dims()[0] == talker_hidden && emb_t.dims().len() >= 2 && emb_t.dims()[1] != talker_hidden {
-                    // Transposed [talker_hidden, vocab_size] → row-major [vocab_size, talker_hidden]
-                    emb_t.t().unwrap().contiguous().unwrap().flatten_all().unwrap().to_vec1().unwrap()
-                } else {
-                    emb_t.flatten_all().unwrap().to_vec1().unwrap()
-                };
-                codec_embd_f32.push(flat.clone());
-                codec_embd_q8.push(Q8Weights::from_f32_data(&flat, vocab_size, talker_hidden));
-                codec_embd.push(emb_t);
+                codec_embd_q8.push(Q8Weights::from_gguf(content, file, &name)?);
             } else {
                 anyhow::bail!("missing {name} — expected {num_embd} embedding tables");
             }
         }
 
-        // ── linear heads ─────────────────────────────────────────────────
-        let mut lm_heads = Vec::with_capacity(num_acoustic);
+        // ── lm_heads (Q8 direct from GGUF) ───────────────────────────────
         let mut lm_heads_q8 = Vec::with_capacity(num_acoustic);
         for g in 0..num_acoustic {
             let name = format!("code_pred.lm_head.{g}.weight");
             if !content.tensor_infos.contains_key(&name) {
-                anyhow::bail!(
-                    "missing {name} — expected {num_acoustic} lm heads"
-                );
+                anyhow::bail!("missing {name} — expected {num_acoustic} lm heads");
             }
-            let head_t = load_f32(&name, &mut *file)?;
-            let flat = head_t.flatten_all()?.to_vec1()?;
-            lm_heads_q8.push(Q8Weights::from_f32_data(&flat, vocab_size, pred_hidden));
-            lm_heads.push(head_t);
+            lm_heads_q8.push(Q8Weights::from_gguf(content, file, &name)?);
         }
 
-        // ── precompute RoPE cos/sin ──────────────────────────────────────
-        let inv_freq: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| (1.0_f64 / rope_theta.powf(i as f64 / head_dim as f64)) as f32)
-            .collect();
-        let n_freq = inv_freq.len();
-        let inv_freq_t = Tensor::from_slice(&inv_freq, (n_freq,), &device)?;
-        let pos: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
-        let pos_t = Tensor::from_slice(&pos, (max_seq_len,), &device)?;
-        let freqs = pos_t.unsqueeze(1)?.matmul(&inv_freq_t.unsqueeze(0)?)?;
-        let mut cos_v = freqs.cos()?;
-        let mut sin_v = freqs.sin()?;
-        // Interleave pairs → [max_seq_len, head_dim]
-        cos_v = interleave(&cos_v, 2)?;
-        sin_v = interleave(&sin_v, 2)?;
-        // Add batch + head dims → [1, 1, max_seq_len, head_dim]
-        let cos = cos_v.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = sin_v.unsqueeze(0)?.unsqueeze(0)?;
-
-        // ── flat RoPE for fused path ─────────────────────────────────────
+        // ── flat RoPE cos/sin (f64 precision, no Tensor) ─────────────────
         let half = head_dim / 2;
         let inv_freq_f64: Vec<f64> = (0..head_dim)
             .step_by(2)
@@ -429,9 +385,6 @@ impl CodePredictor {
             }
         }
 
-        // ── f32 view of output_norm weight ───────────────────────────────
-        let output_norm_w_f32 = output_norm_w.as_ref().map(|t| t.flatten_all().unwrap().to_vec1().unwrap());
-
         // FFN intermediate dimension from first layer's ffn_gate (output rows).
         let ffn_dim = layers
             .first()
@@ -451,6 +404,12 @@ impl CodePredictor {
         let pred_scratch = PredScratch::new(pred_hidden, attn_dim, ffn_dim, kv_dim);
         let q8_ws = Q8Workspace::new();
 
+        // ── batched KV cache + scratch ──────────────────────────────────
+        let batch_m_max = 128;
+        let k_cache_batched = vec![vec![Vec::new(); batch_m_max]; n_layers];
+        let v_cache_batched = vec![vec![Vec::new(); batch_m_max]; n_layers];
+        let batch_scratch = BatchScratch::new(batch_m_max, pred_hidden, attn_dim, kv_dim, ffn_dim);
+
         Ok(Self {
             num_acoustic,
             pred_hidden,
@@ -463,19 +422,11 @@ impl CodePredictor {
             max_seq_len,
             ffn_dim,
             layers,
-            codec_embd,
-            codec_embd_f32,
             codec_embd_q8,
-            lm_heads,
             lm_heads_q8,
-            mtp_proj_w,
-            mtp_proj_b,
             mtp_proj_q8,
             mtp_proj_b_f32,
-            output_norm_w,
             output_norm_eps: output_norm_eps_val,
-            cos,
-            sin,
             cos_f32,
             sin_f32,
             output_norm_w_f32,
@@ -483,35 +434,13 @@ impl CodePredictor {
             v_cache_data,
             q8_ws,
             pred_scratch,
-            device: device.clone(),
+            k_cache_batched,
+            v_cache_batched,
+            batch_scratch,
         })
     }
 
-    // ── private helpers ─────────────────────────────────────────────────
-
-    /// Project `[batch, seq, talker_hidden]` → `[batch, seq, pred_hidden]` via `mtp_proj`.
-    fn project(&self, x: &Tensor) -> anyhow::Result<Tensor> {
-        let mut h = x.clone();
-        if let Some(ref w) = self.mtp_proj_w {
-            h = linear_fwd(w, &h)?;
-            if let Some(ref b) = self.mtp_proj_b {
-                h = h.broadcast_add(b)?;
-            }
-        }
-        Ok(h)
-    }
-
-    /// Apply lm_head `g` to hidden state at `pred_hidden` dimension.
-    ///
-    /// `h`: `[1, 1, pred_hidden]`.
-    /// Returns `Vec<f32>` logits of length `vocab_size`.
-    fn apply_lm_head(&self, g: usize, h: &Tensor) -> anyhow::Result<Vec<f32>> {
-        let head = &self.lm_heads[g]; // QMatMul [vocab_size, pred_hidden]
-        let logits_t = linear_fwd(head, h)?; // [1, 1, vocab_size]
-        Ok(logits_t.flatten_all()?.to_vec1()?)
-    }
-
-    // ── f32 projection/lm_head/embed (allocation-free, no Tensor) ──────
+    // ── f32 hot-path helpers (zero Tensor round-trips) ─────────────────
 
     /// Project `[talker_hidden]` → `[pred_hidden]` via mtp_proj (Q8 gemv).
     fn project_f32(&mut self, x: &[f32]) -> Vec<f32> {
@@ -769,15 +698,15 @@ impl CodePredictor {
     }
 
     /// Embed a single acoustic codebook token (codebook g, for g in 1..num_acoustic)
-    /// into a flat `[talker_hidden]` f32 vec.
+    /// into a flat `[talker_hidden]` f32 vec (dequantized from Q8).
     pub fn embed_acoustic_code(&self, codebook_idx: usize, token_id: u32) -> anyhow::Result<Vec<f32>> {
-        let emb = embed_token(
-            &self.codec_embd[codebook_idx],
-            token_id,
-            self.talker_hidden,
-            &self.device,
-        )?; // [1, 1, talker_hidden]
-        Ok(emb.flatten_all()?.to_vec1()?)
+        let row_blocks = self.codec_embd_q8[codebook_idx].row_blocks(token_id as usize);
+        let n_blocks = row_blocks.len();
+        let padded_len = n_blocks * QK8_0;
+        let mut row = vec![0.0f32; padded_len];
+        <BlockQ8_0 as GgmlType>::to_float(row_blocks, &mut row);
+        row.truncate(self.talker_hidden);
+        Ok(row)
     }
 
     /// Sum-embed a full code frame (c0..cN including codebook 0) into a single
