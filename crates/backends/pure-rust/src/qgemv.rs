@@ -3,7 +3,6 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::quantized::gguf_file::Content;
 use candle_core::quantized::k_quants::{BlockQ8_0, GgmlType, QK8_0};
@@ -239,9 +238,6 @@ unsafe fn q8_vec_dot_avx2(n: usize, w: &[BlockQ8_0], x: &[BlockQ8_0]) -> f32 {
     _mm_cvtss_f32(sum128)
 }
 
-/// One-shot flag to print AVX2 detection state once.
-static AVX2_REPORTED: AtomicBool = AtomicBool::new(false);
-
 /// Runtime-dispatched Q8_0 vec_dot.
 ///
 /// Uses AVX2+FMA on capable x86_64, optimized scalar everywhere else.
@@ -249,11 +245,7 @@ static AVX2_REPORTED: AtomicBool = AtomicBool::new(false);
 pub fn q8_vec_dot(n: usize, w: &[BlockQ8_0], x: &[BlockQ8_0]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
-        if !AVX2_REPORTED.swap(true, Ordering::Relaxed) {
-            eprintln!("[q8_vec_dot] AVX2+FMA: {}", if use_avx2 { "ENABLED" } else { "FALLBACK (scalar)" });
-        }
-        if use_avx2 {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { q8_vec_dot_avx2(n, w, x) };
         }
     }

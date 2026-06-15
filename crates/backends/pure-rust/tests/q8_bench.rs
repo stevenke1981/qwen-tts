@@ -514,3 +514,64 @@ fn microbench_gemv_sizes() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Equivalence test: batched vs sequential predictor with temperature=0
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires model file — run manually with --release"]
+fn test_batched_vs_sequential_equivalence() {
+    use rand::SeedableRng;
+
+    let device = Device::Cpu;
+    let path = talker_path();
+
+    // Load two independent predictors
+    fn load_predictor(path: &Path, device: &Device) -> CodePredictor {
+        let mut f = File::open(path).expect("open GGUF");
+        let content = gguf_file::Content::read(&mut f).expect("parse header");
+        CodePredictor::from_gguf(&content, &mut f, device).expect("load predictor")
+    }
+    let mut seq_pred = load_predictor(&path, &device);
+    let mut batch_pred = load_predictor(&path, &device);
+
+    let d_model = 2048;
+    let n_frames = 4;
+
+    // Deterministic inputs
+    let talker_hidden_all: Vec<f32> = (0..n_frames * d_model)
+        .map(|i| ((i as u64 * 7 + 3) % 100) as f32 / 100.0)
+        .collect();
+    let c0_embed_all: Vec<f32> = (0..n_frames * d_model)
+        .map(|i| ((i as u64 * 5 + 11) % 100) as f32 / 100.0)
+        .collect();
+
+    // Sequential per-frame (temperature=0 = argmax)
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let mut seq_frames = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        let th = &talker_hidden_all[f * d_model..(f + 1) * d_model];
+        let c0 = &c0_embed_all[f * d_model..(f + 1) * d_model];
+        seq_frames.push(
+            seq_pred.predict_one_frame_sampled(th, c0, 0.0, None, None, &mut rng),
+        );
+    }
+
+    // Batched (temperature=0 = argmax)
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let batch_frames = batch_pred.predict_n_frames_batched(
+        &talker_hidden_all, &c0_embed_all, n_frames,
+        0.0, None, None, &mut rng,
+    );
+
+    assert_eq!(batch_frames.len(), n_frames);
+    for f in 0..n_frames {
+        assert_eq!(
+            seq_frames[f], batch_frames[f],
+            "frame {f}: sequential {:?} != batched {:?}",
+            seq_frames[f], batch_frames[f],
+        );
+    }
+    println!("equivalence OK: {n_frames} frames match seq==batch");
+}

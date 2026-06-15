@@ -837,7 +837,7 @@ impl CodePredictor {
             let k_slices: Vec<&[f32]> =
                 self.k_cache_batched[i].iter().map(|v| v.as_slice()).collect();
             let v_slices: Vec<&[f32]> =
-                self.k_cache_batched[i].iter().map(|v| v.as_slice()).collect();
+                self.v_cache_batched[i].iter().map(|v| v.as_slice()).collect();
             let attn_out = batch_attention_f32_par(
                 &q_rope, &k_slices, &v_slices, n_qh, n_kvh, hd, m,
             );
@@ -1070,6 +1070,10 @@ fn interleave(x: &Tensor, n: usize) -> anyhow::Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::quantized::gguf_file;
+    use std::fs::File;
+    use std::path::Path;
+    use std::time::Instant;
 
     #[test]
     fn test_code_frame_type() {
@@ -1083,5 +1087,47 @@ mod tests {
         let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), &dev).unwrap();
         let r = interleave(&x, 2).unwrap();
         assert_eq!(r.dims(), &[2, 4]); // last dim doubled
+    }
+
+    /// Verify batched M=1 produces the same output as sequential per-frame prediction.
+    #[test]
+    #[ignore = "requires model file"]
+    fn test_batched_eq_sequential_m1() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().and_then(|p| p.parent())
+            .and_then(|p| p.parent()).unwrap()
+            .join("models")
+            .join("qwen-talker-1.7b-base-Q8_0.gguf");
+        assert!(root.exists(), "model not found: {}", root.display());
+
+        fn load(path: &Path) -> CodePredictor {
+            let mut f = File::open(path).unwrap();
+            let c = gguf_file::Content::read(&mut f).unwrap();
+            CodePredictor::from_gguf(&c, &mut f, &Device::Cpu).unwrap()
+        }
+        let mut p_seq = load(&root);
+        let mut p_batch = load(&root);
+
+        let d_model = p_seq.talker_hidden;
+        let talker_hidden: Vec<f32> = (0..d_model)
+            .map(|i| ((i as u64 * 7 + 3) % 100) as f32 / 100.0)
+            .collect();
+        let c0_embed: Vec<f32> = (0..d_model)
+            .map(|i| ((i as u64 * 5 + 11) % 100) as f32 / 100.0)
+            .collect();
+
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let seq_frame = p_seq.predict_one_frame_sampled(
+            &talker_hidden, &c0_embed, 0.0, None, None, &mut rng,
+        );
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let frames = p_batch.predict_n_frames_batched(
+            &talker_hidden, &c0_embed, 1, 0.0, None, None, &mut rng,
+        );
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(seq_frame, frames[0], "M=1 batched must match sequential");
     }
 }
