@@ -14,7 +14,7 @@ use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
 use crate::code_predictor::CodePredictor;
-use crate::custom_ops::{attention_gqa_tensor, rms_norm_tensor};
+use crate::custom_ops::{attention_gqa_flat, rms_norm_tensor};
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 
 const FN_TOKEN_EMBD: &str = "talker.text_embd.weight";
@@ -59,6 +59,8 @@ pub struct Talker {
     text_proj_fc2_b: Tensor,
     layers: Vec<DecoderLayer>,
     device: Device,
+    /// Persistent Q8 workspace (avoids re-allocation on the hot path).
+    pub(crate) q8_ws: Q8Workspace,
 }
 
 pub(crate) struct DecoderLayer {
@@ -77,60 +79,84 @@ pub(crate) struct DecoderLayer {
 }
 
 // -----------------------------------------------------------------------
-// KV Cache
+// KV Cache (flat pre-allocated buffers)
 // -----------------------------------------------------------------------
 
-/// Per-layer key/value cache for incremental decoding.
+/// Per-layer key/value cache using pre-allocated flat f32 buffers.
 ///
-/// Stores the K and V tensors for each decoder layer as they are computed,
-/// growing one position at a time. Used with `Talker::forward_step`.
-pub struct KvCache {
-    k_caches: Vec<Option<Tensor>>,
-    v_caches: Vec<Option<Tensor>>,
+/// Each layer allocates an f32 buffer of size `n_kv_heads * max_seq_len * head_dim`.
+/// On each append, the new K,V values are memcpy'd into the buffer at position
+/// `pos`. Attention reads directly from the flat buffer (zero-copy slice reference).
+///
+/// This replaces the old `KvCache` which used `Tensor::cat` — a growing
+/// allocation pattern that copies O(n²) data over the full decode run.
+pub struct KvCacheFlat {
+    n_layers: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    k_bufs: Vec<Vec<f32>>,
+    v_bufs: Vec<Vec<f32>>,
+    pos: usize,
 }
 
-impl KvCache {
-    /// Create a new cache for `n_layers` layers (all empty).
-    pub fn new(n_layers: usize) -> Self {
+impl KvCacheFlat {
+    /// Create a new cache with pre-allocated buffers of `max_seq` per head.
+    pub fn new(n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> Self {
+        let per_layer = n_kv_heads * max_seq * head_dim;
         Self {
-            k_caches: vec![None; n_layers],
-            v_caches: vec![None; n_layers],
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            k_bufs: (0..n_layers).map(|_| vec![0.0f32; per_layer]).collect(),
+            v_bufs: (0..n_layers).map(|_| vec![0.0f32; per_layer]).collect(),
+            pos: 0,
         }
-    }
-
-    /// Append K,V for one token at layer `layer`.
-    ///
-    /// K/V shapes: `[batch, n_kv_heads, 1, head_dim]`.
-    pub fn append(&mut self, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
-        let new_k = match &self.k_caches[layer] {
-            Some(cache) => Tensor::cat(&[cache, k], 2)?,
-            None => k.clone(),
-        };
-        let new_v = match &self.v_caches[layer] {
-            Some(cache) => Tensor::cat(&[cache, v], 2)?,
-            None => v.clone(),
-        };
-        self.k_caches[layer] = Some(new_k);
-        self.v_caches[layer] = Some(new_v);
-        Ok(())
     }
 
     /// Number of cached positions.
     pub fn current_len(&self) -> usize {
-        self.k_caches[0]
-            .as_ref()
-            .map(|t| t.dims()[2])
-            .unwrap_or(0)
+        self.pos
     }
 
-    /// Borrow the K cache at `layer` (returns `Some` after at least one append).
-    pub fn k(&self, layer: usize) -> Option<&Tensor> {
-        self.k_caches[layer].as_ref()
+    /// Append K,V for one token at layer `layer`.
+    ///
+    /// `k`, `v`: flat f32 slices in `[n_kv_heads, 1, head_dim]` row-major
+    /// (from the output of q8_linear after reshape). These are copied into
+    /// the pre-allocated buffer at position `pos`.
+    ///
+    /// Buffer layout: `[n_kv_heads, max_seq, head_dim]` row-major.
+    /// For head `h` at position `t`, dim `d`: offset = h * (max_seq * hd) + t * hd + d
+    pub fn append(&mut self, layer: usize, k: &[f32], v: &[f32]) {
+        let n_kv = self.n_kv_heads;
+        let hd = self.head_dim;
+        let p = self.pos;
+        let max_hd = self.max_seq * hd;
+        for h in 0..n_kv {
+            let k_src = &k[h * hd..(h + 1) * hd];
+            let k_dst = &mut self.k_bufs[layer][h * max_hd + p * hd..h * max_hd + (p + 1) * hd];
+            k_dst.copy_from_slice(k_src);
+
+            let v_src = &v[h * hd..(h + 1) * hd];
+            let v_dst = &mut self.v_bufs[layer][h * max_hd + p * hd..h * max_hd + (p + 1) * hd];
+            v_dst.copy_from_slice(v_src);
+        }
+        self.pos += 1;
     }
 
-    /// Borrow the V cache at `layer` (returns `Some` after at least one append).
-    pub fn v(&self, layer: usize) -> Option<&Tensor> {
-        self.v_caches[layer].as_ref()
+    /// Reference to the pre-allocated K buffer for `layer`.
+    ///
+    /// The buffer always has length `n_kv_heads * max_seq * head_dim`, but only
+    /// the first `current_len()` positions of each head contain valid data.
+    /// Use `head_stride = max_seq` when passing to `attention_f32`.
+    pub fn k_slice(&self, layer: usize) -> &[f32] {
+        &self.k_bufs[layer]
+    }
+
+    /// Reference to the pre-allocated V buffer for `layer`.
+    pub fn v_slice(&self, layer: usize) -> &[f32] {
+        &self.v_bufs[layer]
     }
 }
 
@@ -265,6 +291,7 @@ impl Talker {
             text_proj_fc2_b,
             layers,
             device: device.clone(),
+            q8_ws: Q8Workspace::new(),
         })
     }
 
@@ -599,18 +626,18 @@ impl Talker {
         Ok(result.contiguous()?)
     }
 
-    /// Process one token through all decoder layers with KV cache (incremental decode).
+    /// Process one token through all decoder layers with flat KV cache (incremental decode).
     ///
     /// `x`: `[batch, 1, d_model]` — single token embedding.
-    /// `cache`: mutable per-layer KV cache (will be appended to).
+    /// `cache`: mutable per-layer flat KV cache (pre-allocated f32 buffers).
     /// `cos_full`, `sin_full`: `[1, 1, max_seq, head_dim]` — precomputed RoPE
     ///   for all positions; the current position is `cache.current_len()`.
     ///
     /// Returns output-normed hidden state: `[batch, 1, d_model]`.
     pub fn forward_step(
-        &self,
+        &mut self,
         x: &Tensor,
-        cache: &mut KvCache,
+        cache: &mut KvCacheFlat,
         cos_full: &Tensor,
         sin_full: &Tensor,
     ) -> anyhow::Result<Tensor> {
@@ -624,7 +651,7 @@ impl Talker {
         let n_kv = cfg.n_kv_heads;
         let hd = cfg.head_dim();
         let head_dim_sum = n_heads * hd;
-        let mut ws = Q8Workspace::new();
+        let device = self.device().clone();
 
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = hidden.clone();
@@ -634,7 +661,7 @@ impl Talker {
             let h_2d = hidden.reshape((batch, d_model))?;
             let qkv = q8_linear_multi(
                 &[&layer.attn_q, &layer.attn_k, &layer.attn_v],
-                &h_2d, &mut ws,
+                &h_2d, &mut self.q8_ws,
             )?;
             let q = &qkv[0]; let k = &qkv[1]; let v = &qkv[2];
 
@@ -653,36 +680,36 @@ impl Talker {
             let q = apply_rope(&q, &cos, &sin)?;
             let k = apply_rope(&k, &cos, &sin)?;
 
-            // Append new K,V to cache
-            cache.append(i, &k, &v)?;
+            // Extract K,V as f32 slices and append to flat cache
+            let k_flat = k.flatten_all()?.to_vec1::<f32>()?;
+            let v_flat = v.flatten_all()?.to_vec1::<f32>()?;
+            cache.append(i, &k_flat, &v_flat);
 
-            // Get full K/V from cache
-            let k_cached = cache
-                .k(i)
-                .ok_or_else(|| anyhow::anyhow!("K cache empty after append"))?;
-            let v_cached = cache
-                .v(i)
-                .ok_or_else(|| anyhow::anyhow!("V cache empty after append"))?;
-
-            // GQA-aware attention (f32 slice, no repeat_kv needed)
-            let attn_out = attention_gqa_tensor(&q, &k_cached, &v_cached)?;
+            // GQA attention using flat buffer (no Tensor::to_vec1 on the cache)
+            let attn_out = attention_gqa_flat(
+                &q,
+                cache.k_slice(i),
+                cache.v_slice(i),
+                n_heads, n_kv, pos + 1, hd, cfg.max_seq_len,
+                &device,
+            )?;
 
             // Output projection
             let attn_out = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch, head_dim_sum))?;
-            let attn_proj = q8_linear(&layer.attn_o, &attn_out, &mut ws)?;
+            let attn_proj = q8_linear(&layer.attn_o, &attn_out, &mut self.q8_ws)?;
             hidden = (residual + attn_proj.reshape((batch, 1, d_model))?)?;
 
             // SwiGLU FFN (fused gate+up quantize)
             let residual = hidden.clone();
             hidden = rms_norm_tensor(&hidden, layer.ffn_norm.weight(), layer.ffn_norm.eps())?;
             let h_2d = hidden.reshape((batch, d_model))?;
-            let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
+            let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut self.q8_ws)?;
             let gate = candle_nn::ops::silu(&gu[0])?;
             let up = gu[1].clone();
             let hid_2d = (gate * up)?;
-            let hid_out = q8_linear(&layer.ffn_down, &hid_2d, &mut ws)?;
+            let hid_out = q8_linear(&layer.ffn_down, &hid_2d, &mut self.q8_ws)?;
             hidden = (residual + hid_out.reshape((batch, 1, d_model))?)?;
         }
 

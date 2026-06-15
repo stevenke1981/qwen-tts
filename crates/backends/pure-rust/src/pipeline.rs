@@ -12,7 +12,7 @@ use crate::code_predictor::CodePredictor;
 use crate::debug_dumper::DebugDumper;
 use crate::prompt::{build_prompt, load_gguf_metadata, parse_prompt_metadata, PromptCache, PromptMetadata};
 use crate::sampling;
-use crate::talker::{precompute_cos_sin, KvCache, Talker};
+use crate::talker::{precompute_cos_sin, KvCacheFlat, Talker};
 use crate::timing::TimingRecorder;
 use crate::tokenizer::HfTokenizer;
 
@@ -157,7 +157,8 @@ impl Pipeline {
         // 3b. Convert prompt embed to tensor and prefill one-by-one
         let input_embed = Tensor::from_slice(&prompt.input_embed, (1, t_ctx, hidden), &self.device)?;
 
-        let mut kv_cache = KvCache::new(self.talker.config().n_layers);
+        let cfg = self.talker.config();
+        let mut kv_cache = KvCacheFlat::new(cfg.n_layers, cfg.n_kv_heads, cfg.head_dim(), cfg.max_seq_len);
         let mut last_hidden: Option<Tensor> = None;
         for pos in 0..t_ctx {
             let _step_timer = timing_recorder.as_mut().map(|tr| {

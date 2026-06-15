@@ -413,9 +413,10 @@ impl CodePredictor {
 
             // ── GQA attention (f32 slice, no Tensor wrapper) ──────────────
             let kv_len = self.k_cache_data[i].len() / kv_dim;
+            // head_stride = kv_len for compact buffers (no gaps between heads).
             let attn_out_f32 = attention_f32(
                 &q_rope, &self.k_cache_data[i], &self.v_cache_data[i],
-                n_qh, n_kvh, kv_len, hd,
+                n_qh, n_kvh, kv_len, hd, kv_len,
             );
             let attn_out = Tensor::from_slice(&attn_out_f32, (batch, 1, attn_dim), &self.device)?;
 

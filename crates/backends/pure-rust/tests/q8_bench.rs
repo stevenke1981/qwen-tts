@@ -15,7 +15,7 @@ use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 
 use qwen_tts_backend_pure_rust::code_predictor::CodePredictor;
-use qwen_tts_backend_pure_rust::talker::{KvCache, Talker};
+use qwen_tts_backend_pure_rust::talker::{KvCacheFlat, Talker};
 use qwen_tts_backend_pure_rust::timing::TimingRecorder;
 
 // ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ fn bench_load_time() {
 
     // Warm up (first load is cold — disk cache).
     let start = Instant::now();
-    let talker = Talker::from_gguf(&path, &Device::Cpu)
+    let mut talker = Talker::from_gguf(&path, &Device::Cpu)
         .expect("talker should load with Q8Weights");
     let load_s = start.elapsed().as_secs_f64();
     timing.load.push(load_s);
@@ -168,10 +168,9 @@ fn bench_load_time() {
     let device = Device::Cpu;
     let batch = 1;
     let d_model = talker.config().d_model;
-    let n_layers = talker.config().n_layers;
-    let mut cache = KvCache::new(n_layers);
-    let max_seq = 2048;
     let cfg = talker.config();
+    let max_seq = 2048;
+    let mut cache = KvCacheFlat::new(cfg.n_layers, cfg.n_kv_heads, cfg.head_dim(), max_seq);
     let (cos, sin) = precompute_cos_sin(cfg.head_dim(), cfg.rope_theta, max_seq, &device)
         .expect("precompute cos/sin");
 
@@ -209,7 +208,7 @@ fn bench_128_frames() {
     // Load talker
     let path = talker_path();
     let t0 = Instant::now();
-    let talker = Talker::from_gguf(&path, &device).expect("load talker");
+    let mut talker = Talker::from_gguf(&path, &device).expect("load talker");
     let load_talker_s = t0.elapsed().as_secs_f64();
 
     // Load code predictor
@@ -253,7 +252,7 @@ fn bench_128_frames() {
         .expect("input tensor");
 
     // ---- Talker prefill (128 tokens, streaming) ----
-    let mut talker_cache = KvCache::new(n_layers);
+    let mut talker_cache = KvCacheFlat::new(n_layers, cfg.n_kv_heads, cfg.head_dim(), max_seq);
 
     for step in 0..128 {
         let start = Instant::now();
@@ -402,7 +401,7 @@ fn bench_crossval_q8_vs_f32() {
     let device = Device::Cpu;
     let path = talker_path();
 
-    let talker = Talker::from_gguf(&path, &device).expect("load talker (Q8_0)");
+    let mut talker = Talker::from_gguf(&path, &device).expect("load talker (Q8_0)");
     let cfg = talker.config();
     let n_layers = cfg.n_layers;
     let d_model = cfg.d_model;
@@ -410,7 +409,7 @@ fn bench_crossval_q8_vs_f32() {
     let (cos, sin) = precompute_cos_sin(cfg.head_dim(), cfg.rope_theta, max_seq, &device).expect("cos/sin");
 
     // Forward a single step
-    let mut cache = KvCache::new(n_layers);
+    let mut cache = KvCacheFlat::new(n_layers, cfg.n_kv_heads, cfg.head_dim(), max_seq);
     let x = Tensor::ones((1, 1, d_model), candle_core::DType::F32, &device).unwrap();
 
     let h = talker

@@ -5,7 +5,7 @@
 //! then wrap results back into candle Tensors. This avoids Tensor dispatch
 //! overhead (reshape, permute, narrow, etc.) for the hot path.
 
-use candle_core::Tensor;
+use candle_core::{Device, Tensor};
 
 // ── RMS Norm ───────────────────────────────────────────────────────────
 
@@ -143,12 +143,16 @@ pub fn silu_tensor(x: &Tensor) -> candle_core::Result<Tensor> {
 ///
 /// # Layout
 /// - `q`: `[n_heads, head_dim]` — query.
-/// - `k`: `[n_kv_heads, kv_len, head_dim]` — full key cache (f32).
+/// - `k`: `[n_kv_heads, kv_len, head_dim]` — full key cache (f32),
+///   with `head_stride` positions between heads (allows pre-allocated flat buffers).
 /// - `v`: `[n_kv_heads, kv_len, head_dim]` — full value cache (f32).
 /// - `n_heads`: number of query heads.
 /// - `n_kv_heads`: number of key/value heads.
 /// - `kv_len`: number of cached positions.
 /// - `head_dim`: dimension per head.
+/// - `head_stride`: number of positions allocated per head in the flat buffer
+///   (≥ kv_len). For a compact buffer `head_stride = kv_len`; for a
+///   pre-allocated buffer `head_stride = max_seq_len`.
 ///
 /// Returns `[n_heads * head_dim]` f32 — attention output.
 pub fn attention_f32(
@@ -159,6 +163,7 @@ pub fn attention_f32(
     n_kv_heads: usize,
     kv_len: usize,
     head_dim: usize,
+    head_stride: usize,
 ) -> Vec<f32> {
     let n_repeat = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -170,7 +175,9 @@ pub fn attention_f32(
         let q_off = h * hd;
 
         // scores[h, t] = q[h,:] · k[kv_h, t, :] * scale  for t=0..kv_len
-        let k_base = kv_h * kv_len * hd;
+        // head_stride replaces kv_len in the per-head base offset, allowing
+        // pre-allocated flat buffers where each head has head_stride slots.
+        let k_base = kv_h * head_stride * hd;
         let mut max_s = f32::NEG_INFINITY;
         let mut scores = vec![0.0f32; kv_len];
         for t in 0..kv_len {
@@ -191,7 +198,7 @@ pub fn attention_f32(
         let inv_sum = 1.0 / sum;
 
         // Weighted sum of V
-        let v_base = kv_h * kv_len * hd;
+        let v_base = kv_h * head_stride * hd;
         for d in 0..hd {
             let acc = (0..kv_len).fold(0.0f32, |acc, t| {
                 acc + scores[t] * v[v_base + t * hd + d]
@@ -233,9 +240,47 @@ pub fn attention_gqa_tensor(
         n_kv_heads,
         kv_len,
         head_dim,
+        kv_len, // head_stride = kv_len (compact layout in concatenated tensors)
     );
 
     Tensor::from_slice(&out, (batch, n_heads, 1, head_dim), q.device())
+}
+
+/// Flat-buffer variant of attention_gqa that takes raw f32 slices for K/V
+/// instead of Tensors, avoiding the to_vec1 copy of the entire KV cache.
+///
+/// # Inputs
+/// - `q`: `[1, n_heads, 1, head_dim]` — query tensor.
+/// - `k_flat`, `v_flat`: flat f32 buffers with layout `[n_kv_heads, head_stride, head_dim]`.
+/// - `kv_len`: actual number of valid positions (≤ head_stride).
+/// - `head_stride`: allocated positions per head in the flat buffer (= max_seq_len).
+///
+/// Returns `[1, n_heads, 1, head_dim]` — attention output.
+pub fn attention_gqa_flat(
+    q: &Tensor,
+    k_flat: &[f32],
+    v_flat: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    kv_len: usize,
+    head_dim: usize,
+    head_stride: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let q_slice = q.flatten_all()?.to_vec1::<f32>()?;
+
+    let out = attention_f32(
+        &q_slice,
+        k_flat,
+        v_flat,
+        n_heads,
+        n_kv_heads,
+        kv_len,
+        head_dim,
+        head_stride,
+    );
+
+    Tensor::from_slice(&out, (1, n_heads, 1, head_dim), device)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

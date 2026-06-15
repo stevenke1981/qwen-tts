@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use candle_core::{Device, Tensor};
 
-use qwen_tts_backend_pure_rust::talker::{KvCache, Talker};
+use qwen_tts_backend_pure_rust::talker::{KvCacheFlat, Talker};
 
 fn project_root() -> &'static Path {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -61,17 +61,18 @@ fn profile_cache_growth() {
     let path = talker_path();
     assert!(path.exists(), "GGUF not found: {}", path.display());
 
-    let talker = Talker::from_gguf(&path, &Device::Cpu).expect("load talker");
+    let mut talker = Talker::from_gguf(&path, &Device::Cpu).expect("load talker");
     let device = Device::Cpu;
     let cfg = talker.config();
     let d_model = cfg.d_model;
     let n_layers = cfg.n_layers;
-    let (cos, sin) = precompute_cos_sin(cfg.head_dim(), cfg.rope_theta, 2048, &device).expect("cos/sin");
+    let max_seq = 2048;
+    let (cos, sin) = precompute_cos_sin(cfg.head_dim(), cfg.rope_theta, max_seq, &device).expect("cos/sin");
 
     let x = Tensor::ones((1, 1, d_model), candle_core::DType::F32, &device).expect("input");
 
     // 128 steps measuring cache growth
-    let mut cache = KvCache::new(n_layers);
+    let mut cache = KvCacheFlat::new(n_layers, cfg.n_kv_heads, cfg.head_dim(), max_seq);
     let mut times = Vec::with_capacity(128);
     for step in 0..128 {
         let start = Instant::now();
