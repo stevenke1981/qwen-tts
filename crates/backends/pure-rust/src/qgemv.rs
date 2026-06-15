@@ -262,6 +262,103 @@ pub fn q8_linear(weights: &Q8Weights, x: &Tensor, ws: &mut Q8Workspace) -> anyho
 }
 
 // ---------------------------------------------------------------------------
+// Q8LinearMulti — fused projections sharing one input quantization
+// ---------------------------------------------------------------------------
+
+/// Quantize input **once**, then compute multiple output projections in parallel.
+///
+/// All weights must share the same `k` (input dimension). The input `x` is
+/// quantized a single time, then `vec_dot` runs against **every row of every
+/// weight matrix** in a single flat `par_iter` for maximum throughput.
+///
+/// For M > 1 (batch matmul), falls back to per-weight `q8_linear` calls since
+/// each input row requires independent quantization.
+pub fn q8_linear_multi(
+    weights: &[&Q8Weights],
+    x: &Tensor,
+    ws: &mut Q8Workspace,
+) -> anyhow::Result<Vec<Tensor>> {
+    anyhow::ensure!(!weights.is_empty(), "q8_linear_multi: empty weights");
+    let first = weights[0];
+    for w in weights {
+        anyhow::ensure!(
+            w.k == first.k,
+            "q8_linear_multi: all weights must have same k (got {} and {})",
+            w.k,
+            first.k,
+        );
+    }
+
+    let x_dims = x.dims();
+    let rank = x_dims.len();
+    anyhow::ensure!(rank >= 1, "q8_linear_multi: input must be at least 1D");
+    let bsz: usize = x_dims[..rank - 1].iter().product();
+    let in_features = x_dims[rank - 1];
+    anyhow::ensure!(
+        in_features == first.k,
+        "q8_linear_multi: input features {in_features} != k={}",
+        first.k,
+    );
+
+    let device = x.device();
+
+    if bsz == 1 {
+        // ── M=1 (GEMV): one quantize, flat parallel vec_dot ────────────
+        let x_2d = x.reshape((1, in_features))?;
+        let x_slice = x_2d.flatten_all()?.to_vec1::<f32>()?;
+
+        ws.ensure_xq(first.blocks_per_row);
+        ws.padded.clear();
+        ws.padded.extend_from_slice(&x_slice);
+        ws.padded.resize(first.padded_k, 0.0);
+        <BlockQ8_0 as GgmlType>::from_float(&ws.padded, &mut ws.x_q[..first.blocks_per_row]);
+
+        let x_q_ref: &[BlockQ8_0] = &ws.x_q[..first.blocks_per_row];
+        let padded_k = first.padded_k;
+
+        // Build row-offset table: for each weight, where its rows start in flat index.
+        let mut offsets: Vec<usize> = Vec::with_capacity(weights.len() + 1);
+        offsets.push(0);
+        for w in weights {
+            offsets.push(offsets.last().unwrap() + w.n);
+        }
+        let total_rows = *offsets.last().unwrap();
+
+        // Single flat par_iter across ALL weight rows.
+        let flat_results: Vec<f32> = (0..total_rows)
+            .into_par_iter()
+            .map(|flat_row| {
+                // Find which weight and row within that weight.
+                // Binary search would be faster for many weights; linear is fine for 2-3.
+                let (wi, row_in_w) = offsets[..weights.len()]
+                    .binary_search(&flat_row)
+                    .map(|i| (i, 0))
+                    .unwrap_or_else(|i| (i - 1, flat_row - offsets[i - 1]));
+                let w_row = weights[wi].row_blocks(row_in_w);
+                <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref)
+            })
+            .collect();
+
+        // Split flat results back into per-weight tensors.
+        let mut outputs = Vec::with_capacity(weights.len());
+        for i in 0..weights.len() {
+            let start = offsets[i];
+            let end = offsets[i + 1];
+            let slice = &flat_results[start..end];
+            outputs.push(Tensor::from_slice(slice, (1, weights[i].n), device)?);
+        }
+        Ok(outputs)
+    } else {
+        // ── M > 1 (batch matmul): fall back to sequential per-weight calls ──
+        let mut outputs = Vec::with_capacity(weights.len());
+        for w in weights {
+            outputs.push(q8_linear(w, x, ws)?);
+        }
+        Ok(outputs)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

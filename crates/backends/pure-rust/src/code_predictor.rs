@@ -36,7 +36,7 @@ use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
 use crate::sampling;
-use crate::qgemv::{q8_linear, Q8Weights, Q8Workspace};
+use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 use crate::talker::{
     apply_per_head_norm, apply_rope, embed_token, linear_fwd, repeat_kv, DecoderLayer,
 };
@@ -347,11 +347,13 @@ impl CodePredictor {
             let residual = x.clone();
             x = layer.attn_norm.forward(&x)?;
 
-            // QKV projections using Q8_0 quantized matmul
+            // QKV projections (fused quantize)
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let q = q8_linear(&layer.attn_q, &h_2d, &mut ws)?; // [B, n_q_hd * hd]
-            let k = q8_linear(&layer.attn_k, &h_2d, &mut ws)?; // [B, n_kv_hd * hd]
-            let v = q8_linear(&layer.attn_v, &h_2d, &mut ws)?; // [B, n_kv_hd * hd]
+            let qkv = q8_linear_multi(
+                &[&layer.attn_q, &layer.attn_k, &layer.attn_v],
+                &h_2d, &mut ws,
+            )?;
+            let q = &qkv[0]; let k = &qkv[1]; let v = &qkv[2];
 
             // Reshape to multi-head: [B, n_heads, 1, head_dim]
             let q = q.reshape((batch, self.n_q_heads, 1, self.head_dim))?;
@@ -406,12 +408,13 @@ impl CodePredictor {
             let attn_proj = q8_linear(&layer.attn_o, &attn_out, &mut ws)?;
             x = (residual + attn_proj.reshape((batch, 1, self.pred_hidden))?)?;
 
-            // SwiGLU FFN
+            // SwiGLU FFN (fused gate+up quantize)
             let residual = x.clone();
             x = layer.ffn_norm.forward(&x)?;
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d, &mut ws)?)?;
-            let up = q8_linear(&layer.ffn_up, &h_2d, &mut ws)?;
+            let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h_2d, &mut ws)?;
+            let gate = candle_nn::ops::silu(&gu[0])?;
+            let up = gu[1].clone();
             let hid = (gate * up)?;
             let hid_out = q8_linear(&layer.ffn_down, &hid, &mut ws)?;
             x = (residual + hid_out.reshape((batch, 1, self.pred_hidden))?)?;
