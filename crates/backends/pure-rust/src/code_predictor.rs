@@ -174,10 +174,24 @@ struct BatchScratch {
     gate_buf: Vec<f32>,      // [m_max, ffn_dim]
     up_buf: Vec<f32>,        // [m_max, ffn_dim]
     ffn_mid: Vec<f32>,       // [m_max, ffn_dim]
+
+    // ── pre-allocated matmul buffers (avoid per-call Vec allocation) ──
+    /// Quantized input blocks: [m_max * max_bpr].
+    /// Sized for the largest bpr across all weights (max 86 for ffn_down).
+    x_q_buf: Vec<BlockQ8_0>,
+    /// Padded f32 scratch: [m_max * max_padded_k].
+    padded_f32: Vec<f32>,
 }
 
 impl BatchScratch {
     fn new(m_max: usize, pred_hidden: usize, attn_dim: usize, kv_dim: usize, ffn_dim: usize) -> Self {
+        // Maximum blocks-per-row across all predictor weights (correct [n_in,n_out]):
+        //   - Q,K,V,gate,up:     k=1024  → bpr=32
+        //   - O:                 k=2048  → bpr=64
+        //   - down:              k=3072  → bpr=96
+        //   - mtp_proj:          k=2048  → bpr=64 (not used in forward_at_pos)
+        let max_bpr = ffn_dim.div_ceil(32).max(64); // ffn_dim=3072 → 96
+        let max_padded_k = max_bpr * 32;
         Self {
             m_max,
             h: vec![0.0; m_max * pred_hidden],
@@ -189,6 +203,8 @@ impl BatchScratch {
             gate_buf: vec![0.0; m_max * ffn_dim],
             up_buf: vec![0.0; m_max * ffn_dim],
             ffn_mid: vec![0.0; m_max * ffn_dim],
+            x_q_buf: vec![BlockQ8_0::zeros(); m_max * max_bpr],
+            padded_f32: vec![0.0; m_max * max_padded_k],
         }
     }
 }
@@ -343,7 +359,7 @@ impl CodePredictor {
         };
 
         // ── codec_embd tables (Q8 direct from GGUF, no transpose needed) ─
-        let num_embd = num_acoustic.saturating_sub(1); // 14
+        let num_embd = num_acoustic; // 15 (one per acoustic codegroup c1..cN)
         let mut codec_embd_q8 = Vec::with_capacity(num_embd);
         for g in 0..num_embd {
             let name = format!("code_pred.codec_embd.{g}.weight");
@@ -787,14 +803,18 @@ impl CodePredictor {
     /// `pred_input`: `[m, pred_hidden]` flattened.
     /// `m`: number of sequences (batch size ≤ batch_scratch.m_max).
     /// Returns `[m, pred_hidden]` — output-normed hidden states.
+    ///
+    /// Uses pre-allocated `x_q_buf` / `padded_f32` + parallel quantize in
+    /// `matmul_batched_prealloc`; QKV and gate+up share one quantize step
+    /// via `matmul_batched_from_quantized`.  No per-call Vec allocations
+    /// on the matmul hot path.
     fn forward_at_pos_batched(&mut self, pos: usize, pred_input: &[f32], m: usize) -> Vec<f32> {
         let n_qh = self.n_q_heads;
         let n_kvh = self.n_kv_heads;
         let hd = self.head_dim;
         let pred_h = self.pred_hidden;
-        let kv_dim = self.layers[0].attn_k.out_features();
+        let _kv_dim = self.layers[0].attn_k.out_features();
         let ffn_dim = self.layers[0].ffn_gate.out_features();
-        let eps = 1e-6_f64;
 
         let cos = &self.cos_f32[pos * hd..(pos + 1) * hd];
         let sin = &self.sin_f32[pos * hd..(pos + 1) * hd];
@@ -810,14 +830,37 @@ impl CodePredictor {
             scr.residual[..m * pred_h].copy_from_slice(&scr.h[..m * pred_h]);
             rms_norm_batched_par(&mut scr.h[..m * pred_h], &layer.attn_norm_w, m, pred_h);
 
-            // 2. QKV: three separate matmul_batched calls
-            let q_out = layer.attn_q.matmul_batched(&scr.h[..m * pred_h], m);
-            let k_out = layer.attn_k.matmul_batched(&scr.h[..m * pred_h], m);
-            let v_out = layer.attn_v.matmul_batched(&scr.h[..m * pred_h], m);
+            // 2. QKV: single quantize → three matmul_batched_from_quantized
+            let q_n = layer.attn_q.out_features();
+            let k_n = layer.attn_k.out_features();
+            let v_n = layer.attn_v.out_features();
+            let bpr_qkv = layer.attn_q.blocks_per_row(); // 32 (k=1024)
+            let pk_qkv = layer.attn_q.padded_k();         // 1024
+            let xq_sz_qkv = m * bpr_qkv;
+            let pp_sz_qkv = m * pk_qkv;
+            // Quantize once (x_q_buf filled, padded used as scratch)
+            layer.attn_q.matmul_batched_prealloc(
+                &scr.h[..m * pred_h], m,
+                &mut scr.x_q_buf[..xq_sz_qkv], &mut scr.padded_f32[..pp_sz_qkv],
+                &mut scr.attn_q_buf[..m * q_n],
+            );
+            // Reuse same quantized x_q for K and V (same k=1024, bpr=32)
+            layer.attn_k.matmul_batched_from_quantized(
+                &scr.x_q_buf[..xq_sz_qkv], m,
+                &mut scr.k_buf[..m * k_n],
+            );
+            layer.attn_v.matmul_batched_from_quantized(
+                &scr.x_q_buf[..xq_sz_qkv], m,
+                &mut scr.v_buf[..m * v_n],
+            );
 
             // 3. Per-head QK-norm
-            let q_normed = qk_norm_batched_par(&q_out, &layer.attn_q_norm_w, m, n_qh, hd);
-            let k_normed = qk_norm_batched_par(&k_out, &layer.attn_k_norm_w, m, n_kvh, hd);
+            let q_normed = qk_norm_batched_par(
+                &scr.attn_q_buf[..m * n_qh * hd], &layer.attn_q_norm_w, m, n_qh, hd,
+            );
+            let k_normed = qk_norm_batched_par(
+                &scr.k_buf[..m * n_kvh * hd], &layer.attn_k_norm_w, m, n_kvh, hd,
+            );
 
             // 4. RoPE
             let q_rope = rope_batched_par(&q_normed, cos, sin, m, n_qh, hd);
@@ -830,7 +873,7 @@ impl CodePredictor {
                 self.k_cache_batched[i][seq]
                     .extend_from_slice(&k_rope[k_start..k_start + n_kvh * hd]);
                 self.v_cache_batched[i][seq]
-                    .extend_from_slice(&v_out[v_start..v_start + n_kvh * hd]);
+                    .extend_from_slice(&scr.v_buf[v_start..v_start + n_kvh * hd]);
             }
 
             // 6. Attention per sequence (parallel)
@@ -842,14 +885,22 @@ impl CodePredictor {
                 &q_rope, &k_slices, &v_slices, n_qh, n_kvh, hd, m,
             );
 
-            // 7. O projection
-            let o_out = layer.attn_o.matmul_batched(&attn_out, m);
+            // 7. O projection into q_buf (own quantize — k=2048, bpr=64 ≠ QKV)
+            let bpr_o = layer.attn_o.blocks_per_row(); // 64
+            let pk_o = layer.attn_o.padded_k();         // 2048
+            let xq_sz_o = m * bpr_o;
+            let pp_sz_o = m * pk_o;
+            layer.attn_o.matmul_batched_prealloc(
+                &attn_out, m,
+                &mut scr.x_q_buf[..xq_sz_o], &mut scr.padded_f32[..pp_sz_o],
+                &mut scr.q_buf[..m * pred_h],
+            );
 
             // 8. Residual add: h = residual + o_out (parallel over m)
             scr.h[..m * pred_h]
                 .par_chunks_mut(pred_h)
                 .zip(scr.residual[..m * pred_h].par_chunks(pred_h))
-                .zip(o_out.par_chunks(pred_h))
+                .zip(scr.q_buf[..m * pred_h].par_chunks(pred_h))
                 .for_each(|((h_row, r_row), o_row)| {
                     for j in 0..pred_h {
                         h_row[j] = r_row[j] + o_row[j];
@@ -862,30 +913,47 @@ impl CodePredictor {
             // 10. FFN norm (in-place)
             rms_norm_batched_par(&mut scr.h[..m * pred_h], &layer.ffn_norm_w, m, pred_h);
 
-            // 11. FFN gate + up (separate matmul_batched calls)
-            let gate_out = layer.ffn_gate.matmul_batched(&scr.h[..m * pred_h], m);
-            let up_out = layer.ffn_up.matmul_batched(&scr.h[..m * pred_h], m);
+            // 11. gate+up: shared quantize + from_quantized (k=1024, bpr=32, same as QKV)
+            let gate_n = layer.ffn_gate.out_features(); // 3072
+            let up_n = layer.ffn_up.out_features();     // 3072
+            layer.ffn_gate.matmul_batched_prealloc(
+                &scr.h[..m * pred_h], m,
+                &mut scr.x_q_buf[..xq_sz_qkv], &mut scr.padded_f32[..pp_sz_qkv],
+                &mut scr.gate_buf[..m * gate_n],
+            );
+            layer.ffn_up.matmul_batched_from_quantized(
+                &scr.x_q_buf[..xq_sz_qkv], m,
+                &mut scr.up_buf[..m * up_n],
+            );
 
             // 12. SiLU(gate) * up → ffn_mid (parallel over m)
-            let gate_act = silu_batched_par(&gate_out, m, ffn_dim);
+            let gate_act = silu_batched_par(&scr.gate_buf[..m * ffn_dim], m, ffn_dim);
             scr.ffn_mid[..m * ffn_dim]
                 .par_chunks_mut(ffn_dim)
                 .zip(gate_act.par_chunks(ffn_dim))
-                .zip(up_out.par_chunks(ffn_dim))
+                .zip(scr.up_buf[..m * ffn_dim].par_chunks(ffn_dim))
                 .for_each(|((fm_row, g_row), u_row)| {
                     for j in 0..ffn_dim {
                         fm_row[j] = g_row[j] * u_row[j];
                     }
                 });
 
-            // 13. Down projection
-            let down_out = layer.ffn_down.matmul_batched(&scr.ffn_mid[..m * ffn_dim], m);
+            // 13. Down projection into q_buf (different bpr from QKV)
+            let bpr_down = layer.ffn_down.blocks_per_row();
+            let pk_down = layer.ffn_down.padded_k();
+            let xq_sz_down = m * bpr_down;
+            let pp_sz_down = m * pk_down;
+            layer.ffn_down.matmul_batched_prealloc(
+                &scr.ffn_mid[..m * ffn_dim], m,
+                &mut scr.x_q_buf[..xq_sz_down], &mut scr.padded_f32[..pp_sz_down],
+                &mut scr.q_buf[..m * pred_h],
+            );
 
             // 14. Residual add: h = residual + down_out
             scr.h[..m * pred_h]
                 .par_chunks_mut(pred_h)
                 .zip(scr.residual[..m * pred_h].par_chunks(pred_h))
-                .zip(down_out.par_chunks(pred_h))
+                .zip(scr.q_buf[..m * pred_h].par_chunks(pred_h))
                 .for_each(|((h_row, r_row), d_row)| {
                     for j in 0..pred_h {
                         h_row[j] = r_row[j] + d_row[j];
@@ -1004,7 +1072,7 @@ impl CodePredictor {
         self.talker_hidden
     }
 
-    /// Embed a single acoustic codebook token (codebook g, for g in 1..num_acoustic)
+    /// Embed a single acoustic codebook token for `codebook_idx` (0-based, mapping to c1..cN)
     /// into a flat `[talker_hidden]` f32 vec (dequantized from Q8).
     pub fn embed_acoustic_code(&self, codebook_idx: usize, token_id: u32) -> anyhow::Result<Vec<f32>> {
         let row_blocks = self.codec_embd_q8[codebook_idx].row_blocks(token_id as usize);

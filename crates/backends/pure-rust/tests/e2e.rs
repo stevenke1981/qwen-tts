@@ -256,7 +256,7 @@ fn test_pipeline_full_synthesize() {
 
     let request = SynthesisRequest {
         text: "Hello, world.".into(),
-        language: "en".into(),
+        language: "english".into(),
         speaker: None,
         instruct: None,
         ref_audio_path: None,
@@ -313,12 +313,13 @@ fn test_pipeline_full_synthesize() {
 #[test]
 #[ignore = "requires ~8 GB RAM and ~40 seconds"]
 fn test_pipeline_minimal_synthesize() {
+
     let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &Device::Cpu)
         .expect("pipeline should load");
 
     let request = SynthesisRequest {
         text: "Hi.".into(),
-        language: "en".into(),
+        language: "english".into(),
         speaker: None,
         instruct: None,
         ref_audio_path: None,
@@ -362,4 +363,268 @@ fn test_pipeline_minimal_synthesize() {
         audio.len(),
         nonzero,
     );
+}
+
+/// Diagnostic: compare generated codes between pure-Rust and C++ FFI reference.
+///
+/// C++ FFI reference (argmax, seed=42, "Hello, this is a test.", max-tokens 2):
+///   Frame 0: c0=404, c1=[0, 901, 81, 366, 647, 1301, 609, 546, 351, 205, 1659, 1607, 181, 754, 121]
+///   Frame 1: c0=1014, c1=[969, 769, 326, 21, 1719, 2009, 153, 417, 649, 145, 932, 1832, 411, 83, 404]
+#[test]
+#[ignore = "diagnostic: ~10 GB RAM, ~5 min"]
+fn test_compare_codes_with_cpp() {
+    let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &Device::Cpu)
+        .expect("pipeline should load");
+
+    let request = SynthesisRequest {
+        text: "Hello, this is a test.".into(),
+        language: "english".into(),
+        speaker: None,
+        instruct: None,
+        ref_audio_path: None,
+        ref_text: None,
+        seed: Some(42),
+        max_new_tokens: Some(2),
+        temperature: Some(1.0),
+        top_k: Some(40),
+        top_p: Some(0.9),
+        repetition_penalty: None,
+        do_sample: None, // argmax
+        out_path: std::path::Path::new("/tmp/compare-codes.wav").to_path_buf(),
+        device: qwen_tts_runtime::DeviceKind::Cpu,
+        models: qwen_tts_core::TtsModelSet::new(&talker_path(), &codec_path()),
+    };
+
+    let (codes, n_frames, audio) = pipeline.synthesize_raw(&request, None)
+        .expect("synthesize_raw should succeed");
+
+    // Print generated codes
+    println!("Pure-Rust generated codes ({n_frames} frames, {} total tokens):", codes.len());
+    for f in 0..n_frames {
+        let start = f * 16;
+        let end = start + 16;
+        if end <= codes.len() {
+            let frame_codes: Vec<String> = codes[start..end].iter().map(|c| c.to_string()).collect();
+            println!("  Frame {}: [{}]", f, frame_codes.join(", "));
+        }
+    }
+
+    // C++ reference (argmax, seed=42, "Hello, this is a test.", 2 tokens)
+    let cpp_frame0: Vec<i32> = vec![404, 0, 901, 81, 366, 647, 1301, 609, 546, 351, 205, 1659, 1607, 181, 754, 121];
+    let cpp_frame1: Vec<i32> = vec![1014, 969, 769, 326, 21, 1719, 2009, 153, 417, 649, 145, 932, 1832, 411, 83, 404];
+
+    println!();
+    println!("C++ FFI reference codes:");
+    println!("  Frame 0: [{}]", cpp_frame0.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
+    println!("  Frame 1: [{}]", cpp_frame1.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
+
+    // Compare frame 0
+    if n_frames >= 1 {
+        let rust_f0: Vec<i32> = codes[0..16].to_vec();
+        let match_f0: Vec<bool> = rust_f0.iter().zip(cpp_frame0.iter()).map(|(a, b)| a == b).collect();
+        let match_count_f0 = match_f0.iter().filter(|&&m| m).count();
+        println!();
+        println!("Frame 0 match: {}/16", match_count_f0);
+        for i in 0..16 {
+            if rust_f0[i] != cpp_frame0[i] {
+                println!("  c{}: rust={} cpp={} MISMATCH", i, rust_f0[i], cpp_frame0[i]);
+            }
+        }
+    }
+
+    if n_frames >= 2 {
+        let rust_f1: Vec<i32> = codes[16..32].to_vec();
+        let match_f1: Vec<bool> = rust_f1.iter().zip(cpp_frame1.iter()).map(|(a, b)| a == b).collect();
+        let match_count_f1 = match_f1.iter().filter(|&&m| m).count();
+        println!("Frame 1 match: {}/16", match_count_f1);
+        for i in 0..16 {
+            if rust_f1[i] != cpp_frame1[i] {
+                println!("  c{}: rust={} cpp={} MISMATCH", i, rust_f1[i], cpp_frame1[i]);
+            }
+        }
+    }
+
+    // Print audio stats
+    let peak = audio.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    let rms: f64 = (audio.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / audio.len() as f64).sqrt();
+    println!();
+    println!("Audio: {} samples, peak={peak}, rms={rms:.1}", audio.len());
+
+    // Dump summary
+    if n_frames >= 1 {
+        let rust_f0: Vec<i32> = codes[0..16].to_vec();
+        let match_f0 = rust_f0.iter().zip(cpp_frame0.iter()).filter(|(a, b)| a == b).count();
+        if match_f0 == 16 {
+            println!("RESULT: Frame 0 EXACT MATCH ✓");
+        } else {
+            println!("RESULT: Frame 0 DIFFERS ({} match, {} mismatch)", match_f0, 16 - match_f0);
+        }
+    }
+    if n_frames >= 2 {
+        let rust_f1: Vec<i32> = codes[16..32].to_vec();
+        let match_f1 = rust_f1.iter().zip(cpp_frame1.iter()).filter(|(a, b)| a == b).count();
+        if match_f1 == 16 {
+            println!("RESULT: Frame 1 EXACT MATCH ✓");
+        } else {
+            println!("RESULT: Frame 1 DIFFERS ({} match, {} mismatch)", match_f1, 16 - match_f1);
+        }
+    }
+}
+
+/// Dump all metadata keys from the talker GGUF.
+#[test]
+#[ignore = "diagnostic"]
+fn test_dump_metadata() {
+    use gguf_file::Value;
+
+    let mut file = File::open(&talker_path()).expect("open talker GGUF");
+    let content = gguf_file::Content::read(&mut file).expect("parse GGUF header");
+    let meta = &content.metadata;
+
+    println!("GGUF metadata keys:");
+    let mut keys: Vec<&String> = meta.keys().collect();
+    keys.sort();
+    for k in &keys {
+        let v = &meta[*k];
+        let preview = match v {
+            Value::String(s) => format!("string(len={})", s.len()),
+            Value::U32(u) => format!("u32({u})"),
+            Value::F32(f) => format!("f32({f})"),
+            Value::Array(arr) => format!("array(len={})", arr.len()),
+            Value::Bool(b) => format!("bool({b})"),
+            _ => format!("{v:?}"),
+        };
+        println!("  {k}: {preview}");
+    }
+
+    // Dump language names
+    println!();
+    if let Some(names_arr) = meta.get("qwen3-tts.codec.language_names").and_then(|v| v.to_vec().ok()) {
+        let ids_vec = meta.get("qwen3-tts.codec.language_ids").and_then(|v| v.to_vec().ok()).cloned().unwrap_or_default();
+        for (i, n) in names_arr.iter().enumerate() {
+            let name = n.to_string().ok().cloned().unwrap_or_default();
+            let id = ids_vec.get(i).and_then(|v| v.to_u32().ok()).unwrap_or(0);
+            println!("  language[{i}]: id={id} name='{name}'");
+        }
+    } else {
+        println!("  (no qwen3-tts.codec.language_names key)");
+    }
+
+    // Count codec_embd and lm_head tensors in the GGUF
+    let codec_embd_count = content.tensor_infos.keys().filter(|k| k.contains("code_pred.codec_embd.")).count();
+    let lm_head_count = content.tensor_infos.keys().filter(|k| k.contains("code_pred.lm_head.")).count();
+    println!("  code_pred.codec_embd.* count: {codec_embd_count}");
+    println!("  code_pred.lm_head.* count: {lm_head_count}");
+
+    // Dump speaker names
+    if let Some(spk_arr) = meta.get("qwen3-tts.codec.speaker_names").and_then(|v| v.to_vec().ok()) {
+        let ids_vec = meta.get("qwen3-tts.codec.speaker_ids").and_then(|v| v.to_vec().ok()).cloned().unwrap_or_default();
+        let dial_vec = meta.get("qwen3-tts.codec.speaker_dialects").and_then(|v| v.to_vec().ok()).cloned().unwrap_or_default();
+        for (i, n) in spk_arr.iter().enumerate() {
+            let name = n.to_string().ok().cloned().unwrap_or_default();
+            let id = ids_vec.get(i).and_then(|v| v.to_u32().ok()).unwrap_or(0);
+            let dial = dial_vec.get(i).and_then(|v| v.to_string().ok().cloned()).unwrap_or_default();
+            println!("  speaker[{i}]: id={id} name='{name}' dialect='{dial}'");
+        }
+    } else {
+        println!("  (no qwen3-tts.codec.speaker_names key)");
+    }
+}
+
+/// DEFINITIVE DIAGNOSTIC: Compare Q8Weights::from_gguf gemv against candle's
+/// dequantized matmul for a REAL GGUF tensor (talker layer 0 attn_k).
+///
+/// This isolates whether the Q8 block layout interpretation is correct.
+/// If the two results differ significantly, the block layout is wrong.
+#[test]
+#[ignore = "diagnostic: ~8 GB RAM"]
+fn test_q8_vs_candle_dequant() {
+    use qwen_tts_backend_pure_rust::qgemv::{Q8Weights, Q8Workspace};
+
+    let path = talker_path();
+    let device = Device::Cpu;
+    let mut file = File::open(&path).expect("open talker GGUF");
+    let content = gguf_file::Content::read(&mut file).expect("parse GGUF header");
+
+    // Load attn_k of layer 0 via both paths
+    let tensor_name = "talker.blk.0.attn_k.weight";
+
+    // 1. Candle dequantized (reference)
+    let qt = content.tensor(&mut file, tensor_name, &device)
+        .expect("load tensor via candle");
+    let w_f32 = qt.dequantize(&device).expect("dequantize");
+    let w_f32_vec: Vec<f32> = w_f32.flatten_all().unwrap().to_vec1().unwrap();
+
+    let dims_after_reversal = w_f32.dims().to_vec();
+    println!("Tensor '{}':", tensor_name);
+    println!("  Candle dims (after reversal): {:?}", dims_after_reversal);
+
+    // 2. Our Q8 loading
+    let q8 = Q8Weights::from_gguf(&content, &mut file, tensor_name)
+        .expect("load Q8 weight");
+    let (q8_n, q8_k) = q8.shape();
+    println!("  Q8Weights: n={}, k={}, blocks_per_row={}, padded_k={}", q8_n, q8_k, q8.blocks_per_row(), q8.padded_k());
+
+    // 3. Create a deterministic test input
+    let k_dim = q8_k; // in_features from our Q8 interpretation
+    let mut x: Vec<f32> = Vec::with_capacity(k_dim);
+    for i in 0..k_dim {
+        x.push(((i * 7 + 3) % 100) as f32 / 50.0 - 1.0);
+    }
+
+    // 4. Our Q8 gemv result
+    let mut ws = Q8Workspace::new();
+    let y_q8 = q8.gemv(&x, &mut ws);
+
+    // 5. Candle reference: need to match the same operation.
+    //    Our gemv computes: y[i] = sum_j(W_q8[i][j] * x[j])  (i=output, j=input)
+    //    Candle has W as a 2D tensor with dims = dims_after_reversal.
+    //    If dims = [out, in], then: y = W @ x_tensor
+    //    If dims = [in, out], then: y = x_tensor @ W (wrong!) or y = W^T @ x_tensor
+    let x_tensor = candle_core::Tensor::from_vec(x.clone(), (k_dim,), &device).unwrap();
+
+    // Try the correct matmul direction based on dims
+    let out_dim_from_dims = dims_after_reversal[0];
+    let in_dim_from_dims = dims_after_reversal[1];
+
+    println!("  Candle dims[0]={}, dims[1]={}", out_dim_from_dims, in_dim_from_dims);
+    println!("  Q8 n={} (our output dim), k={} (our input dim)", q8_n, q8_k);
+
+    // Candle matmul: W[1024, 2048] @ x[2048, 1] → [1024, 1]
+    // x needs to be column vector for candle matmul convention
+    let x_col = x_tensor.reshape((k_dim, 1)).unwrap();
+    let y_candle_2d = w_f32.matmul(&x_col).unwrap();
+    let y_candle: Vec<f32> = y_candle_2d.reshape((out_dim_from_dims,)).unwrap().to_vec1().unwrap();
+    println!("  Matmul: W[{},{}] @ x[{}] → y[{}]", out_dim_from_dims, in_dim_from_dims, k_dim, y_candle.len());
+
+    if !y_candle.is_empty() {
+        assert_eq!(y_q8.len(), y_candle.len(),
+            "output length mismatch: Q8={} candle={}", y_q8.len(), y_candle.len());
+
+        // Compare
+        let mut max_rel_err = 0.0f32;
+        let mut max_abs_err = 0.0f32;
+        let mut first_mismatch = None;
+        for i in 0..y_q8.len().min(32) {
+            let abs_err = (y_q8[i] - y_candle[i]).abs();
+            let rel_err = abs_err / y_candle[i].abs().max(1e-6);
+            if rel_err > max_rel_err { max_rel_err = rel_err; }
+            if abs_err > max_abs_err { max_abs_err = abs_err; }
+            if first_mismatch.is_none() && abs_err > 0.1 {
+                first_mismatch = Some(i);
+            }
+            if i < 8 {
+                println!("  [{i}] Q8={:.6}  candle={:.6}  abs_err={:.6}  rel_err={:.4}%",
+                    y_q8[i], y_candle[i], abs_err, rel_err * 100.0);
+            }
+        }
+        println!("  Max abs err: {:.6}", max_abs_err);
+        println!("  Max rel err: {:.2}%", max_rel_err * 100.0);
+        if let Some(idx) = first_mismatch {
+            println!("  First mismatch at index {idx}");
+        } else {
+            println!("  All first 32 elements match within 0.1 abs tolerance ✓");
+        }
+    }
+
 }

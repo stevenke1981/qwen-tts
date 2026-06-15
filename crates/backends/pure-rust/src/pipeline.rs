@@ -123,6 +123,20 @@ impl Pipeline {
         let hidden = prompt.hidden;
         let t_ctx = prompt.T_ctx;
 
+        // Diagnostic: print prompt layout and first few embedding values
+        log::info!(
+            "[Pipeline-Debug] prompt_ids={:?} T_ctx={} hidden={} N_text={}",
+            &prompt.prompt_ids[..prompt.prompt_ids.len().min(20)],
+            t_ctx, hidden, prompt.N_text,
+        );
+        // Print first row (position 0) first 8 values
+        if prompt.input_embed.len() >= 8 {
+            log::info!(
+                "[Pipeline-Debug] prompt_embed row0 [0..8] = {:?}",
+                &prompt.input_embed[..8]
+            );
+        }
+
         // --- 2. Sampling configuration ---
         let temperature = request.temperature.unwrap_or(1.0);
         let top_k = request.top_k.map(|v| v as usize);
@@ -208,6 +222,12 @@ impl Pipeline {
                 sampling::argmax_idx(&cb0_logits)
             };
             drop(_cb0_timer);
+
+            log::info!(
+                "[Pipeline-Debug] frame={} cb0={} (logits len={}, argmax_idx={})",
+                frame_idx, cb0_token, cb0_logits.len(),
+                cb0_logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(0),
+            );
 
             // EOS detection — stop generation when codec_eos is emitted.
             if cb0_token == codec_eos_id {
@@ -334,6 +354,172 @@ impl Pipeline {
     /// Convenience wrapper without timing recorder.
     pub fn synthesize_simple(&mut self, request: &SynthesisRequest) -> anyhow::Result<Vec<i16>> {
         self.synthesize(request, None)
+    }
+
+    /// Synthesize and return raw code tokens alongside audio samples.
+    ///
+    /// Returns `(all_codes, num_frames, audio_i16)` where `all_codes` is a flat
+    /// buffer of `[num_frames, 16]` codebook indices (row-major i32).
+    pub fn synthesize_raw(
+        &mut self,
+        request: &SynthesisRequest,
+        timing_recorder: Option<&mut TimingRecorder>,
+    ) -> anyhow::Result<(Vec<i32>, usize, Vec<i16>)> {
+        // Run full synthesis to get audio, but also capture codes.
+        // We temporarily monkey-patch by re-running the synthesis inline and
+        // capturing codes. To avoid duplicating all the logic, we add a small
+        // hook: store codes on the struct during synthesize_raw.
+        //
+        // NOTE: This is a minimal diagnostic path. The codes are captured from
+        // the internal synthesize by re-running and intercepting via the dumper
+        // — but that's wasteful. Instead, factor out the core loop.
+        //
+        // Simplest approach: duplicate the synthesize logic here but return codes.
+        let raw_text = &request.text;
+        if raw_text.trim().is_empty() {
+            anyhow::bail!("text cannot be empty");
+        }
+
+        let t1 = std::time::Instant::now();
+        let tokenizer = &self.tokenizer;
+
+        let ref_spk_emb: Option<&[f32]> = None;
+        let ref_codes: Option<&[i32]> = None;
+        let ref_codes_t: usize = 0;
+
+        let prompt = build_prompt(
+            &self.talker,
+            &self.device,
+            &self.prompt_metadata,
+            &mut self.prompt_cache,
+            tokenizer,
+            Some(&self.code_predictor),
+            raw_text,
+            &request.language,
+            request.instruct.as_deref().unwrap_or(""),
+            request.speaker.as_deref().unwrap_or(""),
+            ref_spk_emb,
+            request.ref_text.as_deref().unwrap_or(""),
+            ref_codes,
+            ref_codes_t,
+        )?;
+
+        let hidden = prompt.hidden;
+        let t_ctx = prompt.T_ctx;
+
+        let temperature = request.temperature.unwrap_or(1.0);
+        let top_k = request.top_k.map(|v| v as usize);
+        let top_p = request.top_p.map(|v| v as f32);
+        let repetition_penalty = request.repetition_penalty.unwrap_or(1.0);
+        let seed = request.seed.map(|s| s as u64);
+        let mut rng: StdRng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
+        let num_frames = request.max_new_tokens.unwrap_or(1024) as usize;
+        let do_sample = request.do_sample.unwrap_or(true);
+        let codec_eos_id = self.prompt_metadata.codec_specials.eos_id;
+        let talker_vocab = self.talker.config().vocab_size;
+
+        let codec_codebooks: usize = 16;
+        let mut all_codes: Vec<i32> = Vec::with_capacity(num_frames * codec_codebooks);
+        let mut talker_history: Vec<u32> = Vec::with_capacity(num_frames);
+
+        let max_seq = self.talker.config().max_seq_len;
+        let hd = self.talker.config().head_dim();
+        let (cos_flat, sin_flat) = precompute_cos_sin_flat(self.talker.config(), max_seq);
+
+        let input_embed = Tensor::from_slice(&prompt.input_embed, (1, t_ctx, hidden), &self.device)?;
+
+        let cfg = self.talker.config();
+        let mut kv_cache = KvCacheFlat::new(cfg.n_layers, cfg.n_kv_heads, cfg.head_dim(), cfg.max_seq_len);
+        let mut last_hidden: Option<Vec<f32>> = None;
+        for pos in 0..t_ctx {
+            let emb = input_embed.i((.., pos..pos + 1, ..))?;
+            let emb_flat: Vec<f32> = emb.flatten_all()?.to_vec1()?;
+            let cos_pos = &cos_flat[pos * hd..(pos + 1) * hd];
+            let sin_pos = &sin_flat[pos * hd..(pos + 1) * hd];
+            let hidden_vec = self
+                .talker
+                .forward_step_fused(&emb_flat, &mut kv_cache, pos, cos_pos, sin_pos);
+            last_hidden = Some(hidden_vec);
+        }
+        let mut last_hidden = last_hidden
+            .ok_or_else(|| anyhow::anyhow!("empty sequence after prompt prefill"))?;
+
+        for frame_idx in 0..num_frames {
+            let last_hidden_t = Tensor::from_slice(&last_hidden, (1, 1, hidden), &self.device)?;
+            let cb0_logits_t = self.talker.predict_codebook0(&last_hidden_t)?;
+            let mut cb0_logits: Vec<f32> = cb0_logits_t.flatten_all()?.to_vec1()?;
+            let suppress_lo = talker_vocab.saturating_sub(1024);
+            let suppress_hi = talker_vocab;
+            sampling::apply_suppress(&mut cb0_logits, suppress_lo, suppress_hi, codec_eos_id);
+            let cb0_token = if do_sample {
+                let (tok, _prob) = sampling::sample_token(
+                    &cb0_logits, temperature, top_k, top_p, &mut rng,
+                    Some(&talker_history), repetition_penalty,
+                );
+                tok
+            } else {
+                sampling::argmax_idx(&cb0_logits)
+            };
+
+            if cb0_token == codec_eos_id {
+                log::info!("[Pipeline] EOS at step {}, stopping", frame_idx);
+                break;
+            }
+            talker_history.push(cb0_token);
+
+            let cb0_emb = self.talker.embed_codebook0_f32(cb0_token)?;
+
+            let frame: Vec<u32> = if do_sample {
+                self.code_predictor.predict_one_frame_sampled(&last_hidden, &cb0_emb, temperature, top_k, top_p, &mut rng)
+            } else {
+                self.code_predictor.predict_one_frame_argmax(&last_hidden, &cb0_emb)
+            };
+
+            let codes: Vec<u32> = std::iter::once(cb0_token).chain(frame.iter().copied()).collect();
+            let codec_sum = self.code_predictor.embed_frame(&self.talker, &codes)?;
+
+            let overlay: &[f32] = if frame_idx < prompt.T_trailing {
+                let off = frame_idx * hidden;
+                &prompt.trailing_text_hidden[off..off + hidden]
+            } else {
+                &prompt.tts_pad_embed
+            };
+
+            let mut next_emb_vec = vec![0.0f32; hidden];
+            for i in 0..hidden {
+                next_emb_vec[i] = codec_sum[i] + overlay[i];
+            }
+
+            all_codes.push(cb0_token as i32);
+            for &token in &frame {
+                all_codes.push(token as i32);
+            }
+            while all_codes.len() < (frame_idx + 1) * codec_codebooks {
+                all_codes.push(0);
+            }
+
+            let pos = kv_cache.current_len();
+            let cos_pos = &cos_flat[pos * hd..(pos + 1) * hd];
+            let sin_pos = &sin_flat[pos * hd..(pos + 1) * hd];
+            let hidden_vec = self
+                .talker
+                .forward_step_fused(&next_emb_vec, &mut kv_cache, pos, cos_pos, sin_pos);
+            last_hidden = hidden_vec;
+        }
+
+        let total_frames = all_codes.len() / codec_codebooks;
+        all_codes.truncate(total_frames * codec_codebooks);
+
+        let audio_f32 = self.codec_decoder.decode(&all_codes, total_frames);
+        let audio_i16: Vec<i16> = audio_f32
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect();
+
+        Ok((all_codes, total_frames, audio_i16))
     }
 }
 

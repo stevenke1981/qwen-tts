@@ -225,3 +225,20 @@
 **Trigger:** Multi-level parallel optimization (QKV fusion, head-level par, element-wise par) improved talker by 8.8% (68→63ms/step) but predictor stayed unchanged. The bottleneck was f32 matmul (project_f32, apply_lm_head_f32), not Q8 ops.
 **Rule:** Before adding parallelism, profile to identify the actual bottleneck. Q8 GEMV is memory-bandwidth-bound — adding more CPU cores to a memory-bound op yields diminishing returns. Head-level parallelism helps when head_dim ops are compute-bound (norm, RoPE, attention) but does not help when the bottleneck is reading weight data from DRAM (gemv). Check compute-to-memory ratio before deciding where to add threads.
 **Source:** 2026-06-15-multi-level-parallel-optimization
+
+---
+## Lesson #34 — 2026-06-15
+**Trigger:** Predictor's f32 matmul layers (project_f32, apply_lm_head_f32, embed_codec_f32) were bottlenecked at 250ms/frame. Adding parallelism (Lesson #33) didn't help. Converting the three weight matrices (mtp_proj: 1024×2048, lm_heads: 15×2048×1024, codec_embd: 14×2048×2048) from f32 to Q8_0 via `Q8Weights::from_f32_data` and using `gemv_into` / `gemv_into_quantized` cut predictor time 2.9× (250ms→85ms/frame).
+**Rule:** For memory-bandwidth-bound f32 matmul where each output element reads every input element once, Q8_0 quantization (4 bytes/weight → ~1 byte/weight) reduces DRAM traffic by ~75%, translating to ~3× speedup on CPU. Combine with codec_embd Q8 row lookup fused into mtp_proj's `gemv_into_quantized` to skip the f32 dequantize+project round-trip entirely. GGML's design principle — solve the memory bandwidth wall — applies equally to custom Rust Q8 GEMV implementations.
+**Source:** perf(predictor): Q8_0 quantize mtp_proj, lm_heads, codec_embd
+---
+## Lesson #1 — 2026-06-15
+**Trigger:** Batched predictor M=1 produced different output than sequential M=1. Debugging revealed k_cache_batched was used for both key and value slices.
+**Rule:** When building multi-cache structures for batched attention, double-check each slice variable reads from the correct cache. A copy-paste error (k → v) silently produces wrong attention output with no runtime error.
+**Source:** Phase 5 bug fix — forward_at_pos_batched v_slices
+
+---
+## Lesson #2 — 2026-06-15
+**Trigger:** Believed `from_gguf` had a shape bug (n/k swapped) for non-square Q8 weights. Spent hours analyzing and "fixing", but the original code `n=shape[0]; k=shape[1]` was always correct. candle_core reverses GGUF dimensions on read (gguf_file.rs:438): GGUF file stores `[n_in, n_out]` (innermost=n_in=k), after reversal → `[n_out, n_in]`. So shape[0] = n_out (rows), shape[1] = n_in (cols, contiguous for Q8 blocks). The assertion failures were from NEW code (forward_at_pos_batched using wrong bpr), not the old from_gguf.
+**Rule:** Before "fixing" a suspected bug in working code, verify by reading the ACTUAL candle source (gguf_file.rs write path writes `dims.iter().rev()`; read path reverses back). Then run a WITH-model equivalence test BEFORE making code changes. If the existing code loads models correctly (model run doesn't panic), the load-time shape reading is likely correct — the bug is probably in NEW code that consumes the values. Never assume a working function is buggy without first proving the bug with a model-grounded test.
+**Source:** Phase 6 shape fix revert

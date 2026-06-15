@@ -157,6 +157,13 @@ pub fn parse_text_specials(meta: &HashMap<String, gguf_file::Value>) -> anyhow::
     })
 }
 
+/// Try to convert a GGUF Value to u32, accepting U32, I32, U16, I16, U8, I8.
+fn value_to_u32(v: &gguf_file::Value) -> Option<u32> {
+    v.to_u32().ok().or_else(|| {
+        v.to_i32().ok().map(|i| i as u32)
+    })
+}
+
 /// Parse language entries from GGUF metadata arrays.
 fn parse_languages(meta: &HashMap<String, gguf_file::Value>) -> Vec<LanguageEntry> {
     let names = meta
@@ -173,7 +180,7 @@ fn parse_languages(meta: &HashMap<String, gguf_file::Value>) -> Vec<LanguageEntr
         .and_then(|v| v.to_vec().ok())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.to_u32().ok())
+                .filter_map(value_to_u32)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -396,6 +403,7 @@ pub fn build_prompt(
     );
     let ids = tokenizer.encode(&full_text)?;
     let N = ids.len();
+    log::info!("[Prompt] Tokenized: full_text={:?}, N={}, ids={:?}", full_text, N, &ids[..N.min(20)]);
     anyhow::ensure!(N >= 8, "tokenized prompt too short: {} tokens", N);
     let N_text = N - 8;
     anyhow::ensure!(N_text > 0, "no utterance text in prompt (N={})", N);

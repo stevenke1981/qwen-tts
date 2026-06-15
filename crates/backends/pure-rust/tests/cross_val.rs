@@ -124,7 +124,7 @@ fn pure_rust_synthesize(
 
     let request = SynthesisRequest {
         text: text.into(),
-        language: "en".into(),
+        language: "english".into(),
         speaker: None,
         instruct: None,
         ref_audio_path: None,
@@ -333,6 +333,119 @@ fn test_pure_rust_sample_vs_argmax() {
     );
 }
 
+/// Generate speech with both backends, save WAVs to `models/`, and compare.
+#[test]
+#[ignore = "requires external qwen-tts.exe binary"]
+fn test_generate_and_compare_wavs() {
+    let out_dir = project_root().join("models");
+
+    // ── 1. Pure Rust: synthesize 64 frames ────────────────────────────────
+    eprintln!("[Pure Rust] Synthesizing 64 frames (temperature=1.0, seed=42)...");
+    let device = Device::Cpu;
+    let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &device)
+        .expect("load pure-rust pipeline");
+
+    let request = SynthesisRequest {
+        text: "Hello, this is a test of the pure Rust text to speech system.".into(),
+        language: "english".into(),
+        speaker: None,
+        instruct: None,
+        ref_audio_path: None,
+        ref_text: None,
+        seed: Some(42),
+        max_new_tokens: Some(32),
+        temperature: Some(1.0),
+        top_k: Some(40),
+        top_p: Some(0.9),
+        repetition_penalty: None,
+        do_sample: Some(true),
+        out_path: PathBuf::new(),
+        device: qwen_tts_runtime::DeviceKind::Cpu,
+        models: qwen_tts_core::TtsModelSet::new(&talker_path(), &codec_path()),
+    };
+
+    let t0 = std::time::Instant::now();
+    let pure_audio = pipeline.synthesize_simple(&request)
+        .expect("pure rust synthesize");
+    let pure_time = t0.elapsed().as_secs_f64();
+
+    let pure_wav = out_dir.join("pure-rust-e2e.wav");
+    write_i16_wav(&pure_wav, &pure_audio, 24000);
+    eprintln!("[Pure Rust] Done: {pure_time:.2}s, {} samples -> {}",
+        pure_audio.len(), pure_wav.display());
+
+    // ── 2. C++ FFI: synthesize with same params ───────────────────────────
+    eprintln!("[FFI C++] Synthesizing 32 frames (temperature=1.0, seed=42)...");
+    let ffi_wav = out_dir.join("ffi-cpp-e2e.wav");
+
+    let t0 = std::time::Instant::now();
+    let output = Command::new(qwen_tts_bin())
+        .arg("synth")
+        .arg("--text").arg("Hello, this is a test of the pure Rust text to speech system.")
+        .arg("--talker").arg(talker_path())
+        .arg("--codec").arg(codec_path())
+        .arg("--lang").arg("english")
+        .arg("--out").arg(&ffi_wav)
+        .arg("--max-tokens").arg("32")
+        .arg("--temperature").arg("1.0")
+        .arg("--seed").arg("42")
+        .output()
+        .expect("FFI binary should run");
+    let ffi_time = t0.elapsed().as_secs_f64();
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("FFI synthesis failed: {stderr}");
+    }
+    eprintln!("[FFI C++] Done: {ffi_time:.2}s -> {}", ffi_wav.display());
+
+    // ── 3. Compare ────────────────────────────────────────────────────────
+    let ffi_data = read_wav(&ffi_wav).expect("FFI WAV should be readable");
+    eprintln!();
+    eprintln!("=== Comparison: Pure Rust vs C++ FFI (32 frames, seed=42) ===");
+    compute_metrics(&pure_audio, &ffi_data.samples);
+
+    // Non-trivial amplitude
+    let max_pure = pure_audio.iter().map(|&s| s.abs()).max().unwrap_or(0);
+    let max_ffi = ffi_data.samples.iter().map(|&s| s.abs()).max().unwrap_or(0);
+    assert!(max_pure > 100, "Pure Rust has near-zero amplitude ({max_pure})");
+    assert!(max_ffi > 100, "FFI C++ has near-zero amplitude ({max_ffi})");
+    eprintln!();
+    eprintln!("✅ WAVs saved to:");
+    eprintln!("   Pure Rust: {}", pure_wav.display());
+    eprintln!("   C++ FFI:   {}", ffi_wav.display());
+}
+
+/// Write i16 PCM samples to WAV file.
+fn write_i16_wav(path: &Path, samples: &[i16], sample_rate: u32) {
+    let channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let data_size = samples.len() as u32 * 2;
+    let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+    let block_align = channels * bits_per_sample / 8;
+    let riff_size = 36 + data_size;
+
+    let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());  // PCM
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_size.to_le_bytes());
+
+    for &s in samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, &bytes).expect("write WAV");
+}
+
 /// End-to-end benchmark with cold/warm timing, using Pipeline + TimingRecorder.
 ///
 /// NOTE: Uses 4 frames for quick CI verification. Increase `max_new_tokens` to 128
@@ -355,7 +468,7 @@ fn bench_end2end() {
     let n_frames = 4i32;
     let request = SynthesisRequest {
         text: "純 Rust 語音合成測試。".to_string(),
-        language: "zh".into(),
+        language: "chinese".into(),
         speaker: None,
         instruct: None,
         ref_audio_path: None,

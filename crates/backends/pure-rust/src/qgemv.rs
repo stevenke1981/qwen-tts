@@ -43,6 +43,11 @@ impl Q8Weights {
             .ok_or_else(|| anyhow::anyhow!("missing tensor {name}"))?;
         let shape = info.shape.dims();
         anyhow::ensure!(shape.len() >= 2, "tensor {name} has {shape:?}, expected ≥2D");
+        // candle_core reverses GGUF dims on read (gguf_file.rs:438).
+        // GGUF file stores [n_in, n_out] (innermost = n_in = k).
+        // After candle reversal: shape = [n_out, n_in].
+        //   shape[0] = n_out (output features = rows)
+        //   shape[1] = n_in  (input features = cols, contiguous in Q8 blocks)
         let n = shape[0];
         let k = shape[1];
         let blocks_per_row = k.div_ceil(QK8_0);
@@ -91,6 +96,16 @@ impl Q8Weights {
     /// Number of input features.
     pub fn in_features(&self) -> usize {
         self.k
+    }
+
+    /// Blocks per weight row (= `ceil(k / 32)`).
+    pub fn blocks_per_row(&self) -> usize {
+        self.blocks_per_row
+    }
+
+    /// Padded input length in floats (= `blocks_per_row * 32`).
+    pub fn padded_k(&self) -> usize {
+        self.padded_k
     }
 
     /// Raw Q8_0 block slice.
@@ -525,6 +540,176 @@ impl Q8Weights {
             });
 
         result
+    }
+
+    /// Batch matmul with pre-allocated buffers and parallel quantize.
+    ///
+    /// Writes output directly in [m, n] row-major layout (no internal
+    /// transpose), saving one copy and one vector allocation.
+    ///
+    /// `x`:    `[m, k]` f32 — input (row-major flattened).
+    /// `m`:    batch size.
+    /// `x_q`:  pre-allocated `[m * blocks_per_row]` block buffer.
+    /// `padded`: pre-allocated flat `[m * padded_k]` f32 buffer, split per
+    ///           thread during quantize.  Must be ≥ `m * padded_k`.
+    /// `out`:  pre-allocated `[m * n]` f32 output buffer (overwritten).
+    pub fn matmul_batched_prealloc(
+        &self,
+        x: &[f32],
+        m: usize,
+        x_q: &mut [BlockQ8_0],
+        padded: &mut [f32],
+        out: &mut [f32],
+    ) {
+        let bpr = self.blocks_per_row;
+        let padded_k = self.padded_k;
+        let k = self.k;
+        let n = self.n;
+        assert_eq!(x_q.len(), m * bpr,
+            "matmul_batched_prealloc: x_q.len {} != m*bpr={}*{}={}",
+            x_q.len(), m, bpr, m * bpr);
+        assert_eq!(padded.len(), m * padded_k,
+            "matmul_batched_prealloc: padded.len {} != m*padded_k={}*{}={}",
+            padded.len(), m, padded_k, m * padded_k);
+        assert_eq!(out.len(), m * n,
+            "matmul_batched_prealloc: out.len {} != m*n={}*{}={}",
+            out.len(), m, n, m * n);
+
+        // 1. Parallel quantize — pair each padded chunk with its x_q block.
+        let padded_k_val = padded_k;
+        padded
+            .par_chunks_mut(padded_k_val)
+            .zip(x_q.par_chunks_mut(bpr))
+            .enumerate()
+            .for_each(|(seq, (p_chunk, dst_blocks))| {
+                let src = &x[seq * k..(seq + 1) * k];
+                p_chunk[..k].copy_from_slice(src);
+                // Zero-pad the tail (if k not a multiple of QK8_0)
+                for p in p_chunk[k..].iter_mut() {
+                    *p = 0.0;
+                }
+                <BlockQ8_0 as GgmlType>::from_float(p_chunk, dst_blocks);
+            });
+
+        // 2. Compute directly into [m, n] layout — no transpose step.
+        out.par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(seq, out_row)| {
+                let xq_slice = &x_q[seq * bpr..(seq + 1) * bpr];
+                for row in 0..n {
+                    let w_blocks = self.row_blocks(row);
+                    out_row[row] = q8_vec_dot(padded_k, w_blocks, xq_slice);
+                }
+            });
+    }
+
+    /// Batch matmul from already-quantized input.
+    ///
+    /// Skips the quantize step entirely — use when `x_q` has already been
+    /// filled (e.g., by a previous call to `matmul_batched_prealloc` on a
+    /// sibling weight with the same `k`).
+    ///
+    /// `x_q`: `[m * blocks_per_row]` — pre-quantized input blocks.
+    /// `m`:   batch size.
+    /// `out`: `[m * n]` f32 — pre-allocated output (overwritten).
+    pub fn matmul_batched_from_quantized(
+        &self,
+        x_q: &[BlockQ8_0],
+        m: usize,
+        out: &mut [f32],
+    ) {
+        let bpr = self.blocks_per_row;
+        let padded_k = self.padded_k;
+        let n = self.n;
+        assert_eq!(x_q.len(), m * bpr,
+            "matmul_batched_from_quantized: x_q.len {} != m*bpr={}*{}={}",
+            x_q.len(), m, bpr, m * bpr);
+        assert_eq!(out.len(), m * n,
+            "matmul_batched_from_quantized: out.len {} != m*n={}*{}={}",
+            out.len(), m, n, m * n);
+
+        out.par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(seq, out_row)| {
+                let xq_slice = &x_q[seq * bpr..(seq + 1) * bpr];
+                for row in 0..n {
+                    let w_blocks = self.row_blocks(row);
+                    out_row[row] = q8_vec_dot(padded_k, w_blocks, xq_slice);
+                }
+            });
+    }
+
+    /// Fused batch matmul for multiple weight matrices sharing one input.
+    ///
+    /// Quantises the M input rows **once**, then computes projections
+    /// through **all** weight matrices in parallel (one rayon scope per
+    /// weight).
+    ///
+    /// All weights must share the same `k` (input dimension); each
+    /// may have its own `n` (output dimension).
+    ///
+    /// `outputs` must have the same length as `weights`.  Each
+    /// `outputs[i]` must be `[m * weights[i].n]` f32.
+    pub fn matmul_multi_batched(
+        weights: &[&Q8Weights],
+        x: &[f32],
+        m: usize,
+        x_q: &mut [BlockQ8_0],
+        padded: &mut [f32],
+        outputs: &mut [Vec<f32>],
+    ) {
+        assert!(!weights.is_empty(), "matmul_multi_batched: empty weights");
+        assert_eq!(weights.len(), outputs.len(),
+            "matmul_multi_batched: {} weights != {} outputs",
+            weights.len(), outputs.len());
+        let bpr = weights[0].blocks_per_row();
+        let padded_k = weights[0].padded_k();
+        let k_val = weights[0].k;
+        #[cfg(debug_assertions)]
+        for w in weights {
+            assert_eq!(w.k, k_val, "matmul_multi_batched: all weights must share k");
+        }
+        assert_eq!(x_q.len(), m * bpr);
+        assert_eq!(padded.len(), m * padded_k);
+        #[cfg(debug_assertions)]
+        for (i, (w, o)) in weights.iter().zip(outputs.iter()).enumerate() {
+            assert_eq!(o.len(), m * w.n,
+                "matmul_multi_batched: output[{}] len {} != m*n={}*{}",
+                i, o.len(), m, w.n);
+        }
+
+        // 1. Parallel quantize (single pass — main saving).
+        padded
+            .par_chunks_mut(padded_k)
+            .zip(x_q.par_chunks_mut(bpr))
+            .enumerate()
+            .for_each(|(seq, (p_chunk, dst_blocks))| {
+                let src = &x[seq * k_val..(seq + 1) * k_val];
+                p_chunk[..k_val].copy_from_slice(src);
+                for p in p_chunk[k_val..].iter_mut() {
+                    *p = 0.0;
+                }
+                <BlockQ8_0 as GgmlType>::from_float(p_chunk, dst_blocks);
+            });
+
+        // 2. Parallel over weight matrices.  Each weight's rows are
+        //    processed sequentially but vec_dots are against all M seqs.
+        let padded_k = weights[0].padded_k;
+        outputs
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(wi, out)| {
+                let w = weights[wi];
+                let n_wi = w.n;
+                for row_in_w in 0..n_wi {
+                    let w_blocks = w.row_blocks(row_in_w);
+                    for seq in 0..m {
+                        let xq_slice = &x_q[seq * bpr..(seq + 1) * bpr];
+                        out[seq * n_wi + row_in_w] =
+                            q8_vec_dot(padded_k, w_blocks, xq_slice);
+                    }
+                }
+            });
     }
 }
 
