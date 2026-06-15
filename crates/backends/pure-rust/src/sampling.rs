@@ -5,6 +5,8 @@
 //! version used here, and manual iteration over the vocabulary (≤152k tokens)
 //! is fast enough for CPU inference.
 
+use std::collections::HashSet;
+
 use rand::Rng;
 
 use candle_core::Tensor;
@@ -96,7 +98,54 @@ pub fn sample_argmax(logits: &Tensor) -> anyhow::Result<u32> {
     Ok(val)
 }
 
+/// Mask logits in `[lo, hi)` to -inf, except `keep` is left untouched.
+/// Mirrors C++ `apply_suppress` in sampling.h.
+pub fn apply_suppress(logits: &mut [f32], lo: usize, hi: usize, keep: u32) {
+    let lo = lo.min(logits.len());
+    let hi = hi.min(logits.len());
+    for i in lo..hi {
+        if i as u32 != keep {
+            logits[i] = f32::NEG_INFINITY;
+        }
+    }
+}
+
+/// HF-style repetition penalty over **unique** tokens in history.
+///
+/// For each unique token `t` in `history`:
+///   if logits[t] >= 0 → logits[t] /= penalty
+///   if logits[t] <  0 → logits[t] *= penalty
+///
+/// Mirrors C++ `apply_repetition_penalty` in sampling.h (uses per-call
+/// bool-flag vector to deduplicate).
+pub fn apply_repetition_penalty(logits: &mut [f32], history: &[u32], penalty: f32) {
+    if (penalty - 1.0).abs() <= f32::EPSILON || history.is_empty() {
+        return;
+    }
+    let n_vocab = logits.len();
+    let mut seen = HashSet::new();
+    for &tok in history {
+        let t = tok as usize;
+        if t >= n_vocab {
+            continue;
+        }
+        if !seen.insert(t) {
+            continue;
+        }
+        let s = logits[t];
+        logits[t] = if s < 0.0 { s * penalty } else { s / penalty };
+    }
+}
+
 /// Sample a single token ID from a flat logits array.
+///
+/// Pipeline: repetition_penalty(history) → temperature → top_k → top_p →
+/// softmax → multinomial.
+///
+/// When `temperature <= 0.0`, returns argmax (greedy) ignoring all other
+/// sampling params.
+///
+/// `history` — optional c0 token history for repetition penalty (None = skip).
 ///
 /// Returns `(token_id, probability_of_selected_token)`.
 pub fn sample_token(
@@ -105,8 +154,18 @@ pub fn sample_token(
     top_k: Option<usize>,
     top_p: Option<f32>,
     rng: &mut impl Rng,
+    history: Option<&[u32]>,
+    repetition_penalty: f32,
 ) -> (u32, f32) {
+    // Greedy: argmax, skip all sampling chain
+    if temperature <= 0.0 {
+        let idx = argmax_idx(logits);
+        return (idx, 1.0);
+    }
+
     let mut logits = logits.to_vec();
+
+    apply_repetition_penalty(&mut logits, history.unwrap_or(&[]), repetition_penalty);
     apply_temperature(&mut logits, temperature);
     if let Some(k) = top_k {
         apply_top_k(&mut logits, k);
@@ -207,8 +266,8 @@ mod tests {
         let logits = test_logits();
         let mut rng1 = StdRng::seed_from_u64(42);
         let mut rng2 = StdRng::seed_from_u64(42);
-        let (t1, _) = sample_token(&logits, 0.8, Some(5), None, &mut rng1);
-        let (t2, _) = sample_token(&logits, 0.8, Some(5), None, &mut rng2);
+        let (t1, _) = sample_token(&logits, 0.8, Some(5), None, &mut rng1, None, 1.0);
+        let (t2, _) = sample_token(&logits, 0.8, Some(5), None, &mut rng2, None, 1.0);
         assert_eq!(t1, t2);
     }
 

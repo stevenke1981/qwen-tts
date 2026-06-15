@@ -118,6 +118,11 @@ impl Pipeline {
         let temperature = request.temperature.unwrap_or(1.0);
         let top_k = request.top_k.map(|v| v as usize);
         let top_p = request.top_p.map(|v| v as f32);
+        let repetition_penalty = request.repetition_penalty.unwrap_or(1.0);
+        // Subtalker (code predictor) defaults — separate from talker params.
+        // When SynthesisRequest doesn't expose subtalker fields, fall back to
+        // the talker values (which match the C++ convention when both are the
+        // same). TODO: add explicit subtalker fields to SynthesisRequest.
         let seed = request.seed.map(|s| s as u64);
         let mut rng: StdRng = match seed {
             Some(s) => StdRng::seed_from_u64(s),
@@ -125,10 +130,15 @@ impl Pipeline {
         };
         let num_frames = request.max_new_tokens.unwrap_or(1024) as usize;
         let do_sample = request.do_sample.unwrap_or(true);
+        let codec_eos_id = self.prompt_metadata.codec_specials.eos_id;
+        let talker_vocab = self.talker.config().vocab_size;
 
-        // --- 3. KV cache + autoregressive frame generation ---
+        // ── 3. KV cache + autoregressive frame generation ──────────────────
         let codec_codebooks: usize = 16;
         let mut all_codes: Vec<i32> = Vec::with_capacity(num_frames * codec_codebooks);
+        // c0 token history for repetition penalty (HF style: each unique token
+        // touched once per call). Mirrors C++ `talker_history` in pipeline-tts.cpp.
+        let mut talker_history: Vec<u32> = Vec::with_capacity(num_frames);
 
         // 3a. Precompute RoPE for the full context length
         let max_seq = self.talker.config().max_seq_len;
@@ -157,22 +167,46 @@ impl Pipeline {
 
         // 3c. Decode loop: generate audio frames with full codec embedding sum + trailing overlay
         for frame_idx in 0..num_frames {
-            // Predict codebook 0 via codec_head
+            // ── Step A: sample codebook 0 with suppress + rep_penalty ─────
             let _cb0_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("cb0_sample".into(), "step".into(), frame_idx)
             });
-            let cb0_logits = self.talker.predict_codebook0(&last_hidden)?;
+            let cb0_logits_t = self.talker.predict_codebook0(&last_hidden)?;
+            // Convert from [1, 1, V] candle tensor to flat f32 slice for
+            // suppress + rep_penalty + sampling chain.
+            let cb0_logits_flat: Vec<f32> = cb0_logits_t.flatten_all()?.to_vec1()?;
+            let mut cb0_logits = cb0_logits_flat;
+            // Suppress codec reserved range [vocab-1024, vocab) except codec_eos.
+            let suppress_lo = talker_vocab.saturating_sub(1024);
+            let suppress_hi = talker_vocab;
+            sampling::apply_suppress(&mut cb0_logits, suppress_lo, suppress_hi, codec_eos_id);
             let cb0_token = if do_sample {
-                sample_logits_tensor(&cb0_logits, temperature, top_k, top_p, &mut rng)?
+                let (tok, _prob) = sampling::sample_token(
+                    &cb0_logits, temperature, top_k, top_p, &mut rng,
+                    Some(&talker_history), repetition_penalty,
+                );
+                tok
             } else {
-                sampling::sample_argmax(&cb0_logits)?
+                // Argmax path: still apply suppress (but skip rep_penalty
+                // because argmax doesn't need it — it picks the highest logit
+                // regardless).
+                sampling::argmax_idx(&cb0_logits)
             };
             drop(_cb0_timer);
+
+            // EOS detection — stop generation when codec_eos is emitted.
+            if cb0_token == codec_eos_id {
+                log::info!("[Pipeline] EOS at step {}, stopping", frame_idx);
+                break;
+            }
+
+            // Track c0 history for repetition penalty.
+            talker_history.push(cb0_token);
 
             // Embed codebook 0 token for predictor prefill
             let cb0_emb = self.talker.embed_codebook0(cb0_token)?;
 
-            // Predict acoustic codebooks 1..N via code predictor
+            // ── Step B: predict acoustic codebooks 1..N ──────────────────
             let _pred_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("predictor_frame".into(), "frame".into(), frame_idx)
             });
@@ -187,7 +221,7 @@ impl Pipeline {
             };
             drop(_pred_timer);
 
-            // Build next-token embedding = sum of all 16 codebook embeddings + trailing overlay
+            // ── Step C: build next-token embedding ────────────────────────
             let codes: Vec<u32> = std::iter::once(cb0_token).chain(frame.iter().copied()).collect();
             let codec_sum = self.code_predictor.embed_frame(&self.talker, &codes)?;
 
@@ -205,17 +239,16 @@ impl Pipeline {
             }
             let next_emb = Tensor::from_slice(&next_emb_vec, (1, 1, hidden), &self.device)?;
 
-            // Store all codes
+            // Store all codes (pad to 16 codebooks)
             all_codes.push(cb0_token as i32);
             for &token in &frame {
                 all_codes.push(token as i32);
             }
-            // Pad to full 16 codebooks if necessary
             while all_codes.len() < (frame_idx + 1) * codec_codebooks {
                 all_codes.push(0);
             }
 
-            // Forward step with the combined embedding (16 codebooks + trailing overlay)
+            // ── Step D: talker forward step ───────────────────────────────
             last_hidden = self
                 .talker
                 .forward_step(&next_emb, &mut kv_cache, &cos_full, &sin_full)?;
@@ -259,19 +292,6 @@ impl Pipeline {
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
-
-/// Sample from a `[batch, 1, vocab]` or `[batch, vocab]` logits tensor.
-fn sample_logits_tensor(
-    logits: &Tensor,
-    temperature: f32,
-    top_k: Option<usize>,
-    top_p: Option<f32>,
-    rng: &mut impl rand::Rng,
-) -> anyhow::Result<u32> {
-    let logits_1d: Vec<f32> = logits.flatten_all()?.to_vec1()?;
-    let (token, _prob) = sampling::sample_token(&logits_1d, temperature, top_k, top_p, rng);
-    Ok(token)
-}
 
 /// Look for `tokenizer.json` in the same directory as the talker GGUF.
 fn discover_tokenizer(talker_path: &Path) -> anyhow::Result<HfTokenizer> {

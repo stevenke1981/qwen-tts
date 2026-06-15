@@ -496,7 +496,7 @@ impl CodePredictor {
         let h1 = self.forward_at_pos(1, &proj_1)?;
         let logits_0 = self.apply_lm_head(0, &h1)?;
         let (c1, _prob) =
-            sampling::sample_token(&logits_0, temperature, top_k, top_p, rng);
+            sampling::sample_token(&logits_0, temperature, top_k, top_p, rng, None, 1.0);
         let mut codes: Vec<u32> = vec![c1];
 
         // ── Decode positions 2..(num_acoustic+1) ─────────────────────────
@@ -518,7 +518,7 @@ impl CodePredictor {
             let h = self.forward_at_pos(pos, &proj)?;
             let logits = self.apply_lm_head(g, &h)?;
             let (code, _prob) =
-                sampling::sample_token(&logits, temperature, top_k, top_p, rng);
+                sampling::sample_token(&logits, temperature, top_k, top_p, rng, None, 1.0);
             codes.push(code);
         }
 
