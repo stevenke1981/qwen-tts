@@ -128,6 +128,9 @@ impl KvCacheFlat {
     ///
     /// Buffer layout: `[n_kv_heads, max_seq, head_dim]` row-major.
     /// For head `h` at position `t`, dim `d`: offset = h * (max_seq * hd) + t * hd + d
+    ///
+    /// NOTE: This does NOT increment `self.pos`. Call `advance_pos()` once
+    /// after all layers have appended for the current forward step.
     pub fn append(&mut self, layer: usize, k: &[f32], v: &[f32]) {
         let n_kv = self.n_kv_heads;
         let hd = self.head_dim;
@@ -142,6 +145,10 @@ impl KvCacheFlat {
             let v_dst = &mut self.v_bufs[layer][h * max_hd + p * hd..h * max_hd + (p + 1) * hd];
             v_dst.copy_from_slice(v_src);
         }
+    }
+
+    /// Call once after all layers have appended for the current step.
+    pub fn advance_pos(&mut self) {
         self.pos += 1;
     }
 
@@ -715,6 +722,7 @@ impl Talker {
 
         // Final output norm
         let hidden = rms_norm_tensor(&hidden, self.output_norm.weight(), self.output_norm.eps())?;
+        cache.advance_pos();
         Ok(hidden)
     }
 
