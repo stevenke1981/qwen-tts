@@ -31,15 +31,16 @@
 use std::fs::File;
 
 use candle_core::quantized::gguf_file::Content;
-use candle_core::{Device, Tensor, D};
+use candle_core::{Device, Tensor};
 use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
 use crate::sampling;
 use crate::custom_ops::{
-    attention_f32, per_head_rms_norm_f32, rms_norm_f32, rope_f32, silu_f32,
+    attention_f32, per_head_rms_norm_f32, rms_norm_f32, rms_norm_f32_inplace,
+    rope_f32,
 };
-use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
+use crate::qgemv::{Q8Weights, Q8Workspace};
 use crate::talker::{
     embed_token, linear_fwd, DecoderLayer, Talker,
 };
@@ -65,12 +66,15 @@ pub struct CodePredictor {
     /// Head dimension (128).
     head_dim: usize,
     /// Vocabulary size for code tokens (e.g., 2048).
+    #[allow(dead_code)]
     vocab_size: usize,
     /// Number of transformer layers (5 for 1.7B).
     n_layers: usize,
     /// Maximum sequence length per frame (num_acoustic + 1 = 16).
+    #[allow(dead_code)]
     max_seq_len: usize,
     /// FFN intermediate dimension (e.g., 3072 for 1.7B model).
+    #[allow(dead_code)]
     ffn_dim: usize,
 
     // ── weights ───────────────────────────────────────────────────────────
@@ -89,14 +93,24 @@ pub struct CodePredictor {
     mtp_proj_w: Option<Tensor>,
     mtp_proj_b: Option<Tensor>,
     /// Output norm weight + eps (applied after last transformer layer).
+    #[allow(dead_code)]
     output_norm_w: Option<Tensor>,
     output_norm_eps: f64,
 
-    // ── precomputed RoPE ──────────────────────────────────────────────────
-    /// Cosine table. Shape: [1, 1, max_seq_len, head_dim].
+    // ── precomputed RoPE (Tensor version, kept for API compat) ──────────
+    #[allow(dead_code)]
     cos: Tensor,
-    /// Sine table. Shape: [1, 1, max_seq_len, head_dim].
+    #[allow(dead_code)]
     sin: Tensor,
+
+    // ── flat RoPE for fused path ──────────────────────────────────────────
+    /// Flat cos table: [max_seq_len * head_dim].
+    cos_f32: Vec<f32>,
+    /// Flat sin table: [max_seq_len * head_dim].
+    sin_f32: Vec<f32>,
+
+    /// F32 view of output_norm weight (None if no separate output norm).
+    output_norm_w_f32: Option<Vec<f32>>,
 
     // ── mutable per-frame state ───────────────────────────────────────────
     /// Flat f32 KV cache: per-layer vectors of flattened [n_kv_heads, kv_len, head_dim].
@@ -105,8 +119,34 @@ pub struct CodePredictor {
     k_cache_data: Vec<Vec<f32>>,
     v_cache_data: Vec<Vec<f32>>,
 
+    /// Persistent Q8 workspace (avoids re-allocation on the hot path).
+    q8_ws: Q8Workspace,
+
+    /// Pre-allocated scratch buffers for fused forward path.
+    pred_scratch: PredScratch,
+
     /// Device handle.
     device: Device,
+}
+
+/// Pre-allocated scratch buffers for CodePredictor's fused forward path.
+struct PredScratch {
+    /// Saved pre-norm hidden state for residual connection (pred_hidden).
+    residual: Vec<f32>,
+    /// In/out main state buffer (pred_hidden). Recycled as norm input/output.
+    h: Vec<f32>,
+    /// FFN intermediate: SiLU(gate) * up (ffn_dim).
+    ffn_mid: Vec<f32>,
+}
+
+impl PredScratch {
+    fn new(pred_hidden: usize, ffn_dim: usize) -> Self {
+        Self {
+            residual: vec![0.0f32; pred_hidden],
+            h: vec![0.0f32; pred_hidden],
+            ffn_mid: vec![0.0f32; ffn_dim],
+        }
+    }
 }
 
 impl CodePredictor {
@@ -306,6 +346,30 @@ impl CodePredictor {
         let cos = cos_v.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin_v.unsqueeze(0)?.unsqueeze(0)?;
 
+        // ── flat RoPE for fused path ─────────────────────────────────────
+        let half = head_dim / 2;
+        let inv_freq_f64: Vec<f64> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1.0_f64 / rope_theta.powf(i as f64 / head_dim as f64))
+            .collect();
+        let mut cos_f32 = vec![0.0f32; max_seq_len * head_dim];
+        let mut sin_f32 = vec![0.0f32; max_seq_len * head_dim];
+        for p in 0..max_seq_len {
+            let base = p * head_dim;
+            for d in 0..half {
+                let angle = p as f64 * inv_freq_f64[d];
+                let c = angle.cos() as f32;
+                let s = angle.sin() as f32;
+                cos_f32[base + d] = c;
+                cos_f32[base + d + half] = c;
+                sin_f32[base + d] = s;
+                sin_f32[base + d + half] = s;
+            }
+        }
+
+        // ── f32 view of output_norm weight ───────────────────────────────
+        let output_norm_w_f32 = output_norm_w.as_ref().map(|t| t.flatten_all().unwrap().to_vec1().unwrap());
+
         // FFN intermediate dimension from first layer's ffn_gate (output rows).
         let ffn_dim = layers
             .first()
@@ -315,6 +379,10 @@ impl CodePredictor {
         // Pre-allocate flat f32 KV caches (per-layer, empty initially).
         let k_cache_data = vec![Vec::new(); n_layers];
         let v_cache_data = vec![Vec::new(); n_layers];
+
+        // Pre-allocated scratch buffers + Q8 workspace for fused path.
+        let pred_scratch = PredScratch::new(pred_hidden, ffn_dim);
+        let q8_ws = Q8Workspace::new();
 
         Ok(Self {
             num_acoustic,
@@ -336,8 +404,13 @@ impl CodePredictor {
             output_norm_eps: output_norm_eps_val,
             cos,
             sin,
+            cos_f32,
+            sin_f32,
+            output_norm_w_f32,
             k_cache_data,
             v_cache_data,
+            q8_ws,
+            pred_scratch,
             device: device.clone(),
         })
     }
@@ -366,113 +439,102 @@ impl CodePredictor {
         Ok(logits_t.flatten_all()?.to_vec1()?)
     }
 
-    /// Forward one position through all transformer layers, updating the KV cache.
+    /// Fused f32 forward for one position — zero Tensor round-trips on the hot path.
     ///
     /// All intermediate operations use raw f32 slices — no Tensor dispatch
     /// for norm, RoPE, or attention. Only the I/O boundaries (input Tensor,
-    /// q8_linear projections, output Tensor) create tensors.
+    /// Q8 gemv projections, output Tensor) create tensors.
     ///
     /// `pos`: absolute position in the sequence (0-based within this frame).
-    /// `pred_input`: `[1, 1, pred_hidden]` — already projected.
-    fn forward_at_pos(&mut self, pos: usize, pred_input: &Tensor) -> anyhow::Result<Tensor> {
-        let mut x = pred_input.clone();
-        let (batch, _one, _d_model) = x.dims3()?;
-
-        // Derive head dimensions from the actual Q8 weight shapes (more
-        // reliable than metadata, which may differ per model variant).
-        let attn_dim = self.layers[0].attn_q.out_features(); // n_q_heads * head_dim
-        let kv_dim = self.layers[0].attn_k.out_features();   // n_kv_heads * head_dim
+    /// `pred_input`: `[pred_hidden]` — already projected via mtp_proj.
+    /// Returns `[pred_hidden]` — output-normed hidden state.
+    fn forward_at_pos_fused(&mut self, pos: usize, pred_input: &[f32]) -> Vec<f32> {
         let n_qh = self.n_q_heads;
         let n_kvh = self.n_kv_heads;
-        let hd = attn_dim / n_qh;
-        debug_assert_eq!(hd * n_kvh, kv_dim, "predictor KV dim mismatch");
+        let hd = self.head_dim;
+        let eps = 1e-6_f64;
+        let pred_h = self.pred_hidden;
+        let kv_dim = self.layers[0].attn_k.out_features();
 
-        // RoPE cos/sin at this position — extract once for all layers
-        let cos_t = self.cos.narrow(D::Minus2, pos, 1)?; // [1, 1, 1, hd]
-        let sin_t = self.sin.narrow(D::Minus2, pos, 1)?;
-        let cos_f32: Vec<f32> = cos_t.flatten_all()?.to_vec1()?;
-        let sin_f32: Vec<f32> = sin_t.flatten_all()?.to_vec1()?;
+        // Flat RoPE cos/sin at this position
+        let cos = &self.cos_f32[pos * hd..(pos + 1) * hd];
+        let sin = &self.sin_f32[pos * hd..(pos + 1) * hd];
 
-        let mut ws = Q8Workspace::new();
-        let eps = 1e-6_f64; // norm eps (same as talker default)
+        let scr = &mut self.pred_scratch;
+        scr.h.copy_from_slice(pred_input);
 
         for i in 0..self.n_layers {
             let layer = &self.layers[i];
-            let residual = x.clone();
 
-            // ── Attn norm (custom f32) ───────────────────────────────────
-            let x_flat = x.flatten_all()?.to_vec1::<f32>()?;
-            let w_an = layer.attn_norm.weight().flatten_all()?.to_vec1::<f32>()?;
-            let x_normed = rms_norm_f32(&x_flat, &w_an, eps);
-            let x_t = Tensor::from_slice(&x_normed, (batch, 1, self.pred_hidden), &self.device)?;
+            // ── Residual save + attn norm (in-place) ─────────────────────
+            scr.residual.copy_from_slice(&scr.h);
+            rms_norm_f32_inplace(&mut scr.h, &layer.attn_norm_w, eps);
 
-            // ── QKV projections (fused quantize) ──────────────────────────
-            let h_2d = x_t.reshape((batch, self.pred_hidden))?;
-            let qkv = q8_linear_multi(
-                &[&layer.attn_q, &layer.attn_k, &layer.attn_v],
-                &h_2d, &mut ws,
-            )?;
+            // ── QKV gemv ─────────────────────────────────────────────────
+            let q = layer.attn_q.gemv(&scr.h, &mut self.q8_ws);
+            let k = layer.attn_k.gemv(&scr.h, &mut self.q8_ws);
+            let v = layer.attn_v.gemv(&scr.h, &mut self.q8_ws);
 
-            // Extract f32 data — we'll operate directly on these slices
-            let q_f32: Vec<f32> = qkv[0].flatten_all()?.to_vec1()?; // [attn_dim]
-            let k_f32: Vec<f32> = qkv[1].flatten_all()?.to_vec1()?; // [kv_dim]
-            let v_f32: Vec<f32> = qkv[2].flatten_all()?.to_vec1()?; // [kv_dim]
+            // ── Per-head QK-norm ─────────────────────────────────────────
+            let q = per_head_rms_norm_f32(&q, &layer.attn_q_norm_w, n_qh, hd, eps);
+            let k = per_head_rms_norm_f32(&k, &layer.attn_k_norm_w, n_kvh, hd, eps);
 
-            // ── Per-head QK-norm (f32 slice) ──────────────────────────────
-            let w_qn = layer.attn_q_norm.weight().flatten_all()?.to_vec1::<f32>()?;
-            let w_kn = layer.attn_k_norm.weight().flatten_all()?.to_vec1::<f32>()?;
-            let q_normed = per_head_rms_norm_f32(&q_f32, &w_qn, n_qh, hd, eps);
-            let k_normed = per_head_rms_norm_f32(&k_f32, &w_kn, n_kvh, hd, eps);
+            // ── RoPE ─────────────────────────────────────────────────────
+            let q = rope_f32(&q, cos, sin, n_qh, hd);
+            let k = rope_f32(&k, cos, sin, n_kvh, hd);
 
-            // ── 1D NEOX RoPE (f32 slice) ─────────────────────────────────
-            let q_rope = rope_f32(&q_normed, &cos_f32, &sin_f32, n_qh, hd);
-            let k_rope = rope_f32(&k_normed, &cos_f32, &sin_f32, n_kvh, hd);
+            // ── KV cache append ──────────────────────────────────────────
+            self.k_cache_data[i].extend_from_slice(&k);
+            self.v_cache_data[i].extend_from_slice(&v); // V not normed/ROPEd
 
-            // ── KV cache append (flat Vec, no Tensor::cat) ───────────────
-            self.k_cache_data[i].extend_from_slice(&k_rope);
-            self.v_cache_data[i].extend_from_slice(&v_f32); // V is not normed/ROPEd
-
-            // ── GQA attention (f32 slice, no Tensor wrapper) ──────────────
+            // ── GQA attention ────────────────────────────────────────────
             let kv_len = self.k_cache_data[i].len() / kv_dim;
-            // head_stride = kv_len for compact buffers (no gaps between heads).
-            let attn_out_f32 = attention_f32(
-                &q_rope, &self.k_cache_data[i], &self.v_cache_data[i],
+            let attn = attention_f32(
+                &q, &self.k_cache_data[i], &self.v_cache_data[i],
                 n_qh, n_kvh, kv_len, hd, kv_len,
             );
-            let attn_out = Tensor::from_slice(&attn_out_f32, (batch, 1, attn_dim), &self.device)?;
 
-            // ── Output projection ────────────────────────────────────────
-            let attn_proj = q8_linear(&layer.attn_o, &attn_out, &mut ws)?;
-            x = (residual + attn_proj.reshape((batch, 1, self.pred_hidden))?)?;
+            // ── Output projection gemv ───────────────────────────────────
+            let attn_proj = layer.attn_o.gemv(&attn, &mut self.q8_ws); // [pred_hidden]
 
-            // ── SwiGLU FFN (fused gate+up quantize) ─────────────────────
-            let residual = x.clone();
-            let x2_flat = x.flatten_all()?.to_vec1::<f32>()?;
-            let w_fn = layer.ffn_norm.weight().flatten_all()?.to_vec1::<f32>()?;
-            let x2_normed = rms_norm_f32(&x2_flat, &w_fn, eps);
-            let x2_t = Tensor::from_slice(&x2_normed, (batch, 1, self.pred_hidden), &self.device)?;
-            let h2_2d = x2_t.reshape((batch, self.pred_hidden))?;
+            // ── Residual add ─────────────────────────────────────────────
+            for j in 0..pred_h {
+                scr.h[j] = scr.residual[j] + attn_proj[j];
+            }
 
-            let gu = q8_linear_multi(&[&layer.ffn_gate, &layer.ffn_up], &h2_2d, &mut ws)?;
-            let gate_f32: Vec<f32> = gu[0].flatten_all()?.to_vec1()?;
-            let up_f32: Vec<f32> = gu[1].flatten_all()?.to_vec1()?;
-            let gate_act = silu_f32(&gate_f32);
-            let hid_f32: Vec<f32> = gate_act.iter().zip(&up_f32).map(|(g, u)| g * u).collect();
-            let hid_t = Tensor::from_slice(&hid_f32, (batch, 1, self.ffn_dim), &self.device)?;
+            // ── FFN residual save ────────────────────────────────────────
+            scr.residual.copy_from_slice(&scr.h);
 
-            let hid_out = q8_linear(&layer.ffn_down, &hid_t, &mut ws)?;
-            x = (residual + hid_out.reshape((batch, 1, self.pred_hidden))?)?;
+            // ── FFN norm (in-place) ──────────────────────────────────────
+            rms_norm_f32_inplace(&mut scr.h, &layer.ffn_norm_w, eps);
+
+            // ── FFN gate + up gemv ───────────────────────────────────────
+            let gate = layer.ffn_gate.gemv(&scr.h, &mut self.q8_ws);
+            let up = layer.ffn_up.gemv(&scr.h, &mut self.q8_ws);
+
+            // ── SiLU(gate) * up → scr.ffn_mid ────────────────────────────
+            let ffn_dim = gate.len();
+            let fm = &mut scr.ffn_mid[..ffn_dim];
+            for j in 0..ffn_dim {
+                let g = gate[j];
+                let sig = 1.0 / (1.0 + (-g as f64).exp()) as f32;
+                fm[j] = g * sig * up[j];
+            }
+
+            // ── Down projection gemv ─────────────────────────────────────
+            let ffn_out = layer.ffn_down.gemv(fm, &mut self.q8_ws); // [pred_hidden]
+
+            // ── Residual add ─────────────────────────────────────────────
+            for j in 0..pred_h {
+                scr.h[j] = scr.residual[j] + ffn_out[j];
+            }
         }
 
-        // Final output norm
-        if let Some(ref w) = self.output_norm_w {
-            let x_flat = x.flatten_all()?.to_vec1::<f32>()?;
-            let w_o = w.flatten_all()?.to_vec1::<f32>()?;
-            let y = rms_norm_f32(&x_flat, &w_o, self.output_norm_eps);
-            x = Tensor::from_slice(&y, (batch, 1, self.pred_hidden), &self.device)?;
+        // ── Final output norm ────────────────────────────────────────────
+        match &self.output_norm_w_f32 {
+            Some(w) => rms_norm_f32(&scr.h, w, self.output_norm_eps),
+            None => scr.h.clone(),
         }
-
-        Ok(x)
     }
 
     // ── public API ─────────────────────────────────────────────────────
@@ -510,12 +572,15 @@ impl CodePredictor {
         // ── Prefill position 0 ───────────────────────────────────────────
         // Input: talker hidden state → project → forward (no lm_head here)
         let proj_0 = self.project(talker_hidden)?; // [1, 1, pred_hidden]
-        let _ = self.forward_at_pos(0, &proj_0)?;
+        let proj_0_f: Vec<f32> = proj_0.flatten_all()?.to_vec1()?;
+        self.forward_at_pos_fused(0, &proj_0_f);
 
         // ── Prefill position 1 ───────────────────────────────────────────
         // Input: c0_embed → project → forward → lm_head[0] → sample c1
         let proj_1 = self.project(c0_embed)?; // [1, 1, pred_hidden]
-        let h1 = self.forward_at_pos(1, &proj_1)?;
+        let proj_1_f: Vec<f32> = proj_1.flatten_all()?.to_vec1()?;
+        let h1_v = self.forward_at_pos_fused(1, &proj_1_f);
+        let h1 = Tensor::from_slice(&h1_v, (1, 1, self.pred_hidden), &self.device)?;
         let logits_0 = self.apply_lm_head(0, &h1)?;
         let (c1, _prob) =
             sampling::sample_token(&logits_0, temperature, top_k, top_p, rng, None, 1.0);
@@ -537,7 +602,9 @@ impl CodePredictor {
             )?; // [1, 1, talker_hidden]
             let proj = self.project(&emb)?; // [1, 1, pred_hidden]
             let pos = g + 1; // positions 2..15
-            let h = self.forward_at_pos(pos, &proj)?;
+            let proj_f: Vec<f32> = proj.flatten_all()?.to_vec1()?;
+            let h_v = self.forward_at_pos_fused(pos, &proj_f);
+            let h = Tensor::from_slice(&h_v, (1, 1, self.pred_hidden), &self.device)?;
             let logits = self.apply_lm_head(g, &h)?;
             let (code, _prob) =
                 sampling::sample_token(&logits, temperature, top_k, top_p, rng, None, 1.0);
