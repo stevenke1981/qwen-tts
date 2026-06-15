@@ -204,15 +204,36 @@ impl CodePredictor {
             let load_q8 = |name: &str, f: &mut File| -> anyhow::Result<Q8Weights> {
                 Q8Weights::from_gguf(content, f, name)
             };
+            // Load norm tensors and extract f32 weight views.
+            let attn_norm_t = load_f32(&blk("attn_norm.weight"), &mut *file)?;
+            let attn_norm_w = attn_norm_t.to_vec1::<f32>()?;
+            let attn_norm = RmsNorm::new(attn_norm_t, norm_eps);
+
+            let q_norm_t = load_f32(&blk("attn_q_norm.weight"), &mut *file)?;
+            let attn_q_norm_w = q_norm_t.to_vec1::<f32>()?;
+            let attn_q_norm = RmsNorm::new(q_norm_t, norm_eps);
+
+            let k_norm_t = load_f32(&blk("attn_k_norm.weight"), &mut *file)?;
+            let attn_k_norm_w = k_norm_t.to_vec1::<f32>()?;
+            let attn_k_norm = RmsNorm::new(k_norm_t, norm_eps);
+
+            let ffn_norm_t = load_f32(&blk("ffn_norm.weight"), &mut *file)?;
+            let ffn_norm_w = ffn_norm_t.to_vec1::<f32>()?;
+            let ffn_norm = RmsNorm::new(ffn_norm_t, norm_eps);
+
             layers.push(DecoderLayer {
-                attn_norm: RmsNorm::new(load_f32(&blk("attn_norm.weight"), &mut *file)?, norm_eps),
+                attn_norm,
+                attn_norm_w,
                 attn_q: load_q8(&blk("attn_q.weight"), &mut *file)?,
                 attn_k: load_q8(&blk("attn_k.weight"), &mut *file)?,
                 attn_v: load_q8(&blk("attn_v.weight"), &mut *file)?,
                 attn_o: load_q8(&blk("attn_output.weight"), &mut *file)?,
-                attn_q_norm: RmsNorm::new(load_f32(&blk("attn_q_norm.weight"), &mut *file)?, norm_eps),
-                attn_k_norm: RmsNorm::new(load_f32(&blk("attn_k_norm.weight"), &mut *file)?, norm_eps),
-                ffn_norm: RmsNorm::new(load_f32(&blk("ffn_norm.weight"), &mut *file)?, norm_eps),
+                attn_q_norm,
+                attn_k_norm,
+                attn_q_norm_w,
+                attn_k_norm_w,
+                ffn_norm,
+                ffn_norm_w,
                 ffn_gate: load_q8(&blk("ffn_gate.weight"), &mut *file)?,
                 ffn_up: load_q8(&blk("ffn_up.weight"), &mut *file)?,
                 ffn_down: load_q8(&blk("ffn_down.weight"), &mut *file)?,

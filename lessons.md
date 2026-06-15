@@ -185,7 +185,19 @@
 **Source:** code_predictor dimension fix
 
 ---
+## Lesson #28 — 2026-06-15
+**Trigger:** Ported 778-line C++ prompt-builder.h to Rust prompt.rs with 5 modes, prefix cache, and GGUF metadata parsing. Required adding accessor methods to Talker and a new `embed_frame()` to CodePredictor.
+**Rule:** When porting a complex C++ builder to Rust, implement it as a free function (not a struct with lifetime-bound borrow) when it only needs read-only access to config data. Pass `&Talker` as parameter to avoid Pipeline lifetime complications. Store pre-computed special embeddings in a `PromptCache` to avoid redundant projections on repeated calls with the same parameters.
+**Source:** feat(prompt): full C++ prompt-builder port
+
+---
 ## Lesson #25 — 2026-06-15
 **Trigger:** Custom attention_tensor at small cache sizes (kv_len<5) was slower than candle's native matmul due to to_vec1 copy overhead dominating the tiny computation.
 **Rule:** When replacing tensor ops with custom f32 ops, benchmark at representative sizes (not just microbenchmark). For tiny tensors (<10KB), tensor dispatch overhead is negligible and vanilla candle ops may be faster. For larger tensors (>100KB) or operations that scale with data size (attention grows with kv_len), custom f32 ops win due to fusion eliminating intermediate allocations.
 **Source:** qgemv GQA custom attention
+
+---
+## Lesson #29 — 2026-06-15
+**Trigger:** KV cache hot path used Tensor::cat (O(n²) cumulative copies). Replaced with pre-allocated Vec<f32> flat buffers + strided attention_f32 to avoid per-step Tensor→f32 cache copies.
+**Rule:** To eliminate O(n²) KV cache append cost: (1) allocate max-sized flat f32 buffers per layer, memcpy new K/V at current position (O(1) per step per head); (2) add `head_stride` param to attention_f32 so it can index into pre-allocated (non-compact) buffers with gaps; (3) persist Q8Workspace as a Talker field to avoid Vec::new per forward_step call. The key saving is avoiding `Tensor::to_vec1` on the growing KV cache (one full-cache copy per layer per step).
+**Source:** feat(talker): pre-allocated KV cache + persistent Q8Workspace

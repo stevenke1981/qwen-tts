@@ -26,6 +26,19 @@ pub fn rms_norm_f32(x: &[f32], weight: &[f32], eps: f64) -> Vec<f32> {
         .collect()
 }
 
+/// In-place RMS Normalization on a flat f32 slice.
+///
+/// `x` is modified in-place: `x[i] *= w[i] * inv_rms`.
+/// `weight`: `[n]` — learned scale.
+pub fn rms_norm_f32_inplace(x: &mut [f32], weight: &[f32], eps: f64) {
+    let n = x.len();
+    let mean_sq = x.iter().map(|&v| v * v).sum::<f32>() / n as f32;
+    let inv_rms = (1.0 / ((mean_sq as f64 + eps).sqrt())) as f32;
+    for i in 0..n {
+        x[i] *= inv_rms * weight[i];
+    }
+}
+
 /// Tensor wrapper: applies RMS norm without going through candle's RmsNorm.
 ///
 /// `x`: `[..., d_model]` — any rank.

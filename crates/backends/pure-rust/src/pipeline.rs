@@ -12,7 +12,7 @@ use crate::code_predictor::CodePredictor;
 use crate::debug_dumper::DebugDumper;
 use crate::prompt::{build_prompt, load_gguf_metadata, parse_prompt_metadata, PromptCache, PromptMetadata};
 use crate::sampling;
-use crate::talker::{precompute_cos_sin, KvCacheFlat, Talker};
+use crate::talker::{precompute_cos_sin_flat, KvCacheFlat, Talker};
 use crate::timing::TimingRecorder;
 use crate::tokenizer::HfTokenizer;
 
@@ -149,10 +149,10 @@ impl Pipeline {
         // touched once per call). Mirrors C++ `talker_history` in pipeline-tts.cpp.
         let mut talker_history: Vec<u32> = Vec::with_capacity(num_frames);
 
-        // 3a. Precompute RoPE for the full context length
+        // 3a. Precompute RoPE for the full context length (flat f32, no Tensor)
         let max_seq = self.talker.config().max_seq_len;
-        let (cos_full, sin_full) =
-            precompute_cos_sin(self.talker.config(), max_seq, &self.device)?;
+        let hd = self.talker.config().head_dim();
+        let (cos_flat, sin_flat) = precompute_cos_sin_flat(self.talker.config(), max_seq);
 
         // 3b. Convert prompt embed to tensor and prefill one-by-one
         let input_embed = Tensor::from_slice(&prompt.input_embed, (1, t_ctx, hidden), &self.device)?;
@@ -165,9 +165,13 @@ impl Pipeline {
                 tr.start("talker_step".into(), "step".into(), pos)
             });
             let emb = input_embed.i((.., pos..pos + 1, ..))?;
-            let hidden_state = self
+            let emb_flat: Vec<f32> = emb.flatten_all()?.to_vec1()?;
+            let cos_pos = &cos_flat[pos * hd..(pos + 1) * hd];
+            let sin_pos = &sin_flat[pos * hd..(pos + 1) * hd];
+            let hidden_vec = self
                 .talker
-                .forward_step(&emb, &mut kv_cache, &cos_full, &sin_full)?;
+                .forward_step_fused(&emb_flat, &mut kv_cache, pos, cos_pos, sin_pos);
+            let hidden_state = Tensor::from_slice(&hidden_vec, (1, 1, hidden), &self.device)?;
             last_hidden = Some(hidden_state);
             drop(_step_timer);
         }
@@ -252,7 +256,6 @@ impl Pipeline {
             if frame_idx == 0 {
                 dumper.dump_1d("next-emb-step0", &next_emb_vec);
             }
-            let next_emb = Tensor::from_slice(&next_emb_vec, (1, 1, hidden), &self.device)?;
 
             // Store all codes (pad to 16 codebooks)
             all_codes.push(cb0_token as i32);
@@ -273,17 +276,20 @@ impl Pipeline {
                 dumper.dump_i32_as_f32("codes-step0", &[codec_codebooks as i32], &codes_i32);
             }
 
-            // ── Step D: talker forward step ───────────────────────────────
-            last_hidden = self
+            // ── Step D: talker forward step (fused f32 path) ────────────────
+            let pos = kv_cache.current_len();
+            let cos_pos = &cos_flat[pos * hd..(pos + 1) * hd];
+            let sin_pos = &sin_flat[pos * hd..(pos + 1) * hd];
+            let hidden_vec = self
                 .talker
-                .forward_step(&next_emb, &mut kv_cache, &cos_full, &sin_full)?;
+                .forward_step_fused(&next_emb_vec, &mut kv_cache, pos, cos_pos, sin_pos);
+            last_hidden = Tensor::from_slice(&hidden_vec, (1, 1, hidden), &self.device)?;
 
             // Debug dump: hidden state after step 1 (matches C++
             // `talker-hidden-step1`). The first frame (idx 0) produces the
             // hidden state that becomes step 1's talker output.
             if frame_idx == 0 {
-                let hidden_flat: Vec<f32> = last_hidden.flatten_all()?.to_vec1()?;
-                dumper.dump_1d("talker-hidden-step1", &hidden_flat);
+                dumper.dump_1d("talker-hidden-step1", &hidden_vec);
             }
         }
 

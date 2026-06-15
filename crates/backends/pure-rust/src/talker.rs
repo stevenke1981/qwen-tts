@@ -14,7 +14,10 @@ use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
 use crate::code_predictor::CodePredictor;
-use crate::custom_ops::{attention_gqa_flat, rms_norm_tensor};
+use crate::custom_ops::{
+    attention_f32, attention_gqa_flat, per_head_rms_norm_f32,
+    rms_norm_f32, rms_norm_f32_inplace, rms_norm_tensor, rope_f32,
+};
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 
 const FN_TOKEN_EMBD: &str = "talker.text_embd.weight";
@@ -61,10 +64,29 @@ pub struct Talker {
     device: Device,
     /// Persistent Q8 workspace (avoids re-allocation on the hot path).
     pub(crate) q8_ws: Q8Workspace,
+    /// F32 view of output_norm weight (for fused forward path).
+    pub(crate) output_norm_w: Vec<f32>,
+    /// Pre-allocated scratch buffers for the fused forward path.
+    pub(crate) scratch: FusedScratch,
+}
+
+/// Pre-allocated scratch buffers for `forward_step_fused`.
+///
+/// These are sized once during `from_content` and reused across all
+/// fused forward steps, avoiding repeated heap allocation on the hot path.
+pub(crate) struct FusedScratch {
+    /// Saved pre-norm hidden state for residual connections (d_model).
+    pub(crate) residual: Vec<f32>,
+    /// Output of RMS norm (d_model). Used as input to QKV and FFN.
+    pub(crate) normed: Vec<f32>,
+    /// FFN intermediate: SiLU(gate) * up (ffn_dim).
+    pub(crate) ffn_mid: Vec<f32>,
 }
 
 pub(crate) struct DecoderLayer {
     pub(crate) attn_norm: RmsNorm,
+    /// F32 view of attn_norm weight for the fused forward path.
+    pub(crate) attn_norm_w: Vec<f32>,
     pub(crate) attn_q: Q8Weights,
     pub(crate) attn_k: Q8Weights,
     pub(crate) attn_v: Q8Weights,
@@ -72,7 +94,12 @@ pub(crate) struct DecoderLayer {
     /// Per-head QK-norm (applied after reshaping to multi-head, before RoPE).
     pub(crate) attn_q_norm: RmsNorm,
     pub(crate) attn_k_norm: RmsNorm,
+    /// F32 view of QK-norm weights (for fused forward path).
+    pub(crate) attn_q_norm_w: Vec<f32>,
+    pub(crate) attn_k_norm_w: Vec<f32>,
     pub(crate) ffn_norm: RmsNorm,
+    /// F32 view of ffn_norm weight for the fused forward path.
+    pub(crate) ffn_norm_w: Vec<f32>,
     pub(crate) ffn_gate: Q8Weights,
     pub(crate) ffn_up: Q8Weights,
     pub(crate) ffn_down: Q8Weights,
@@ -167,6 +194,20 @@ impl KvCacheFlat {
     }
 }
 
+impl FusedScratch {
+    /// Allocate scratch buffers sized for the fused forward path.
+    ///
+    /// `d_model`: hidden dimension.
+    /// `ffn_dim`: intermediate FFN dimension (for SiLU(gate) * up).
+    pub fn new(d_model: usize, ffn_dim: usize) -> Self {
+        Self {
+            residual: vec![0.0f32; d_model],
+            normed: vec![0.0f32; d_model],
+            ffn_mid: vec![0.0f32; ffn_dim],
+        }
+    }
+}
+
 /// Load a single tensor from GGUF, dequantized to F32.
 fn load_f32_tensor(content: &Content, file: &mut File, name: &str, device: &Device) -> anyhow::Result<Tensor> {
     let qt = content
@@ -227,6 +268,7 @@ impl Talker {
         };
 
         let output_norm = RmsNorm::new(load_f32(FN_OUTPUT_NORM, &mut file)?, cfg.norm_eps);
+        let output_norm_w = output_norm.weight().to_vec1::<f32>()?;
 
         // Optional: codebook 0 embedding + LM head (for autoregressive TTS)
         let codec_embd = if content.tensor_infos.contains_key(FN_CODEC_EMBD) {
@@ -268,22 +310,38 @@ impl Talker {
                     RmsNorm::new(ones, cfg.norm_eps)
                 }
             };
+            // F32 norm weights for fused forward path.
+            let attn_norm = RmsNorm::new(load_f32(&blk(FN_ATTN_NORM), &mut file)?, cfg.norm_eps);
+            let attn_norm_w = attn_norm.weight().to_vec1::<f32>()?;
+            let attn_q_norm_w = attn_q_norm.weight().to_vec1::<f32>()?;
+            let attn_k_norm_w = attn_k_norm.weight().to_vec1::<f32>()?;
+            let ffn_norm = RmsNorm::new(load_f32(&blk(FN_FFN_NORM), &mut file)?, cfg.norm_eps);
+            let ffn_norm_w = ffn_norm.weight().to_vec1::<f32>()?;
+
             // Helper: load Q8_0 quantized weight directly from GGUF.
             let load_q8 = |name: &str, f: &mut File| load_q8_weight(&content, f, name);
             layers.push(DecoderLayer {
-                attn_norm: RmsNorm::new(load_f32(&blk(FN_ATTN_NORM), &mut file)?, cfg.norm_eps),
+                attn_norm,
+                attn_norm_w,
                 attn_q: load_q8(&blk(FN_ATTN_Q), &mut file)?,
                 attn_k: load_q8(&blk(FN_ATTN_K), &mut file)?,
                 attn_v: load_q8(&blk(FN_ATTN_V), &mut file)?,
                 attn_o: load_q8(&blk(FN_ATTN_O), &mut file)?,
                 attn_q_norm,
                 attn_k_norm,
-                ffn_norm: RmsNorm::new(load_f32(&blk(FN_FFN_NORM), &mut file)?, cfg.norm_eps),
+                attn_q_norm_w,
+                attn_k_norm_w,
+                ffn_norm,
+                ffn_norm_w,
                 ffn_gate: load_q8(&blk(FN_FFN_GATE), &mut file)?,
                 ffn_up: load_q8(&blk(FN_FFN_UP), &mut file)?,
                 ffn_down: load_q8(&blk(FN_FFN_DOWN), &mut file)?,
             });
         }
+
+        // Size scratch buffers for the fused forward path.
+        let ffn_dim = layers[0].ffn_gate.out_features();
+        let scratch = FusedScratch::new(cfg.d_model, ffn_dim);
 
         Ok(Self {
             config: cfg,
@@ -299,6 +357,8 @@ impl Talker {
             layers,
             device: device.clone(),
             q8_ws: Q8Workspace::new(),
+            output_norm_w,
+            scratch,
         })
     }
 
@@ -726,6 +786,122 @@ impl Talker {
         Ok(hidden)
     }
 
+    /// Fused single-token forward pass — zero Tensor round-trips on the hot path.
+    ///
+    /// Pure f32 operations on pre-allocated scratch buffers. Bypasses Tensor
+    /// creation, reshape, permute, narrow, and to_vec1 for every per-layer
+    /// operation. Only the final result Vec can be wrapped into a Tensor
+    /// by the caller.
+    ///
+    /// `x`: `[d_model]` — single-token hidden state.
+    /// `cache`: per-layer flat KV cache.
+    /// `pos`: current sequence position (0-based).
+    /// `cos`, `sin`: `[head_dim]` — RoPE cos/sin at position `pos`.
+    ///
+    /// Returns `[d_model]` — output-normed hidden state.
+    pub fn forward_step_fused(
+        &mut self,
+        x: &[f32],
+        cache: &mut KvCacheFlat,
+        pos: usize,
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let d_model = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv = cfg.n_kv_heads;
+        let hd = cfg.head_dim();
+        let max_seq = cfg.max_seq_len;
+        let eps = cfg.norm_eps;
+        let qk_eps = eps; // QK-norm eps matches norm eps
+
+        // Copy input into the main state buffer `h`.
+        // `h` is recycled from `scratch.normed` (first use, content overwritten).
+        let scratch = &mut self.scratch;
+        let h = &mut scratch.normed;
+        h.copy_from_slice(x);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            // ── Save residual ────────────────────────────────────────────
+            scratch.residual.copy_from_slice(h);
+
+            // ── Pre-attention RMS norm: h → scratch.normed ──────────────
+            // (h already lives in scratch.normed from the previous iteration
+            //  or the initial copy; compute norm in-place.)
+            rms_norm_f32_inplace(h, &layer.attn_norm_w, eps);
+
+            // ── QKV projections ──────────────────────────────────────────
+            let q = layer.attn_q.gemv(h, &mut self.q8_ws); // [n_heads * hd]
+            let k = layer.attn_k.gemv(h, &mut self.q8_ws); // [n_kv * hd]
+            let v = layer.attn_v.gemv(h, &mut self.q8_ws); // [n_kv * hd]
+
+            // ── Per-head QK-norm ─────────────────────────────────────────
+            let q = per_head_rms_norm_f32(&q, &layer.attn_q_norm_w, n_heads, hd, qk_eps);
+            let k = per_head_rms_norm_f32(&k, &layer.attn_k_norm_w, n_kv, hd, qk_eps);
+
+            // ── RoPE ─────────────────────────────────────────────────────
+            let q = rope_f32(&q, cos, sin, n_heads, hd);
+            let k = rope_f32(&k, cos, sin, n_kv, hd);
+
+            // ── KV cache append ──────────────────────────────────────────
+            cache.append(i, &k, &v);
+
+            // ── Attention ────────────────────────────────────────────────
+            let attn_out_raw = attention_f32(
+                &q,
+                cache.k_slice(i),
+                cache.v_slice(i),
+                n_heads,
+                n_kv,
+                pos + 1, // kv_len = positions written so far
+                hd,
+                max_seq, // head_stride
+            );
+
+            // ── Output projection ────────────────────────────────────────
+            let attn_proj = layer.attn_o.gemv(&attn_out_raw, &mut self.q8_ws); // [d_model]
+
+            // ── Residual: h = residual + attn_proj ───────────────────────
+            for j in 0..d_model {
+                h[j] = scratch.residual[j] + attn_proj[j];
+            }
+
+            // ── Save residual again for FFN ──────────────────────────────
+            scratch.residual.copy_from_slice(h);
+
+            // ── Pre-FFN RMS norm: h → scratch.normed (in-place) ─────────
+            rms_norm_f32_inplace(h, &layer.ffn_norm_w, eps);
+
+            // ── FFN gate + up (separate gemv — double quantize for now) ──
+            let gate = layer.ffn_gate.gemv(h, &mut self.q8_ws); // [ffn_dim]
+            let up = layer.ffn_up.gemv(h, &mut self.q8_ws);    // [ffn_dim]
+
+            // ── SiLU(gate) * up → scratch.ffn_mid ────────────────────────
+            let ffn_dim = gate.len();
+            let scratch_ffn = &mut scratch.ffn_mid[..ffn_dim];
+            for j in 0..ffn_dim {
+                let g = gate[j];
+                // sigmoid(x) = 1 / (1 + exp(-x))
+                let sig = 1.0 / (1.0 + (-g as f64).exp()) as f32;
+                scratch_ffn[j] = g * sig * up[j];
+            }
+
+            // ── Down projection ──────────────────────────────────────────
+            let ffn_out = layer.ffn_down.gemv(scratch_ffn, &mut self.q8_ws); // [d_model]
+
+            // ── Residual: h = residual + ffn_out ─────────────────────────
+            for j in 0..d_model {
+                h[j] = scratch.residual[j] + ffn_out[j];
+            }
+        }
+
+        // ── Final output norm ────────────────────────────────────────────
+        // h currently holds the post-FFN hidden state. Compute final norm
+        // into a newly allocated Vec (the only allocation on the fused path).
+        rms_norm_f32(h, &self.output_norm_w, eps)
+    }
+
     /// Apply the text projection MLP: fc1 → silu → fc2 + bias.
     ///
     /// `x`: `[batch, seq_len, d_model]` — text embeddings.
@@ -841,6 +1017,35 @@ pub(crate) fn precompute_cos_sin(cfg: &ModelConfig, max_s: usize, dev: &Device) 
     let sin = interleave(&sin, 2)?;
     // Add batch+head dims → [1, 1, max_s, hd]
     Ok((cos.unsqueeze(0)?.unsqueeze(0)?, sin.unsqueeze(0)?.unsqueeze(0)?))
+}
+
+/// Pre-compute RoPE cos/sin as flat f32 arrays.
+///
+/// Returns `(cos, sin)` each of length `max_s * head_dim` with layout
+/// `[pos, d]` where `cos[pos * hd + d]` = cos(pos * inv_freq[d % half])
+/// (interleaved pairs for 1D NEOX RoPE).
+pub(crate) fn precompute_cos_sin_flat(cfg: &ModelConfig, max_s: usize) -> (Vec<f32>, Vec<f32>) {
+    let hd = cfg.head_dim();
+    let half = hd / 2;
+    let inv_freq: Vec<f64> = (0..hd)
+        .step_by(2)
+        .map(|i| 1.0_f64 / cfg.rope_theta.powf(i as f64 / hd as f64))
+        .collect();
+    let mut cos = vec![0.0f32; max_s * hd];
+    let mut sin = vec![0.0f32; max_s * hd];
+    for pos in 0..max_s {
+        let base = pos * hd;
+        for d in 0..half {
+            let angle = pos as f64 * inv_freq[d];
+            let c = angle.cos() as f32;
+            let s = angle.sin() as f32;
+            cos[base + d] = c;
+            cos[base + d + half] = c;
+            sin[base + d] = s;
+            sin[base + d + half] = s;
+        }
+    }
+    (cos, sin)
 }
 
 fn interleave(x: &Tensor, n: usize) -> Result<Tensor> {
