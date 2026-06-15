@@ -117,3 +117,9 @@
 **Trigger:** After rewriting the pipeline to use KV cache, the code predictor failed with `shape mismatch in matmul, lhs: [1024, 2048], rhs: [1, 2048, 1]` — `forward_step` returned 3D `[batch, 1, d_model]` but code predictor's `predict_one_frame_sampled` expected 2D `[batch, d_model]`. The original pipeline's `i((0, seq_len-1, ..))` reduced rank from 3D to 1D, then `.unsqueeze(0)` made it 2D; the new pipeline's `forward_step` returned 3D directly.
 **Rule:** When refactoring a pipeline function that changes intermediate tensor shapes, verify ALL downstream consumers accept the new shape. Use `squeeze()` / `unsqueeze()` explicitly at the call site to match the callee's expected rank rather than changing the callee's interface.
 **Source:** KV cache pipeline rewrite
+
+---
+## Lesson #16 — 2026-06-15
+**Trigger:** CUDA pipeline tests showed only ~1× speedup over CPU for autoregressive decode with tiny matmuls `[1, 2048] @ [6144, 2048]`.
+**Rule:** Before assuming GPU acceleration will help, profile the matrix sizes: if the largest matmul dimension is < 8192 and the batch dimension is 1, kernel launch overhead dominates (>95%), making GPU ~same as CPU. GPU helps only with larger matrices (prefill, batched inference, or kernel fusion).
+**Source:** CUDA pipeline verification tests
