@@ -29,6 +29,7 @@ use std::fs::File;
 use candle_core::quantized::gguf_file::Content;
 use candle_core::{Device, IndexOp, Module, Tensor, D};
 use candle_nn::RmsNorm;
+use rand::SeedableRng;
 
 use crate::config::ModelConfig;
 use crate::sampling;
@@ -193,7 +194,7 @@ impl CodePredictor {
         Ok(frames)
     }
 
-    /// Predict a frame using temperature/top-k/top-p sampling instead of argmax.
+    /// Predict a frame using temperature/top-k/top-p sampling or argmax.
     ///
     /// Returns one `CodeFrame` for `batch=1`.
     pub fn predict_one_frame_sampled(
@@ -207,31 +208,13 @@ impl CodePredictor {
         let batch = hidden.dims()[0];
         assert_eq!(batch, 1, "sampled prediction only supports batch=1");
 
-        // 1. Optional MTP projection
-        let mut h = hidden.clone();
-        if let Some(ref w) = self.mtp_proj_w {
-            h = w.matmul(&h.t()?)?.t()?;
-            if let Some(ref b) = self.mtp_proj_b {
-                h = h.broadcast_add(b)?;
-            }
-        }
+        // Shared computation up to logits
+        let h = self.project_and_norm(hidden)?;
 
-        // 2. Output norm
-        if let Some(ref norm) = self.output_norm {
-            h = norm.forward(&h)?;
-        }
-
-        // 3. For each codebook level, apply lm_head + sample
+        // For each codebook level, apply lm_head + sample
         let mut frame = CodeFrame::with_capacity(self.num_acoustic);
         for (_g, head_w) in self.lm_heads.iter().enumerate() {
-            // Get logits as Vec<f32>
-            let logits_t = if head_w.dims()[0] == self.hidden_size {
-                head_w.matmul(&h.t()?)?.t()?
-            } else {
-                h.matmul(&head_w.t()?)?
-            };
-
-            let logits_flat: Vec<f32> = logits_t.flatten_all()?.to_vec1()?;
+            let logits_flat = self.logits_1d(&h, head_w)?;
 
             // Sample
             let (token, _prob) = sampling::sample_token(&logits_flat, temperature, top_k, top_p, rng);
@@ -239,6 +222,50 @@ impl CodePredictor {
         }
 
         Ok(frame)
+    }
+
+    /// Predict a frame using argmax (fully deterministic).
+    ///
+    /// Returns one `CodeFrame` for `batch=1`.
+    pub fn predict_one_frame_argmax(&self, hidden: &Tensor) -> anyhow::Result<CodeFrame> {
+        let batch = hidden.dims()[0];
+        assert_eq!(batch, 1, "argmax prediction only supports batch=1");
+
+        let h = self.project_and_norm(hidden)?;
+
+        let mut frame = CodeFrame::with_capacity(self.num_acoustic);
+        for (_g, head_w) in self.lm_heads.iter().enumerate() {
+            let logits_flat = self.logits_1d(&h, head_w)?;
+            let (token, _prob) = sampling::sample_token(&logits_flat, 0.0, None, None, &mut rand::rngs::StdRng::seed_from_u64(0));
+            frame.push(token);
+        }
+
+        Ok(frame)
+    }
+
+    // ── Shared helper for projection + norm ──────────────────────────────
+    fn project_and_norm(&self, hidden: &Tensor) -> anyhow::Result<Tensor> {
+        let mut h = hidden.clone();
+        if let Some(ref w) = self.mtp_proj_w {
+            h = w.matmul(&h.t()?)?.t()?;
+            if let Some(ref b) = self.mtp_proj_b {
+                h = h.broadcast_add(b)?;
+            }
+        }
+        if let Some(ref norm) = self.output_norm {
+            h = norm.forward(&h)?;
+        }
+        Ok(h)
+    }
+
+    // ── Shared helper for logits extraction ──────────────────────────────
+    fn logits_1d(&self, h: &Tensor, head_w: &Tensor) -> anyhow::Result<Vec<f32>> {
+        let logits_t = if head_w.dims()[0] == self.hidden_size {
+            head_w.matmul(&h.t()?)?.t()?
+        } else {
+            h.matmul(&head_w.t()?)?
+        };
+        Ok(logits_t.flatten_all()?.to_vec1()?)
     }
 
     /// Return the number of acoustic codebooks this predictor handles.

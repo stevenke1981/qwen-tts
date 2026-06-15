@@ -134,9 +134,15 @@ impl Pipeline {
 
             // Predict acoustic codebooks 1..N via code predictor
             // (code predictor expects [batch, d_model], not [batch, 1, d_model])
-            let frame = self
-                .code_predictor
-                .predict_one_frame_sampled(&last_hidden_2d, temperature, top_k, top_p, &mut rng)?;
+            let frame = if do_sample {
+                self
+                    .code_predictor
+                    .predict_one_frame_sampled(&last_hidden_2d, temperature, top_k, top_p, &mut rng)?
+            } else {
+                self
+                    .code_predictor
+                    .predict_one_frame_argmax(&last_hidden_2d)?
+            };
             for &token in &frame {
                 all_codes.push(token as i32);
             }

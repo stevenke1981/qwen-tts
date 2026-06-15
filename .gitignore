@@ -6,6 +6,7 @@
 /vendor/qwentts.cpp/
 /output*.wav
 /output/
+/tests/*.wav
 /dist/output*.wav
 *.log
 
