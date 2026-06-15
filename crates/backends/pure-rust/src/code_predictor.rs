@@ -36,6 +36,7 @@ use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
 use crate::sampling;
+use crate::qgemv::{q8_linear, Q8Weights};
 use crate::talker::{
     apply_per_head_norm, apply_rope, embed_token, linear_fwd, repeat_kv, DecoderLayer,
 };
@@ -68,7 +69,7 @@ pub struct CodePredictor {
     max_seq_len: usize,
 
     // ── weights ───────────────────────────────────────────────────────────
-    /// Transformer decoder layers (weights loaded as F32).
+    /// Transformer decoder layers (linear weights as Q8_0 quantized).
     layers: Vec<DecoderLayer>,
     /// Per-codebook embedding tables for acoustic codebooks 1..14.
     /// codec_embd[g-1] embeds the predicted code of book g → talker_hidden.
@@ -192,18 +193,22 @@ impl CodePredictor {
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let blk = |name: &str| -> String { format!("code_pred.blk.{i}.{name}") };
+            // Helper: load Q8_0 quantized weight directly from GGUF.
+            let load_q8 = |name: &str, f: &mut File| -> anyhow::Result<Q8Weights> {
+                Q8Weights::from_gguf(content, f, name)
+            };
             layers.push(DecoderLayer {
                 attn_norm: RmsNorm::new(load_f32(&blk("attn_norm.weight"), &mut *file)?, norm_eps),
-                attn_q: load_f32(&blk("attn_q.weight"), &mut *file)?,
-                attn_k: load_f32(&blk("attn_k.weight"), &mut *file)?,
-                attn_v: load_f32(&blk("attn_v.weight"), &mut *file)?,
-                attn_o: load_f32(&blk("attn_output.weight"), &mut *file)?,
+                attn_q: load_q8(&blk("attn_q.weight"), &mut *file)?,
+                attn_k: load_q8(&blk("attn_k.weight"), &mut *file)?,
+                attn_v: load_q8(&blk("attn_v.weight"), &mut *file)?,
+                attn_o: load_q8(&blk("attn_output.weight"), &mut *file)?,
                 attn_q_norm: RmsNorm::new(load_f32(&blk("attn_q_norm.weight"), &mut *file)?, norm_eps),
                 attn_k_norm: RmsNorm::new(load_f32(&blk("attn_k_norm.weight"), &mut *file)?, norm_eps),
                 ffn_norm: RmsNorm::new(load_f32(&blk("ffn_norm.weight"), &mut *file)?, norm_eps),
-                ffn_gate: load_f32(&blk("ffn_gate.weight"), &mut *file)?,
-                ffn_up: load_f32(&blk("ffn_up.weight"), &mut *file)?,
-                ffn_down: load_f32(&blk("ffn_down.weight"), &mut *file)?,
+                ffn_gate: load_q8(&blk("ffn_gate.weight"), &mut *file)?,
+                ffn_up: load_q8(&blk("ffn_up.weight"), &mut *file)?,
+                ffn_down: load_q8(&blk("ffn_down.weight"), &mut *file)?,
             });
         }
 
@@ -343,9 +348,9 @@ impl CodePredictor {
 
             // QKV projections using Q8_0 quantized matmul
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let q = linear_fwd(&layer.attn_q, &h_2d)?; // [B, n_q_hd * hd]
-            let k = linear_fwd(&layer.attn_k, &h_2d)?; // [B, n_kv_hd * hd]
-            let v = linear_fwd(&layer.attn_v, &h_2d)?; // [B, n_kv_hd * hd]
+            let q = q8_linear(&layer.attn_q, &h_2d)?; // [B, n_q_hd * hd]
+            let k = q8_linear(&layer.attn_k, &h_2d)?; // [B, n_kv_hd * hd]
+            let v = q8_linear(&layer.attn_v, &h_2d)?; // [B, n_kv_hd * hd]
 
             // Reshape to multi-head: [B, n_heads, 1, head_dim]
             let q = q.reshape((batch, self.n_q_heads, 1, self.head_dim))?;
@@ -397,17 +402,17 @@ impl CodePredictor {
             let attn_out = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch, head_dim_sum))?;
-            let attn_proj = linear_fwd(&layer.attn_o, &attn_out)?;
+            let attn_proj = q8_linear(&layer.attn_o, &attn_out)?;
             x = (residual + attn_proj.reshape((batch, 1, self.pred_hidden))?)?;
 
             // SwiGLU FFN
             let residual = x.clone();
             x = layer.ffn_norm.forward(&x)?;
             let h_2d = x.reshape((batch, self.pred_hidden))?;
-            let gate = candle_nn::ops::silu(&linear_fwd(&layer.ffn_gate, &h_2d)?)?;
-            let up = linear_fwd(&layer.ffn_up, &h_2d)?;
+            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d)?)?;
+            let up = q8_linear(&layer.ffn_up, &h_2d)?;
             let hid = (gate * up)?;
-            let hid_out = linear_fwd(&layer.ffn_down, &hid)?;
+            let hid_out = q8_linear(&layer.ffn_down, &hid)?;
             x = (residual + hid_out.reshape((batch, 1, self.pred_hidden))?)?;
         }
 

@@ -1,0 +1,7 @@
+# Enable AVX2 and other native-CPU features for Q8_0 GEMV performance.
+# BlockQ8_0::vec_dot dispatches to AVX2 code when compiled with
+# target-cpu=native (via core::arch::x86_64::* intrinsics).
+#
+# Without this, vec_dot falls back to a scalar loop which is 4-8× slower.
+[build]
+rustflags = ["-C", "target-cpu=native"]

@@ -1,9 +1,9 @@
 //! Qwen2 talker transformer — loaded from a GGUF file.
 //!
-//! Weights are loaded as F32 and use the `gemm` crate (via candle) for matmul.
-//! For autoregressive (M=1) inference this is faster than Q8_0 quantized matmul
-//! because candle's k_quants::matmul uses Rayon parallelism (overhead > benefit
-//! for tiny GEMV workloads). See the lesson about Q8_0 bottlenecks.
+//! Linear projection weights are stored as Q8_0 quantized blocks and use a
+//! custom single-threaded GEMV (see [`crate::qgemv`]) which avoids the Rayon
+//! overhead of candle's `k_quants::matmul`. RMS norm weights, embeddings, and
+//! biases remain F32.
 
 use std::fs::File;
 use std::path::Path;
@@ -14,6 +14,7 @@ use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
 use crate::code_predictor::CodePredictor;
+use crate::qgemv::{q8_linear, Q8Weights};
 
 const FN_TOKEN_EMBD: &str = "talker.text_embd.weight";
 const FN_OUTPUT: &str = "talker.output.weight";
@@ -61,17 +62,17 @@ pub struct Talker {
 
 pub(crate) struct DecoderLayer {
     pub(crate) attn_norm: RmsNorm,
-    pub(crate) attn_q: Tensor,
-    pub(crate) attn_k: Tensor,
-    pub(crate) attn_v: Tensor,
-    pub(crate) attn_o: Tensor,
+    pub(crate) attn_q: Q8Weights,
+    pub(crate) attn_k: Q8Weights,
+    pub(crate) attn_v: Q8Weights,
+    pub(crate) attn_o: Q8Weights,
     /// Per-head QK-norm (applied after reshaping to multi-head, before RoPE).
     pub(crate) attn_q_norm: RmsNorm,
     pub(crate) attn_k_norm: RmsNorm,
     pub(crate) ffn_norm: RmsNorm,
-    pub(crate) ffn_gate: Tensor,
-    pub(crate) ffn_up: Tensor,
-    pub(crate) ffn_down: Tensor,
+    pub(crate) ffn_gate: Q8Weights,
+    pub(crate) ffn_up: Q8Weights,
+    pub(crate) ffn_down: Q8Weights,
 }
 
 // -----------------------------------------------------------------------
@@ -139,6 +140,11 @@ fn load_f32_tensor(content: &Content, file: &mut File, name: &str, device: &Devi
         .map_err(|e| anyhow::anyhow!("missing tensor {name}: {e}"))?;
     qt.dequantize(device)
         .map_err(|e| anyhow::anyhow!("dequantize {name}: {e}"))
+}
+
+/// Load a single Q8_0 quantized weight from GGUF (no dequantization).
+fn load_q8_weight(content: &Content, file: &mut File, name: &str) -> anyhow::Result<Q8Weights> {
+    Q8Weights::from_gguf(content, file, name)
 }
 
 // -----------------------------------------------------------------------
@@ -228,18 +234,20 @@ impl Talker {
                     RmsNorm::new(ones, cfg.norm_eps)
                 }
             };
+            // Helper: load Q8_0 quantized weight directly from GGUF.
+            let load_q8 = |name: &str, f: &mut File| load_q8_weight(&content, f, name);
             layers.push(DecoderLayer {
                 attn_norm: RmsNorm::new(load_f32(&blk(FN_ATTN_NORM), &mut file)?, cfg.norm_eps),
-                attn_q: load_f32(&blk(FN_ATTN_Q), &mut file)?,
-                attn_k: load_f32(&blk(FN_ATTN_K), &mut file)?,
-                attn_v: load_f32(&blk(FN_ATTN_V), &mut file)?,
-                attn_o: load_f32(&blk(FN_ATTN_O), &mut file)?,
+                attn_q: load_q8(&blk(FN_ATTN_Q), &mut file)?,
+                attn_k: load_q8(&blk(FN_ATTN_K), &mut file)?,
+                attn_v: load_q8(&blk(FN_ATTN_V), &mut file)?,
+                attn_o: load_q8(&blk(FN_ATTN_O), &mut file)?,
                 attn_q_norm,
                 attn_k_norm,
                 ffn_norm: RmsNorm::new(load_f32(&blk(FN_FFN_NORM), &mut file)?, cfg.norm_eps),
-                ffn_gate: load_f32(&blk(FN_FFN_GATE), &mut file)?,
-                ffn_up: load_f32(&blk(FN_FFN_UP), &mut file)?,
-                ffn_down: load_f32(&blk(FN_FFN_DOWN), &mut file)?,
+                ffn_gate: load_q8(&blk(FN_FFN_GATE), &mut file)?,
+                ffn_up: load_q8(&blk(FN_FFN_UP), &mut file)?,
+                ffn_down: load_q8(&blk(FN_FFN_DOWN), &mut file)?,
             });
         }
 
@@ -300,9 +308,9 @@ impl Talker {
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
 
             // QKV projections using Q8_0 quantized matmul
-            let q = linear_fwd(&layer.attn_q, &h_2d)?; // [B*T, head_dim_sum]
-            let k = linear_fwd(&layer.attn_k, &h_2d)?; // [B*T, n_kv*hd]
-            let v = linear_fwd(&layer.attn_v, &h_2d)?; // [B*T, n_kv*hd]
+            let q = q8_linear(&layer.attn_q, &h_2d)?; // [B*T, head_dim_sum]
+            let k = q8_linear(&layer.attn_k, &h_2d)?; // [B*T, n_kv*hd]
+            let v = q8_linear(&layer.attn_v, &h_2d)?; // [B*T, n_kv*hd]
 
             // Reshape to multi-head: [B*T, dim] → [B, T, n_heads, hd] → [B, n_heads, T, hd]
             let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
@@ -334,17 +342,17 @@ impl Talker {
             let attn_flat = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch * seq_len, head_dim_sum))?;
-            let attn_proj = linear_fwd(&layer.attn_o, &attn_flat)?; // [B*T, d_model]
+            let attn_proj = q8_linear(&layer.attn_o, &attn_flat)?; // [B*T, d_model]
             hidden = (residual + attn_proj.reshape((batch, seq_len, d_model))?)?;
 
             // SwiGLU FFN
             let residual = hidden.clone();
             hidden = layer.ffn_norm.forward(&hidden)?;
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
-            let gate = candle_nn::ops::silu(&linear_fwd(&layer.ffn_gate, &h_2d)?)?;
-            let up = linear_fwd(&layer.ffn_up, &h_2d)?;
+            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d)?)?;
+            let up = q8_linear(&layer.ffn_up, &h_2d)?;
             let hid_2d = (gate * up)?;
-            let hid_out = linear_fwd(&layer.ffn_down, &hid_2d)?; // [B*T, d_model]
+            let hid_out = q8_linear(&layer.ffn_down, &hid_2d)?; // [B*T, d_model]
             hidden = (residual + hid_out.reshape((batch, seq_len, d_model))?)?;
         }
 
@@ -401,9 +409,9 @@ impl Talker {
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
 
             // QKV projections using Q8_0 quantized matmul
-            let q = linear_fwd(&layer.attn_q, &h_2d)?; // [B*T, head_dim_sum]
-            let k = linear_fwd(&layer.attn_k, &h_2d)?; // [B*T, n_kv*hd]
-            let v = linear_fwd(&layer.attn_v, &h_2d)?; // [B*T, n_kv*hd]
+            let q = q8_linear(&layer.attn_q, &h_2d)?; // [B*T, head_dim_sum]
+            let k = q8_linear(&layer.attn_k, &h_2d)?; // [B*T, n_kv*hd]
+            let v = q8_linear(&layer.attn_v, &h_2d)?; // [B*T, n_kv*hd]
 
             // Reshape to multi-head: [B*T, dim] → [B, T, n_heads, hd] → [B, n_heads, T, hd]
             let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
@@ -435,17 +443,17 @@ impl Talker {
             let attn_flat = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch * seq_len, head_dim_sum))?;
-            let attn_proj = linear_fwd(&layer.attn_o, &attn_flat)?; // [B*T, d_model]
+            let attn_proj = q8_linear(&layer.attn_o, &attn_flat)?; // [B*T, d_model]
             hidden = (residual + attn_proj.reshape((batch, seq_len, d_model))?)?;
 
             // SwiGLU FFN
             let residual = hidden.clone();
             hidden = layer.ffn_norm.forward(&hidden)?;
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
-            let gate = candle_nn::ops::silu(&linear_fwd(&layer.ffn_gate, &h_2d)?)?;
-            let up = linear_fwd(&layer.ffn_up, &h_2d)?;
+            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d)?)?;
+            let up = q8_linear(&layer.ffn_up, &h_2d)?;
             let hid_2d = (gate * up)?;
-            let hid_out = linear_fwd(&layer.ffn_down, &hid_2d)?; // [B*T, d_model]
+            let hid_out = q8_linear(&layer.ffn_down, &hid_2d)?; // [B*T, d_model]
             hidden = (residual + hid_out.reshape((batch, seq_len, d_model))?)?;
         }
 
@@ -492,9 +500,9 @@ impl Talker {
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
 
             // QKV projections using Q8_0 quantized matmul
-            let q = linear_fwd(&layer.attn_q, &h_2d)?; // [B*T, head_dim_sum]
-            let k = linear_fwd(&layer.attn_k, &h_2d)?; // [B*T, n_kv*hd]
-            let v = linear_fwd(&layer.attn_v, &h_2d)?; // [B*T, n_kv*hd]
+            let q = q8_linear(&layer.attn_q, &h_2d)?; // [B*T, head_dim_sum]
+            let k = q8_linear(&layer.attn_k, &h_2d)?; // [B*T, n_kv*hd]
+            let v = q8_linear(&layer.attn_v, &h_2d)?; // [B*T, n_kv*hd]
 
             // Reshape to multi-head: [B*T, dim] → [B, T, n_heads, hd] → [B, n_heads, T, hd]
             let q = q.reshape((batch, seq_len, n_heads, hd))?.permute((0, 2, 1, 3))?;
@@ -526,17 +534,17 @@ impl Talker {
             let attn_flat = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch * seq_len, head_dim_sum))?;
-            let attn_proj = linear_fwd(&layer.attn_o, &attn_flat)?; // [B*T, d_model]
+            let attn_proj = q8_linear(&layer.attn_o, &attn_flat)?; // [B*T, d_model]
             hidden = (residual + attn_proj.reshape((batch, seq_len, d_model))?)?;
 
             // SwiGLU FFN
             let residual = hidden.clone();
             hidden = layer.ffn_norm.forward(&hidden)?;
             let h_2d = hidden.reshape((batch * seq_len, d_model))?;
-            let gate = candle_nn::ops::silu(&linear_fwd(&layer.ffn_gate, &h_2d)?)?;
-            let up = linear_fwd(&layer.ffn_up, &h_2d)?;
+            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d)?)?;
+            let up = q8_linear(&layer.ffn_up, &h_2d)?;
             let hid_2d = (gate * up)?;
-            let hid_out = linear_fwd(&layer.ffn_down, &hid_2d)?; // [B*T, d_model]
+            let hid_out = q8_linear(&layer.ffn_down, &hid_2d)?; // [B*T, d_model]
             hidden = (residual + hid_out.reshape((batch, seq_len, d_model))?)?;
         }
 
@@ -613,9 +621,9 @@ impl Talker {
 
             // QKV projections for a single token: [B, d_model] → [B, ...]
             let h_2d = hidden.reshape((batch, d_model))?;
-            let q = linear_fwd(&layer.attn_q, &h_2d)?; // [B, n_heads*hd]
-            let k = linear_fwd(&layer.attn_k, &h_2d)?; // [B, n_kv*hd]
-            let v = linear_fwd(&layer.attn_v, &h_2d)?; // [B, n_kv*hd]
+            let q = q8_linear(&layer.attn_q, &h_2d)?; // [B, n_heads*hd]
+            let k = q8_linear(&layer.attn_k, &h_2d)?; // [B, n_kv*hd]
+            let v = q8_linear(&layer.attn_v, &h_2d)?; // [B, n_kv*hd]
 
             // Reshape to multi-head
             let q = q.reshape((batch, n_heads, 1, hd))?;
@@ -668,17 +676,17 @@ impl Talker {
             let attn_out = attn_out
                 .permute((0, 2, 1, 3))?
                 .reshape((batch, head_dim_sum))?;
-            let attn_proj = linear_fwd(&layer.attn_o, &attn_out)?;
+            let attn_proj = q8_linear(&layer.attn_o, &attn_out)?;
             hidden = (residual + attn_proj.reshape((batch, 1, d_model))?)?;
 
             // SwiGLU FFN
             let residual = hidden.clone();
             hidden = layer.ffn_norm.forward(&hidden)?;
             let h_2d = hidden.reshape((batch, d_model))?;
-            let gate = candle_nn::ops::silu(&linear_fwd(&layer.ffn_gate, &h_2d)?)?;
-            let up = linear_fwd(&layer.ffn_up, &h_2d)?;
+            let gate = candle_nn::ops::silu(&q8_linear(&layer.ffn_gate, &h_2d)?)?;
+            let up = q8_linear(&layer.ffn_up, &h_2d)?;
             let hid_2d = (gate * up)?;
-            let hid_out = linear_fwd(&layer.ffn_down, &hid_2d)?;
+            let hid_out = q8_linear(&layer.ffn_down, &hid_2d)?;
             hidden = (residual + hid_out.reshape((batch, 1, d_model))?)?;
         }
 

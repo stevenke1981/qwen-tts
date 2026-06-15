@@ -4,6 +4,7 @@
 pub mod config;
 pub mod code_predictor;
 pub mod pipeline;
+pub mod qgemv;
 pub mod sampling;
 pub mod talker;
 pub mod tokenizer;
