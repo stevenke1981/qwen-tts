@@ -135,3 +135,9 @@
 **Trigger:** Rewrote code_predictor.rs from simplified linear predictor to full 5-layer transformer with KV cache, requiring coordinated changes across 3 source files and 3 test files.
 **Rule:** When changing a struct's method signature (e.g., `&self → &mut self`), grep for ALL callers in ALL test files before editing — the compiler catches lib callers but test files are only checked at test compile time.
 **Source:** Full code predictor implementation (Task 2)
+
+---
+## Lesson #19 — 2026-06-15
+**Trigger:** E2E test failed with "index-select only supports contiguous tensors" after transposing a square embedding weight [2048,2048] for index_select in the new code predictor.
+**Rule:** After any `Tensor::t()` (transpose) in candle, call `.contiguous()?` before `index_select()` — transpose produces a non-contiguous view, and index_select requires contiguous storage. For square matrices where transpose is a no-op, skip the transpose entirely.
+**Source:** Full code predictor E2E verification
