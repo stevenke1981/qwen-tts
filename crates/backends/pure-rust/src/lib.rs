@@ -92,12 +92,12 @@ impl RuntimeBackend for PureRustBackend {
 
         self.ensure_pipeline()?;
 
-        let guard = self
+        let mut guard = self
             .pipeline
             .lock()
             .map_err(|e| BackendError::Unavailable(format!("mutex poisoned: {e}")))?;
 
-        let pipeline = guard.as_ref().ok_or_else(|| {
+        let pipeline = guard.as_mut().ok_or_else(|| {
             BackendError::Unavailable("pipeline not initialised".into())
         })?;
 

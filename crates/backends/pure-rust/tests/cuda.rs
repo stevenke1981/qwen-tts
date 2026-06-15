@@ -48,7 +48,7 @@ fn talker_loads_on_cuda() {
 /// Quick check: can we initialize the pipeline with CUDA and synthesize audio?
 fn cuda_synthesize_inner(num_frames: u32) {
     let device = Device::new_cuda(0).expect("CUDA should be available");
-    let pipeline = Pipeline::new(&talker_path(), &codec_path(), &device)
+    let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &device)
         .expect("pipeline should load on CUDA");
 
     let request = SynthesisRequest {

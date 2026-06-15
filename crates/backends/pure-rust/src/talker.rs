@@ -58,18 +58,18 @@ pub struct Talker {
 }
 
 pub(crate) struct DecoderLayer {
-    attn_norm: RmsNorm,
-    attn_q: Tensor,
-    attn_k: Tensor,
-    attn_v: Tensor,
-    attn_o: Tensor,
+    pub(crate) attn_norm: RmsNorm,
+    pub(crate) attn_q: Tensor,
+    pub(crate) attn_k: Tensor,
+    pub(crate) attn_v: Tensor,
+    pub(crate) attn_o: Tensor,
     /// Per-head QK-norm (applied after reshaping to multi-head, before RoPE).
-    attn_q_norm: RmsNorm,
-    attn_k_norm: RmsNorm,
-    ffn_norm: RmsNorm,
-    ffn_gate: Tensor,
-    ffn_up: Tensor,
-    ffn_down: Tensor,
+    pub(crate) attn_q_norm: RmsNorm,
+    pub(crate) attn_k_norm: RmsNorm,
+    pub(crate) ffn_norm: RmsNorm,
+    pub(crate) ffn_gate: Tensor,
+    pub(crate) ffn_up: Tensor,
+    pub(crate) ffn_down: Tensor,
 }
 
 // -----------------------------------------------------------------------

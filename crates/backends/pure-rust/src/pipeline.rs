@@ -45,7 +45,7 @@ impl Pipeline {
     }
 
     /// Synthesize speech: text → WAV samples via autoregressive code generation.
-    pub fn synthesize(&self, request: &SynthesisRequest) -> anyhow::Result<Vec<i16>> {
+    pub fn synthesize(&mut self, request: &SynthesisRequest) -> anyhow::Result<Vec<i16>> {
         let raw_text = &request.text;
         if raw_text.trim().is_empty() {
             anyhow::bail!("text cannot be empty");
@@ -115,9 +115,6 @@ impl Pipeline {
 
         // 4c. Decode loop: generate audio frames
         for frame_idx in 0..num_frames {
-            // Squeeze from [1, 1, d_model] to [1, d_model] for code predictor
-            let last_hidden_2d = last_hidden.squeeze(1)?;
-
             // Predict codebook 0 via codec_head
             let cb0_logits = self.talker.predict_codebook0(&last_hidden)?;
             // cb0_logits: [1, 1, vocab_cb0]
@@ -128,20 +125,20 @@ impl Pipeline {
             };
             all_codes.push(cb0_token as i32);
 
-            // Embed codebook 0 token for the next forward step
+            // Embed codebook 0 token for predictor prefill position 1 + next talker step
             let cb0_emb = self.talker.embed_codebook0(cb0_token)?;
             // cb0_emb: [1, 1, d_model]
 
             // Predict acoustic codebooks 1..N via code predictor
-            // (code predictor expects [batch, d_model], not [batch, 1, d_model])
+            // (full transformer with KV cache, needs last talker hidden + c0 embedding)
             let frame = if do_sample {
                 self
                     .code_predictor
-                    .predict_one_frame_sampled(&last_hidden_2d, temperature, top_k, top_p, &mut rng)?
+                    .predict_one_frame_sampled(&last_hidden, &cb0_emb, temperature, top_k, top_p, &mut rng)?
             } else {
                 self
                     .code_predictor
-                    .predict_one_frame_argmax(&last_hidden_2d)?
+                    .predict_one_frame_argmax(&last_hidden, &cb0_emb)?
             };
             for &token in &frame {
                 all_codes.push(token as i32);

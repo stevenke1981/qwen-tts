@@ -251,7 +251,7 @@ fn test_code_predictor_loads() {
 #[test]
 #[ignore = "requires ~10 GB RAM and ~19 minutes (128 frames, KV cache)"]
 fn test_pipeline_full_synthesize() {
-    let pipeline = Pipeline::new(&talker_path(), &codec_path(), &Device::Cpu)
+    let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &Device::Cpu)
         .expect("pipeline should load");
 
     let request = SynthesisRequest {

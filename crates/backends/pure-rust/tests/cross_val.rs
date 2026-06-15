@@ -119,7 +119,7 @@ fn pure_rust_synthesize(
     seed: u64,
 ) -> (Vec<i16>, f64) {
     let device = Device::Cpu;
-    let pipeline = Pipeline::new(&talker_path(), &codec_path(), &device)
+    let mut pipeline = Pipeline::new(&talker_path(), &codec_path(), &device)
         .expect("Pure Rust pipeline should load");
 
     let request = SynthesisRequest {
