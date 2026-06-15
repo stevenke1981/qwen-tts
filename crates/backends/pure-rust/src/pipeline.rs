@@ -9,6 +9,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::code_predictor::CodePredictor;
+use crate::debug_dumper::DebugDumper;
 use crate::prompt::{build_prompt, load_gguf_metadata, parse_prompt_metadata, PromptCache, PromptMetadata};
 use crate::sampling;
 use crate::talker::{precompute_cos_sin, KvCache, Talker};
@@ -26,6 +27,9 @@ pub struct Pipeline {
     prompt_metadata: PromptMetadata,
     /// Pre-computed special embeddings + prefix cache.
     prompt_cache: PromptCache,
+    /// Optional dump directory for deterministic parity fixtures (C++ compatible
+    /// binary format). Set before calling synthesize() to enable debug dumps.
+    pub dump_dir: Option<String>,
 }
 
 impl Pipeline {
@@ -63,6 +67,7 @@ impl Pipeline {
             device: device.clone(),
             prompt_metadata,
             prompt_cache,
+            dump_dir: None,
         })
     }
 
@@ -110,6 +115,10 @@ impl Pipeline {
         if let Some(ref mut tr) = timing_recorder {
             tr.record("prompt_embed".into(), "load".into(), t1.elapsed().as_secs_f64(), 0);
         }
+
+        // Debug dump: prompt embedding (step 0 prefill input).
+        let dumper = DebugDumper::new(self.dump_dir.clone());
+        dumper.dump_2d("prompt-embed", prompt.T_ctx, prompt.hidden, &prompt.input_embed);
 
         let hidden = prompt.hidden;
         let t_ctx = prompt.T_ctx;
@@ -237,6 +246,11 @@ impl Pipeline {
             for i in 0..hidden {
                 next_emb_vec[i] = codec_sum[i] + overlay[i];
             }
+            // Debug dump: next-token embedding at step 0 (matches C++
+            // `next-emb-step0`).
+            if frame_idx == 0 {
+                dumper.dump_1d("next-emb-step0", &next_emb_vec);
+            }
             let next_emb = Tensor::from_slice(&next_emb_vec, (1, 1, hidden), &self.device)?;
 
             // Store all codes (pad to 16 codebooks)
@@ -247,11 +261,29 @@ impl Pipeline {
             while all_codes.len() < (frame_idx + 1) * codec_codebooks {
                 all_codes.push(0);
             }
+            // Debug dump: first frame codes (matches C++ `codes-step0`).
+            if frame_idx == 0 {
+                let frame_start = 0;
+                let frame_end = frame_start + codec_codebooks;
+                let codes_i32: Vec<i32> = all_codes[frame_start..frame_end]
+                    .iter()
+                    .copied()
+                    .collect();
+                dumper.dump_i32_as_f32("codes-step0", &[codec_codebooks as i32], &codes_i32);
+            }
 
             // ── Step D: talker forward step ───────────────────────────────
             last_hidden = self
                 .talker
                 .forward_step(&next_emb, &mut kv_cache, &cos_full, &sin_full)?;
+
+            // Debug dump: hidden state after step 1 (matches C++
+            // `talker-hidden-step1`). The first frame (idx 0) produces the
+            // hidden state that becomes step 1's talker output.
+            if frame_idx == 0 {
+                let hidden_flat: Vec<f32> = last_hidden.flatten_all()?.to_vec1()?;
+                dumper.dump_1d("talker-hidden-step1", &hidden_flat);
+            }
         }
 
         // Trim to exact multiples
@@ -270,6 +302,13 @@ impl Pipeline {
             .iter()
             .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             .collect();
+
+        // Debug dump: full codes matrix (matches C++ `codes-full`).
+        dumper.dump_i32_as_f32(
+            "codes-full",
+            &[total_frames as i32, codec_codebooks as i32],
+            &all_codes,
+        );
 
         log::info!(
             "pure-rust synth: {} ctx tokens → {} code frames ({} code tokens) → {} audio samples ({}s)",

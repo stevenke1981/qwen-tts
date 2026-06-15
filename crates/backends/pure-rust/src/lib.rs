@@ -1,9 +1,10 @@
 //! Pure Rust TTS backend using candle for the talker transformer and
 //! qwen-tts-codec for the DAC decoder. No C++ FFI required.
 
-pub mod config;
 pub mod code_predictor;
+pub mod config;
 pub mod custom_ops;
+pub mod debug_dumper;
 pub mod pipeline;
 pub mod prompt;
 pub mod qgemv;
