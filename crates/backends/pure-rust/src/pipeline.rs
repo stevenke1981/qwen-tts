@@ -11,6 +11,7 @@ use rand::SeedableRng;
 use crate::code_predictor::CodePredictor;
 use crate::sampling;
 use crate::talker::{precompute_cos_sin, KvCache, Talker};
+use crate::timing::TimingRecorder;
 use crate::tokenizer::HfTokenizer;
 
 /// Loaded pipeline ready for synthesis.
@@ -45,13 +46,22 @@ impl Pipeline {
     }
 
     /// Synthesize speech: text → WAV samples via autoregressive code generation.
-    pub fn synthesize(&mut self, request: &SynthesisRequest) -> anyhow::Result<Vec<i16>> {
+    ///
+    /// `timing_recorder` is optional — when provided, per-stage durations are
+    /// recorded for benchmarking. Only active when `pipeline-timing` feature is
+    /// enabled; otherwise the parameter is accepted but ignored.
+    pub fn synthesize(
+        &mut self,
+        request: &SynthesisRequest,
+        mut timing_recorder: Option<&mut TimingRecorder>,
+    ) -> anyhow::Result<Vec<i16>> {
         let raw_text = &request.text;
         if raw_text.trim().is_empty() {
             anyhow::bail!("text cannot be empty");
         }
 
         // --- 1. Tokenize ---
+        let t0 = std::time::Instant::now();
         let input_ids = if let Some(ref tok) = self.tokenizer {
             let mut ids = tok.encode(raw_text)?;
             let bos = tok.bos_id();
@@ -65,6 +75,9 @@ impl Pipeline {
         if input_ids.is_empty() {
             anyhow::bail!("tokenization produced empty input");
         }
+        if let Some(ref mut tr) = timing_recorder {
+            tr.record("tokenize".into(), "load".into(), t0.elapsed().as_secs_f64(), 0);
+        }
 
         // Pad to minimum sequence length
         let min_seq: usize = 8;
@@ -75,8 +88,12 @@ impl Pipeline {
         let input_tensor = Tensor::from_slice(&padded, (1, seq_len), &self.device)?;
 
         // --- 2. Text embeddings ---
+        let t1 = std::time::Instant::now();
         let text_embeds = self.talker.embed_text(&input_tensor)?;
         // text_embeds: [1, seq_len, d_model]
+        if let Some(ref mut tr) = timing_recorder {
+            tr.record("prompt_embed".into(), "load".into(), t1.elapsed().as_secs_f64(), 0);
+        }
 
         // --- 3. Sampling configuration ---
         let temperature = request.temperature.unwrap_or(1.0);
@@ -103,11 +120,15 @@ impl Pipeline {
         let mut kv_cache = KvCache::new(self.talker.config().n_layers);
         let mut last_hidden: Option<Tensor> = None;
         for pos in 0..seq_len {
+            let _step_timer = timing_recorder.as_mut().map(|tr| {
+                tr.start("talker_step".into(), "step".into(), pos)
+            });
             let emb = text_embeds.i((.., pos..pos + 1, ..))?;
             let hidden = self
                 .talker
                 .forward_step(&emb, &mut kv_cache, &cos_full, &sin_full)?;
             last_hidden = Some(hidden);
+            drop(_step_timer);
         }
         // last_hidden: [1, 1, d_model] — output-normed hidden state at the last text position
         let mut last_hidden = last_hidden
@@ -116,6 +137,9 @@ impl Pipeline {
         // 4c. Decode loop: generate audio frames
         for frame_idx in 0..num_frames {
             // Predict codebook 0 via codec_head
+            let _cb0_timer = timing_recorder.as_mut().map(|tr| {
+                tr.start("cb0_sample".into(), "step".into(), frame_idx)
+            });
             let cb0_logits = self.talker.predict_codebook0(&last_hidden)?;
             // cb0_logits: [1, 1, vocab_cb0]
             let cb0_token = if do_sample {
@@ -124,6 +148,7 @@ impl Pipeline {
                 sampling::sample_argmax(&cb0_logits)?
             };
             all_codes.push(cb0_token as i32);
+            drop(_cb0_timer);
 
             // Embed codebook 0 token for predictor prefill position 1 + next talker step
             let cb0_emb = self.talker.embed_codebook0(cb0_token)?;
@@ -131,6 +156,9 @@ impl Pipeline {
 
             // Predict acoustic codebooks 1..N via code predictor
             // (full transformer with KV cache, needs last talker hidden + c0 embedding)
+            let _pred_timer = timing_recorder.as_mut().map(|tr| {
+                tr.start("predictor_frame".into(), "frame".into(), frame_idx)
+            });
             let frame = if do_sample {
                 self
                     .code_predictor
@@ -148,6 +176,7 @@ impl Pipeline {
             while all_codes.len() < (frame_idx + 1) * codec_codebooks {
                 all_codes.push(0);
             }
+            drop(_pred_timer);
 
             // Forward step with the new audio embedding — uses KV cache so this is O(1) per layer
             last_hidden = self
@@ -160,7 +189,11 @@ impl Pipeline {
         all_codes.truncate(total_frames * codec_codebooks);
 
         // --- 5. Decode audio via codec ---
+        let _decode_timer = timing_recorder.as_mut().map(|tr| {
+            tr.start("codec_decode".into(), "decode".into(), 0)
+        });
         let audio_f32 = self.codec_decoder.decode(&all_codes, total_frames);
+        drop(_decode_timer);
 
         // --- 6. Convert f32 → i16 PCM ---
         let audio_i16: Vec<i16> = audio_f32
@@ -178,6 +211,11 @@ impl Pipeline {
         );
 
         Ok(audio_i16)
+    }
+
+    /// Convenience wrapper without timing recorder.
+    pub fn synthesize_simple(&mut self, request: &SynthesisRequest) -> anyhow::Result<Vec<i16>> {
+        self.synthesize(request, None)
     }
 }
 

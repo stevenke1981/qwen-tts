@@ -105,7 +105,7 @@ impl RuntimeBackend for PureRustBackend {
         })?;
 
         let audio_i16 = pipeline
-            .synthesize(request)
+            .synthesize_simple(request)
             .map_err(|e| BackendError::InvalidRequest(format!("synthesis failed: {e}")))?;
 
         drop(guard);
