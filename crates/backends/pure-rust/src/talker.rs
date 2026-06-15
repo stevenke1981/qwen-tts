@@ -11,12 +11,15 @@ use std::path::Path;
 use candle_core::quantized::gguf_file::Content;
 use candle_core::{Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::RmsNorm;
+use rayon::prelude::*;
 
 use crate::config::ModelConfig;
 use crate::code_predictor::CodePredictor;
 use crate::custom_ops::{
-    attention_f32, attention_gqa_flat, per_head_rms_norm_f32,
-    rms_norm_f32, rms_norm_f32_inplace, rms_norm_tensor, rope_f32,
+    attention_f32_par, attention_gqa_flat,
+    per_head_rms_norm_f32_par,
+    rms_norm_f32, rms_norm_f32_inplace, rms_norm_tensor,
+    rope_f32_par, silu_f32_par,
 };
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 
@@ -874,24 +877,27 @@ impl Talker {
             //  or the initial copy; compute norm in-place.)
             rms_norm_f32_inplace(h, &layer.attn_norm_w, eps);
 
-            // ── QKV projections (allocation-free gemv_into) ───────────────
-            layer.attn_q.gemv_into(h, &mut self.q8_ws, &mut scratch.q_buf);
-            layer.attn_k.gemv_into(h, &mut self.q8_ws, &mut scratch.k_buf);
-            layer.attn_v.gemv_into(h, &mut self.q8_ws, &mut scratch.v_buf);
+            // ── QKV projections (quantize-once multi gemv) ────────────────
+            Q8Weights::gemv_multi_into(
+                &[&layer.attn_q, &layer.attn_k, &layer.attn_v],
+                &mut [&mut scratch.q_buf, &mut scratch.k_buf, &mut scratch.v_buf],
+                h,
+                &mut self.q8_ws,
+            );
 
-            // ── Per-head QK-norm ─────────────────────────────────────────
-            let q = per_head_rms_norm_f32(&scratch.q_buf, &layer.attn_q_norm_w, n_heads, hd, qk_eps);
-            let k = per_head_rms_norm_f32(&scratch.k_buf, &layer.attn_k_norm_w, n_kv, hd, qk_eps);
+            // ── Per-head QK-norm (parallel) ──────────────────────────────
+            let q = per_head_rms_norm_f32_par(&scratch.q_buf, &layer.attn_q_norm_w, n_heads, hd, qk_eps);
+            let k = per_head_rms_norm_f32_par(&scratch.k_buf, &layer.attn_k_norm_w, n_kv, hd, qk_eps);
 
-            // ── RoPE ─────────────────────────────────────────────────────
-            let q = rope_f32(&q, cos, sin, n_heads, hd);
-            let k = rope_f32(&k, cos, sin, n_kv, hd);
+            // ── RoPE (parallel) ──────────────────────────────────────────
+            let q = rope_f32_par(&q, cos, sin, n_heads, hd);
+            let k = rope_f32_par(&k, cos, sin, n_kv, hd);
 
             // ── KV cache append ──────────────────────────────────────────
             cache.append(i, &k, &scratch.v_buf);
 
-            // ── Attention ────────────────────────────────────────────────
-            let attn_out_raw = attention_f32(
+            // ── Attention (parallel) ─────────────────────────────────────
+            let attn_out_raw = attention_f32_par(
                 &q,
                 cache.k_slice(i),
                 cache.v_slice(i),
@@ -905,10 +911,13 @@ impl Talker {
             // ── Output projection into q_buf (reuse — attn_dim == d_model) ─
             layer.attn_o.gemv_into(&attn_out_raw, &mut self.q8_ws, &mut scratch.q_buf);
 
-            // ── Residual: h = residual + q_buf ───────────────────────────
-            for j in 0..d_model {
-                h[j] = scratch.residual[j] + scratch.q_buf[j];
-            }
+            // ── Residual: h = residual + q_buf (parallel) ────────────────
+            h.par_iter_mut()
+                .zip(scratch.residual.par_iter())
+                .zip(scratch.q_buf.par_iter())
+                .for_each(|((h_j, &r), &q)| {
+                    *h_j = r + q;
+                });
 
             // ── Save residual again for FFN ──────────────────────────────
             scratch.residual.copy_from_slice(h);
@@ -916,27 +925,35 @@ impl Talker {
             // ── Pre-FFN RMS norm: h → scratch.normed (in-place) ─────────
             rms_norm_f32_inplace(h, &layer.ffn_norm_w, eps);
 
-            // ── FFN gate + up (allocation-free gemv_into) ────────────────
-            layer.ffn_gate.gemv_into(h, &mut self.q8_ws, &mut scratch.gate_buf);
-            layer.ffn_up.gemv_into(h, &mut self.q8_ws, &mut scratch.up_buf);
+            // ── FFN gate + up (quantize-once multi gemv) ──────────────────
+            Q8Weights::gemv_multi_into(
+                &[&layer.ffn_gate, &layer.ffn_up],
+                &mut [&mut scratch.gate_buf, &mut scratch.up_buf],
+                h,
+                &mut self.q8_ws,
+            );
 
-            // ── SiLU(gate) * up → scratch.ffn_mid ────────────────────────
+            // ── SiLU(gate) * up → scratch.ffn_mid (parallel) ─────────────
             let ffn_dim = scratch.gate_buf.len();
             let scratch_ffn = &mut scratch.ffn_mid[..ffn_dim];
-            for j in 0..ffn_dim {
-                let g = scratch.gate_buf[j];
-                // sigmoid(x) = 1 / (1 + exp(-x))
-                let sig = 1.0 / (1.0 + (-g as f64).exp()) as f32;
-                scratch_ffn[j] = g * sig * scratch.up_buf[j];
-            }
+            let silu_gate = silu_f32_par(&scratch.gate_buf);
+            scratch_ffn.par_iter_mut()
+                .zip(silu_gate.par_iter())
+                .zip(scratch.up_buf.par_iter())
+                .for_each(|((dst, &g_act), &u)| {
+                    *dst = g_act * u;
+                });
 
             // ── Down projection into q_buf (reuse — d_model) ─────────────
             layer.ffn_down.gemv_into(scratch_ffn, &mut self.q8_ws, &mut scratch.q_buf);
 
-            // ── Residual: h = residual + q_buf ───────────────────────────
-            for j in 0..d_model {
-                h[j] = scratch.residual[j] + scratch.q_buf[j];
-            }
+            // ── Residual: h = residual + q_buf (parallel) ────────────────
+            h.par_iter_mut()
+                .zip(scratch.residual.par_iter())
+                .zip(scratch.q_buf.par_iter())
+                .for_each(|((h_j, &r), &q)| {
+                    *h_j = r + q;
+                });
         }
 
         // ── Final output norm ────────────────────────────────────────────
