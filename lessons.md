@@ -165,3 +165,9 @@
 **Trigger:** Implemented custom Q8_0 GEMV and discovered that `BlockQ8_0` fields (`d`, `qs`) are `pub(crate)` in candle-core 0.10.2, making them inaccessible from external crates.
 **Rule:** When using quantized block types from candle-core, create and fill them via the public `GgmlType` trait methods (`zeros()` for allocation, `from_float()` for quantization) rather than trying to access fields directly or use raw byte manipulation. The `vec_dot()` method also requires the element count `n` to be a multiple of `QK8_0` (32); always pad input to `ceil(k/32)*32` before quantizing.
 **Source:** qgemv implementation
+
+---
+## Lesson #24 — 2026-06-15
+**Trigger:** `ast_grep_replace` tool reported "APPLIED 28 replacements" but the file content on disk was never actually changed.
+**Rule:** When `ast_grep_replace` does not persist changes to disk, fall back to using the `edit` tool with `replaceAll=true` for bulk string replacements. Verify file content after every replace operation by reading a line.
+**Source:** q8_linear ws-parameter migration
