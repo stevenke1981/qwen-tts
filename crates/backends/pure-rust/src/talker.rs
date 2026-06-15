@@ -14,7 +14,7 @@ use candle_nn::RmsNorm;
 
 use crate::config::ModelConfig;
 use crate::code_predictor::CodePredictor;
-use crate::custom_ops::rms_norm_tensor;
+use crate::custom_ops::{attention_gqa_tensor, rms_norm_tensor};
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 
 const FN_TOKEN_EMBD: &str = "talker.text_embd.weight";
@@ -658,33 +658,15 @@ impl Talker {
             cache.append(i, &k, &v)?;
 
             // Get full K/V from cache
-            let k_cache = cache
+            let k_cached = cache
                 .k(i)
                 .ok_or_else(|| anyhow::anyhow!("K cache empty after append"))?;
-            let v_cache = cache
+            let v_cached = cache
                 .v(i)
                 .ok_or_else(|| anyhow::anyhow!("V cache empty after append"))?;
 
-            // GQA: repeat K,V heads to match n_heads
-            let k_full = if n_repeat > 1 {
-                repeat_kv(k_cache, n_repeat)?
-            } else {
-                k_cache.clone()
-            };
-            let v_full = if n_repeat > 1 {
-                repeat_kv(v_cache, n_repeat)?
-            } else {
-                v_cache.clone()
-            };
-
-            // Scaled dot-product attention (single query, full KV from cache)
-            let scale = (hd as f64).sqrt().recip();
-            let attn = q.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
-            let attn = (attn * scale)?;
-            // No causal mask: the query is at the last position, it attends to
-            // all cached positions (which are all ≤ current position).
-            let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
-            let attn_out = attn.matmul(&v_full)?;
+            // GQA-aware attention (f32 slice, no repeat_kv needed)
+            let attn_out = attention_gqa_tensor(&q, &k_cached, &v_cached)?;
 
             // Output projection
             let attn_out = attn_out

@@ -36,7 +36,7 @@ use candle_nn::RmsNorm;
 use rand::SeedableRng;
 
 use crate::sampling;
-use crate::custom_ops::rms_norm_tensor;
+use crate::custom_ops::{attention_gqa_tensor, rms_norm_tensor};
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 use crate::talker::{
     apply_per_head_norm, apply_rope, embed_token, linear_fwd, repeat_kv, DecoderLayer,
@@ -370,7 +370,7 @@ impl CodePredictor {
             let k = apply_rope(&k, &cos_slice, &sin_slice)?;
 
             // KV cache update: append new K,V to cached
-            let (k_full, v_full) = match &self.kv_cache[i] {
+            let (k_cache, v_cache) = match &self.kv_cache[i] {
                 Some((ck, cv)) => {
                     let new_k = Tensor::cat(&[ck, &k], 2)?;
                     let new_v = Tensor::cat(&[cv, &v], 2)?;
@@ -383,24 +383,8 @@ impl CodePredictor {
                 }
             };
 
-            // GQA: repeat K,V heads
-            let k_gqa = if n_repeat > 1 {
-                repeat_kv(&k_full, n_repeat)?
-            } else {
-                k_full
-            };
-            let v_gqa = if n_repeat > 1 {
-                repeat_kv(&v_full, n_repeat)?
-            } else {
-                v_full
-            };
-
-            // Scaled dot-product attention
-            let scale = (self.head_dim as f64).sqrt().recip();
-            let attn = q.matmul(&k_gqa.transpose(D::Minus2, D::Minus1)?)?;
-            let attn = (attn * scale)?;
-            let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
-            let attn_out = attn.matmul(&v_gqa)?;
+            // GQA-aware attention (f32 slice, no repeat_kv needed)
+            let attn_out = attention_gqa_tensor(&q, &k_cache, &v_cache)?;
 
             // Output projection
             let attn_out = attn_out

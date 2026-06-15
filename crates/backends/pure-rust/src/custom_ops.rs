@@ -123,10 +123,15 @@ pub fn attention_f32(
     output
 }
 
-/// Tensor wrapper for attention_f32.
+/// Tensor wrapper for attention_f32 (GQA-aware, no repeat_kv needed).
 ///
-/// Inputs are candle Tensors with standard shapes.
-pub fn attention_tensor(
+/// # Inputs
+/// - `q`: `[1, n_heads, 1, head_dim]` — query (after per-head norm and RoPE).
+/// - `k_cache`: `[1, n_kv_heads, kv_len, head_dim]` — full KV cache (not repeated).
+/// - `v_cache`: `[1, n_kv_heads, kv_len, head_dim]` — full KV cache.
+///
+/// Returns `[1, n_heads, 1, head_dim]` — attention output.
+pub fn attention_gqa_tensor(
     q: &Tensor,
     k_cache: &Tensor,
     v_cache: &Tensor,
