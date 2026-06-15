@@ -134,10 +134,23 @@ impl Q8Workspace {
     }
 
     /// Ensure `x_q` has at least `bpr` blocks (zero-filled).
-    fn ensure_xq(&mut self, bpr: usize) {
+    pub(crate) fn ensure_xq(&mut self, bpr: usize) {
         if self.x_q.len() < bpr {
             self.x_q.resize(bpr, BlockQ8_0::zeros());
         }
+    }
+
+    /// Quantize `x` (length `k`) into the workspace's `x_q` buffer.
+    ///
+    /// After calling this, use [`Q8Weights::gemv_into_quantized`] to compute
+    /// the GEMV without re-quantizing.
+    pub fn quantize_input(&mut self, x: &[f32], k: usize, bpr: usize, padded_k: usize) {
+        assert_eq!(x.len(), k);
+        self.ensure_xq(bpr);
+        self.padded.clear();
+        self.padded.extend_from_slice(x);
+        self.padded.resize(padded_k, 0.0);
+        <BlockQ8_0 as GgmlType>::from_float(&self.padded, &mut self.x_q[..bpr]);
     }
 }
 
@@ -182,6 +195,81 @@ impl Q8Weights {
                 let w_row = self.row_blocks(row);
                 *d = <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref);
             });
+    }
+
+    /// GEMV using already-quantized input in `ws.x_q`.
+    ///
+    /// `ws` must have been prepared by calling `ws.quantize_input(x, self.k, self.blocks_per_row, self.padded_k)`.
+    ///
+    /// `dst`: `[n]` f32 — pre-allocated output buffer.
+    pub fn gemv_into_quantized(&self, ws: &Q8Workspace, dst: &mut [f32]) {
+        assert_eq!(dst.len(), self.n);
+        let x_q_ref: &[BlockQ8_0] = &ws.x_q[..self.blocks_per_row];
+        let padded_k = self.padded_k;
+        dst.par_iter_mut()
+            .enumerate()
+            .for_each(|(row, d)| {
+                let w_row = self.row_blocks(row);
+                *d = <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref);
+            });
+    }
+
+    /// Quantize `x` once, then compute gemv into multiple output buffers
+    /// in a single flat `par_iter` for maximum thread utilization.
+    ///
+    /// `weights` and `dsts` must have the same length (1-3). All weights
+    /// must have the same `k` (input dimension). Each `dsts[i]` must have
+    /// length `weights[i].n`.
+    pub fn gemv_multi_into(
+        weights: &[&Q8Weights],
+        dsts: &mut [&mut [f32]],
+        x: &[f32],
+        ws: &mut Q8Workspace,
+    ) {
+        assert!(!weights.is_empty(), "gemv_multi_into: empty weights");
+        assert_eq!(weights.len(), dsts.len(), "gemv_multi_into: weights.len != dsts.len");
+        let bpr = weights[0].blocks_per_row;
+        let padded_k = weights[0].padded_k;
+        let k = weights[0].k;
+        for w in weights {
+            assert_eq!(w.k, k, "gemv_multi_into: all weights must have same k");
+        }
+        for (w, d) in weights.iter().zip(dsts.iter()) {
+            assert_eq!(d.len(), w.n, "gemv_multi_into: dst[?].len != w.n");
+        }
+        ws.quantize_input(x, k, bpr, padded_k);
+
+        let x_q_ref: &[BlockQ8_0] = &ws.x_q[..bpr];
+
+        // Build flat offset table: (weight_idx, row_start_in_flat, row_end_exclusive)
+        let mut offsets: Vec<(usize, usize, usize)> = Vec::with_capacity(weights.len());
+        let mut flat_ofs = 0usize;
+        for (wi, w) in weights.iter().enumerate() {
+            offsets.push((wi, flat_ofs, flat_ofs + w.n));
+            flat_ofs += w.n;
+        }
+        let total_rows = flat_ofs;
+
+        // Single flat par_iter across ALL rows of ALL weights.
+        let flat_results: Vec<f32> = (0..total_rows)
+            .into_par_iter()
+            .map(|flat_row| {
+                let &(wi, row_start, _row_end) = offsets
+                    .iter()
+                    .find(|&&(_wi, start, end)| flat_row >= start && flat_row < end)
+                    .unwrap();
+                let row_in_w = flat_row - row_start;
+                let w = weights[wi];
+                let w_row = w.row_blocks(row_in_w);
+                <BlockQ8_0 as GgmlType>::vec_dot(padded_k, w_row, x_q_ref)
+            })
+            .collect();
+
+        // Scatter back into per-weight dst buffers.
+        for (wi, start, end) in offsets {
+            let slice = &flat_results[start..end];
+            dsts[wi].copy_from_slice(slice);
+        }
     }
 
     /// Batch matmul (M ≥ 1): `Y = X @ W^T`.
