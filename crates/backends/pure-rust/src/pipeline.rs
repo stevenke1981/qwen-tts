@@ -9,6 +9,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::code_predictor::CodePredictor;
+use crate::prompt::{build_prompt, load_gguf_metadata, parse_prompt_metadata, PromptCache, PromptMetadata};
 use crate::sampling;
 use crate::talker::{precompute_cos_sin, KvCache, Talker};
 use crate::timing::TimingRecorder;
@@ -19,8 +20,12 @@ pub struct Pipeline {
     talker: Talker,
     code_predictor: CodePredictor,
     codec_decoder: CodecDecoder,
-    tokenizer: Option<HfTokenizer>,
+    tokenizer: HfTokenizer,
     device: Device,
+    /// Prompt-relevant metadata parsed from GGUF (specials, languages, speakers).
+    prompt_metadata: PromptMetadata,
+    /// Pre-computed special embeddings + prefix cache.
+    prompt_cache: PromptCache,
 }
 
 impl Pipeline {
@@ -28,21 +33,37 @@ impl Pipeline {
     ///
     /// `device` — the device (CPU or CUDA) to load weights onto and run on.
     pub fn new(talker_path: &Path, codec_path: &Path, device: &Device) -> anyhow::Result<Self> {
+        // Load prompt metadata from GGUF (opens the file separately, header-only).
+        let gguf_meta = load_gguf_metadata(talker_path)?;
+        let prompt_metadata = parse_prompt_metadata(&gguf_meta)?;
+
         let (talker, code_predictor) = Talker::load_with_predictor(talker_path, device)?;
+
+        // Pre-compute special embeddings (tts_bos, tts_eos, tts_pad, codec_pad, codec_bos).
+        let prompt_cache = PromptCache::new(&talker, &prompt_metadata, device)?;
+
         let codec_decoder = CodecDecoder::load(codec_path)
             .map_err(|e| anyhow::anyhow!("failed to load codec decoder: {e}"))?;
 
-        let tokenizer = discover_tokenizer(talker_path).ok();
+        let tokenizer = discover_tokenizer(talker_path)
+            .map_err(|e| anyhow::anyhow!("tokenizer required — place tokenizer.json next to the talker GGUF: {e}"))?;
 
         log::info!(
-            "pipeline loaded: device={:?}, talker={}, code_predictor={}, tokenizer={}",
+            "pipeline loaded: device={:?}, talker={}, code_predictor={}, tokenizer=found",
             device,
             talker_path.display(),
             codec_path.display(),
-            if tokenizer.is_some() { "found" } else { "not-found" },
         );
 
-        Ok(Self { talker, code_predictor, codec_decoder, tokenizer, device: device.clone() })
+        Ok(Self {
+            talker,
+            code_predictor,
+            codec_decoder,
+            tokenizer,
+            device: device.clone(),
+            prompt_metadata,
+            prompt_cache,
+        })
     }
 
     /// Synthesize speech: text → WAV samples via autoregressive code generation.
@@ -60,42 +81,40 @@ impl Pipeline {
             anyhow::bail!("text cannot be empty");
         }
 
-        // --- 1. Tokenize ---
-        let t0 = std::time::Instant::now();
-        let input_ids = if let Some(ref tok) = self.tokenizer {
-            let mut ids = tok.encode(raw_text)?;
-            let bos = tok.bos_id();
-            if bos != 0 && !ids.is_empty() && ids[0] != bos {
-                ids.insert(0, bos);
-            }
-            ids
-        } else {
-            byte_tokenize(raw_text)
-        };
-        if input_ids.is_empty() {
-            anyhow::bail!("tokenization produced empty input");
-        }
-        if let Some(ref mut tr) = timing_recorder {
-            tr.record("tokenize".into(), "load".into(), t0.elapsed().as_secs_f64(), 0);
-        }
-
-        // Pad to minimum sequence length
-        let min_seq: usize = 8;
-        let pad_len = min_seq.saturating_sub(input_ids.len());
-        let mut padded = vec![0u32; pad_len];
-        padded.extend_from_slice(&input_ids);
-        let seq_len = padded.len();
-        let input_tensor = Tensor::from_slice(&padded, (1, seq_len), &self.device)?;
-
-        // --- 2. Text embeddings ---
+        // --- 1. Build prompt embedding via PromptBuilder ---
         let t1 = std::time::Instant::now();
-        let text_embeds = self.talker.embed_text(&input_tensor)?;
-        // text_embeds: [1, seq_len, d_model]
+
+        let tokenizer = &self.tokenizer;
+
+        let ref_spk_emb: Option<&[f32]> = None;  // Voice clone not yet supported
+        let ref_codes: Option<&[i32]> = None;     // ICL not yet supported
+        let ref_codes_t: usize = 0;
+
+        let prompt = build_prompt(
+            &self.talker,
+            &self.device,
+            &self.prompt_metadata,
+            &mut self.prompt_cache,
+            tokenizer,
+            Some(&self.code_predictor),  // needed for ICL mode
+            raw_text,
+            &request.language,
+            request.instruct.as_deref().unwrap_or(""),
+            request.speaker.as_deref().unwrap_or(""),
+            ref_spk_emb,
+            request.ref_text.as_deref().unwrap_or(""),
+            ref_codes,
+            ref_codes_t,
+        )?;
+
         if let Some(ref mut tr) = timing_recorder {
             tr.record("prompt_embed".into(), "load".into(), t1.elapsed().as_secs_f64(), 0);
         }
 
-        // --- 3. Sampling configuration ---
+        let hidden = prompt.hidden;
+        let t_ctx = prompt.T_ctx;
+
+        // --- 2. Sampling configuration ---
         let temperature = request.temperature.unwrap_or(1.0);
         let top_k = request.top_k.map(|v| v as usize);
         let top_p = request.top_p.map(|v| v as f32);
@@ -107,55 +126,53 @@ impl Pipeline {
         let num_frames = request.max_new_tokens.unwrap_or(1024) as usize;
         let do_sample = request.do_sample.unwrap_or(true);
 
-        // --- 4. KV cache + autoregressive frame generation ---
+        // --- 3. KV cache + autoregressive frame generation ---
         let codec_codebooks: usize = 16;
         let mut all_codes: Vec<i32> = Vec::with_capacity(num_frames * codec_codebooks);
 
-        // 4a. Precompute RoPE for the full context length
+        // 3a. Precompute RoPE for the full context length
         let max_seq = self.talker.config().max_seq_len;
         let (cos_full, sin_full) =
             precompute_cos_sin(self.talker.config(), max_seq, &self.device)?;
 
-        // 4b. Create KV cache and prefill text tokens one-by-one
+        // 3b. Convert prompt embed to tensor and prefill one-by-one
+        let input_embed = Tensor::from_slice(&prompt.input_embed, (1, t_ctx, hidden), &self.device)?;
+
         let mut kv_cache = KvCache::new(self.talker.config().n_layers);
         let mut last_hidden: Option<Tensor> = None;
-        for pos in 0..seq_len {
+        for pos in 0..t_ctx {
             let _step_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("talker_step".into(), "step".into(), pos)
             });
-            let emb = text_embeds.i((.., pos..pos + 1, ..))?;
-            let hidden = self
+            let emb = input_embed.i((.., pos..pos + 1, ..))?;
+            let hidden_state = self
                 .talker
                 .forward_step(&emb, &mut kv_cache, &cos_full, &sin_full)?;
-            last_hidden = Some(hidden);
+            last_hidden = Some(hidden_state);
             drop(_step_timer);
         }
         // last_hidden: [1, 1, d_model] — output-normed hidden state at the last text position
         let mut last_hidden = last_hidden
-            .ok_or_else(|| anyhow::anyhow!("empty text sequence after prefill"))?;
+            .ok_or_else(|| anyhow::anyhow!("empty sequence after prompt prefill"))?;
 
-        // 4c. Decode loop: generate audio frames
+        // 3c. Decode loop: generate audio frames with full codec embedding sum + trailing overlay
         for frame_idx in 0..num_frames {
             // Predict codebook 0 via codec_head
             let _cb0_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("cb0_sample".into(), "step".into(), frame_idx)
             });
             let cb0_logits = self.talker.predict_codebook0(&last_hidden)?;
-            // cb0_logits: [1, 1, vocab_cb0]
             let cb0_token = if do_sample {
                 sample_logits_tensor(&cb0_logits, temperature, top_k, top_p, &mut rng)?
             } else {
                 sampling::sample_argmax(&cb0_logits)?
             };
-            all_codes.push(cb0_token as i32);
             drop(_cb0_timer);
 
-            // Embed codebook 0 token for predictor prefill position 1 + next talker step
+            // Embed codebook 0 token for predictor prefill
             let cb0_emb = self.talker.embed_codebook0(cb0_token)?;
-            // cb0_emb: [1, 1, d_model]
 
             // Predict acoustic codebooks 1..N via code predictor
-            // (full transformer with KV cache, needs last talker hidden + c0 embedding)
             let _pred_timer = timing_recorder.as_mut().map(|tr| {
                 tr.start("predictor_frame".into(), "frame".into(), frame_idx)
             });
@@ -168,42 +185,62 @@ impl Pipeline {
                     .code_predictor
                     .predict_one_frame_argmax(&last_hidden, &cb0_emb)?
             };
+            drop(_pred_timer);
+
+            // Build next-token embedding = sum of all 16 codebook embeddings + trailing overlay
+            let codes: Vec<u32> = std::iter::once(cb0_token).chain(frame.iter().copied()).collect();
+            let codec_sum = self.code_predictor.embed_frame(&self.talker, &codes)?;
+
+            // Trailing text overlay
+            let overlay: &[f32] = if frame_idx < prompt.T_trailing {
+                let off = frame_idx * hidden;
+                &prompt.trailing_text_hidden[off..off + hidden]
+            } else {
+                &prompt.tts_pad_embed
+            };
+
+            let mut next_emb_vec = vec![0.0f32; hidden];
+            for i in 0..hidden {
+                next_emb_vec[i] = codec_sum[i] + overlay[i];
+            }
+            let next_emb = Tensor::from_slice(&next_emb_vec, (1, 1, hidden), &self.device)?;
+
+            // Store all codes
+            all_codes.push(cb0_token as i32);
             for &token in &frame {
                 all_codes.push(token as i32);
             }
-
             // Pad to full 16 codebooks if necessary
             while all_codes.len() < (frame_idx + 1) * codec_codebooks {
                 all_codes.push(0);
             }
-            drop(_pred_timer);
 
-            // Forward step with the new audio embedding — uses KV cache so this is O(1) per layer
+            // Forward step with the combined embedding (16 codebooks + trailing overlay)
             last_hidden = self
                 .talker
-                .forward_step(&cb0_emb, &mut kv_cache, &cos_full, &sin_full)?;
+                .forward_step(&next_emb, &mut kv_cache, &cos_full, &sin_full)?;
         }
 
         // Trim to exact multiples
         let total_frames = all_codes.len() / codec_codebooks;
         all_codes.truncate(total_frames * codec_codebooks);
 
-        // --- 5. Decode audio via codec ---
+        // --- 4. Decode audio via codec ---
         let _decode_timer = timing_recorder.as_mut().map(|tr| {
             tr.start("codec_decode".into(), "decode".into(), 0)
         });
         let audio_f32 = self.codec_decoder.decode(&all_codes, total_frames);
         drop(_decode_timer);
 
-        // --- 6. Convert f32 → i16 PCM ---
+        // --- 5. Convert f32 → i16 PCM ---
         let audio_i16: Vec<i16> = audio_f32
             .iter()
             .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             .collect();
 
         log::info!(
-            "pure-rust synth: {} text tokens → {} code frames ({} code tokens) → {} audio samples ({}s)",
-            seq_len,
+            "pure-rust synth: {} ctx tokens → {} code frames ({} code tokens) → {} audio samples ({}s)",
+            t_ctx,
             total_frames,
             all_codes.len(),
             audio_i16.len(),
@@ -231,7 +268,6 @@ fn sample_logits_tensor(
     top_p: Option<f32>,
     rng: &mut impl rand::Rng,
 ) -> anyhow::Result<u32> {
-    // Flatten to 1D regardless of input rank
     let logits_1d: Vec<f32> = logits.flatten_all()?.to_vec1()?;
     let (token, _prob) = sampling::sample_token(&logits_1d, temperature, top_k, top_p, rng);
     Ok(token)
@@ -254,9 +290,4 @@ fn discover_tokenizer(talker_path: &Path) -> anyhow::Result<HfTokenizer> {
         "no tokenizer.json found next to {}",
         talker_path.display()
     );
-}
-
-/// Simple byte-level tokenizer (fallback when no BPE tokenizer available).
-fn byte_tokenize(text: &str) -> Vec<u32> {
-    text.bytes().map(|b| b as u32 + 1).collect()
 }

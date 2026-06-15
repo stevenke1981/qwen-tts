@@ -41,7 +41,7 @@ use crate::custom_ops::{
 };
 use crate::qgemv::{q8_linear, q8_linear_multi, Q8Weights, Q8Workspace};
 use crate::talker::{
-    embed_token, linear_fwd, DecoderLayer,
+    embed_token, linear_fwd, DecoderLayer, Talker,
 };
 
 /// Type alias: a frame of acoustic code token IDs (one per codebook level).
@@ -548,6 +548,59 @@ impl CodePredictor {
     #[must_use]
     pub fn hidden_size(&self) -> usize {
         self.pred_hidden
+    }
+
+    /// Return the talker hidden dimension.
+    #[must_use]
+    pub fn talker_hidden_size(&self) -> usize {
+        self.talker_hidden
+    }
+
+    /// Embed a single acoustic codebook token (codebook g, for g in 1..num_acoustic)
+    /// into a flat `[talker_hidden]` f32 vec.
+    pub fn embed_acoustic_code(&self, codebook_idx: usize, token_id: u32) -> anyhow::Result<Vec<f32>> {
+        let emb = embed_token(
+            &self.codec_embd[codebook_idx],
+            token_id,
+            self.talker_hidden,
+            &self.device,
+        )?; // [1, 1, talker_hidden]
+        Ok(emb.flatten_all()?.to_vec1()?)
+    }
+
+    /// Sum-embed a full code frame (c0..cN including codebook 0) into a single
+    /// `[talker_hidden]` f32 vec. Codebook 0 is looked up via `talker`, the
+    /// remaining acoustic codebooks via the predictor's own embedding tables.
+    ///
+    /// `codes` must have length `1 + self.num_acoustic`.
+    pub fn embed_frame(&self, talker: &Talker, codes: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let hidden = self.talker_hidden;
+        let n_acoustic = self.num_acoustic;
+        anyhow::ensure!(
+            codes.len() >= 1 + n_acoustic,
+            "embed_frame: expected {} codes, got {}",
+            1 + n_acoustic,
+            codes.len(),
+        );
+
+        let mut sum = vec![0.0f32; hidden];
+
+        // c0: talker's codec embedding table
+        let c0_vec = talker.lookup_codec_row(codes[0])?;
+        for (i, &v) in c0_vec.iter().enumerate() {
+            sum[i] += v;
+        }
+
+        // c1..c15: predictor's codec_embd[g-1]
+        for g in 0..n_acoustic {
+            let cg = codes[1 + g];
+            let cg_vec = self.embed_acoustic_code(g, cg)?;
+            for (i, &v) in cg_vec.iter().enumerate() {
+                sum[i] += v;
+            }
+        }
+
+        Ok(sum)
     }
 }
 

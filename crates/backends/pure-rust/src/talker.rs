@@ -727,6 +727,37 @@ impl Talker {
 
     pub fn device(&self) -> &Device { &self.device }
     pub fn config(&self) -> &ModelConfig { &self.config }
+
+    /// Access the codec embedding table for codebook 0.
+    pub fn codec_embd(&self) -> Option<&Tensor> {
+        self.codec_embd.as_ref()
+    }
+
+    /// Look up a single row in the codec embedding table, return a flat `[hidden]` f32 vec.
+    pub fn lookup_codec_row(&self, row_id: u32) -> anyhow::Result<Vec<f32>> {
+        let emb = self.codec_embd.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("codec_embd not loaded"))?;
+        let d_model = self.config.d_model;
+        let emb_w = if emb.dims()[0] == d_model {
+            emb.t()?
+        } else {
+            emb.clone()
+        };
+        let ids = Tensor::from_slice(&[row_id], (1,), &self.device)?;
+        let row = emb_w.index_select(&ids, 0)?; // [1, d_model]
+        Ok(row.flatten_all()?.to_vec1()?)
+    }
+
+    /// Embed text token IDs and return a flat `[N * d_model]` f32 vec.
+    /// Convenience wrapper over `embed_text` that skips tensor-to-vec conversion.
+    pub fn embed_text_to_vec(&self, ids: &[u32]) -> anyhow::Result<Vec<f32>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let t = Tensor::from_slice(ids, (1, ids.len()), &self.device)?;
+        let emb = self.embed_text(&t)?; // [1, N, d_model]
+        Ok(emb.flatten_all()?.to_vec1()?)
+    }
 }
 
 // -----------------------------------------------------------------------

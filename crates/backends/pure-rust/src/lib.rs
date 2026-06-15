@@ -5,6 +5,7 @@ pub mod config;
 pub mod code_predictor;
 pub mod custom_ops;
 pub mod pipeline;
+pub mod prompt;
 pub mod qgemv;
 pub mod sampling;
 pub mod talker;

@@ -71,7 +71,7 @@ fn cuda_synthesize_inner(num_frames: u32) {
     };
 
     let start = std::time::Instant::now();
-    let audio = pipeline.synthesize(&request)
+    let audio = pipeline.synthesize(&request, None)
         .expect("CUDA synthesis should succeed");
     let elapsed = start.elapsed();
 

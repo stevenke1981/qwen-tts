@@ -273,7 +273,7 @@ fn test_pipeline_full_synthesize() {
         models: qwen_tts_core::TtsModelSet::new(&talker_path(), &codec_path()),
     };
 
-    let audio = pipeline.synthesize(&request)
+    let audio = pipeline.synthesize(&request, None)
         .expect("synthesize should succeed");
 
     // Verify output
@@ -335,7 +335,7 @@ fn test_pipeline_minimal_synthesize() {
         models: qwen_tts_core::TtsModelSet::new(&talker_path(), &codec_path()),
     };
 
-    let audio = pipeline.synthesize(&request)
+    let audio = pipeline.synthesize(&request, None)
         .expect("minimal synthesize should succeed");
     assert!(!audio.is_empty(), "audio must not be empty");
     // With 4 frames at 12 Hz * 24000 / 12Hz frame rate we expect audio
