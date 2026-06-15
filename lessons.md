@@ -129,3 +129,9 @@
 **Trigger:** Cross-validation test showed 0% sample match between Pure Rust (argmax) and FFI (temperature=1.0) with same seed=42 — different RNG implementations (StdRng vs Mersenne Twister) produce completely different acoustic code tokens.
 **Rule:** When cross-validating two implementations that differ in code predictor architecture (simplified vs full) AND RNG, compare structural metrics (duration, RMS, peak, SDR) instead of sample-by-sample exactness. A 0% sample match is expected and valid as long as both produce reasonable audio of the same length.
 **Source:** Cross-validation test suite
+
+---
+## Lesson #18 — 2026-06-15
+**Trigger:** Rewrote code_predictor.rs from simplified linear predictor to full 5-layer transformer with KV cache, requiring coordinated changes across 3 source files and 3 test files.
+**Rule:** When changing a struct's method signature (e.g., `&self → &mut self`), grep for ALL callers in ALL test files before editing — the compiler catches lib callers but test files are only checked at test compile time.
+**Source:** Full code predictor implementation (Task 2)
